@@ -58,3 +58,4 @@ ddqn_ckpt/ddqn_gate_delta_makespan_avg100_dynamic.pth
 ddqn_ckpt/ddqn_gate_delta_makespan_avg100.pth
 ddqn_ckpt/ddqn_gate_delta_makespan100_dynamic.pth
 ddqn_ckpt/ddqn_gate_delta_makespan100.pth
+*.pth

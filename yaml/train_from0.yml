@@ -1,0 +1,13 @@
+# train_from0.yml
+# Configuration to run train_unified.py training PPO from scratch.
+
+# PPO model path to load. Set to empty string to train from scratch.
+ppo_model_path: ""
+
+# Suffix for saved models and plot directory.
+path_name: "train_from0"
+
+# You can add other parameters here if you need to override defaults from params.py
+# For example:
+# ddqn_episodes: 500
+# seed_train: 200
