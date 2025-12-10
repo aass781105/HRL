@@ -15,10 +15,11 @@ import numpy as np
 
 
 # [CHANGED] 支援注入 rng，移除對全域 np.random 的依賴
-def SD2_instance_generator(config, seed=None):
+def SD2_instance_generator(config, seed=None, rng=None):
     """
     :param config: 超參數
-    :param rng:    numpy.random.Generator（可選）。未提供則建立本地 RNG。
+    :param seed:   整數種子碼（可選）
+    :param rng:    numpy.random.Generator 物件（可選）。未提供則根據 seed 建立。
     :return:
         job_length : 每個 job 的工序數 (shape [J])
         op_pt      : 處理時間矩陣 (shape [N, M])；不相容機台為 0
@@ -27,7 +28,9 @@ def SD2_instance_generator(config, seed=None):
     import sys
     import numpy as np
 
-    rng =  np.random.default_rng(seed)  # [ADDED] 本地 RNG（不污染全域）
+    # [MODIFIED] 優先使用傳入的 rng 物件，否則根據 seed 建立
+    if rng is None:
+        rng = np.random.default_rng(seed)
 
     n_j = int(config.n_j)
     n_m = int(config.n_m)

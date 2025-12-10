@@ -1,0 +1,11 @@
+# load_ppo.yml
+
+
+
+eval_model_name: difsize_PPO_time
+ppo_model_path: trained_network\static_ppo\curriculum_train_10x5+mix.pth
+ddqn_model_path: 
+gate_policy: time
+
+
+

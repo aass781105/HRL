@@ -64,7 +64,7 @@ def sample_action(pi: torch.Tensor, action_mask: torch.Tensor = None):
             fallback_sums = fallback.sum(dim=-1, keepdim=True).clamp_min(1.0)
             fallback = fallback / fallback_sums
             probs[zero_sum] = fallback[zero_sum]
-            sums = probs.sum(dim=-1, keepdim=True)
+            sums = probs.sum(dim=-1, keepdims=True)
 
         probs = probs / sums
 

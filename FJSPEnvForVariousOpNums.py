@@ -355,7 +355,33 @@ class FJSPEnvForVariousOpNums:
                           self.fea_pairs)
         self.done_flag = self.done()
 
-        return self.state, np.array(reward), self.done_flag
+        # --- Collect scheduling details for info dictionary (assuming env_idx = 0 for evaluation) ---
+        env_idx = 0 # For single-instance evaluation
+        
+        job_id_in_batch = int(chosen_job[env_idx]) # This is the index in the current batch of jobs
+        op_global_id = int(chosen_op[env_idx]) # The global op index
+
+        # Calculate op_id_in_job from op_global_id and job_first_op_id
+        # self.job_first_op_id has shape (E, N_jobs_in_batch).
+        # It's op_global_id - self.job_first_op_id[env_idx, job_id_in_batch]
+        op_id_in_job = int(op_global_id - self.job_first_op_id[env_idx, job_id_in_batch])
+        
+        scheduled_op_details = {
+            "job_id": job_id_in_batch, # In static env, this is usually the actual job ID
+            "op_id_in_job": op_id_in_job,
+            "op_global_id": op_global_id,
+            "machine_id": int(chosen_mch[env_idx]),
+            "start_time": float(true_chosen_op_st[env_idx]),
+            "end_time": float(self.true_op_ct[env_idx, chosen_op[env_idx]]),
+            "proc_time": float(self.true_op_pt[env_idx, chosen_op[env_idx], chosen_mch[env_idx]])
+        }
+        
+        info = {
+            "scheduled_op_details": scheduled_op_details
+        }
+        # --- End collect scheduling details ---
+
+        return self.state, np.array(reward), self.done_flag, info
 
     def done(self):
         return self.step_count >= self.env_number_of_ops
@@ -561,3 +587,5 @@ class FJSPEnvForVariousOpNums:
                           self.dynamic_pair_mask, self.comp_idx, self.candidate,
                           self.fea_pairs)
         return self.state
+
+

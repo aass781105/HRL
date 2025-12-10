@@ -140,7 +140,7 @@ parser.add_argument('--burst_size', type=int, default=1,
 
 parser.add_argument('--use_ppo', type=str2bool, default=True,
                     help='是否改用 PPO 進行靜態批次的一次排到底')
-parser.add_argument('--ppo_model_path', type=str, default=r'trained_network\unified\unified_ppo_final_100ep_load_ppo.pth',
+parser.add_argument('--ppo_model_path', type=str, default=r'trained_network\SD2\10x5+mix.pth',
                     help='PPO 權重檔 .pth 路徑（use_ppo=True 時必填）')
 parser.add_argument('--event_seed', type=int, default=42,
                     help='事件驅動到達過程的亂數種子（Exponential 間隔）')
@@ -153,7 +153,7 @@ parser.add_argument('--ppo_sample', type=str2bool, default=False,
 # ---- Gate 決策：DDQN 釋放/暫緩（推論）----                                   
    
   #ddqn_gate_idle_final_mk_500ep100_idle
-parser.add_argument('--ddqn_model_path', type=str, default=r"ddqn_ckpt\unified_ddqn_final_100ep_load_ppo.pth",  
+parser.add_argument('--ddqn_model_path', type=str, default=r"ddqn_ckpt\compare.pth",  
                     help='DDQN 推論權重路徑（.pth）')                              
 parser.add_argument('--gate_buffer_threshold', type=int, default=0,              
                     help='當 gate_policy=threshold 時的緩衝門檻（>=此值才 release）')  
@@ -168,7 +168,9 @@ parser.add_argument('--gate_policy', type=str, default='ddqn',
 parser.add_argument('--gate_time_threshold', type=float, default=250.0,
                     help='當 gate_policy=time 時，兩次釋放之間所需的最小事件間隔（可累加）')
 
-
+parser.add_argument('--eval_action_selection', type=str, default='greedy',
+                    choices=['sample', 'greedy'],   # ← 加入 'time'
+                    help='sample or greedy')
 
 
 # ---- DDQN 訓練（超參）----                                                   
@@ -210,7 +212,7 @@ parser.add_argument('--ddqn_out_dir', type=str, default='ddqn_ckpt',
 parser.add_argument('--norm_scale', type=float, default=100,                 
                     help='norm /scale') 
 
-parser.add_argument('--path_name', type=str, default='Hmk',                 
+parser.add_argument('--path_name', type=str, default='test',                 
                     help='path name for saving network') 
 
 parser.add_argument('--enable_full_idle_penalty', type=str2bool, default=False,
@@ -236,7 +238,8 @@ parser.add_argument('--cadence_choices', type=int, nargs='*', default=None,
 parser.add_argument('--episode_seed_base', type=int, default=12345,
                     help='episode 級別的基種子；每個 episode 以此為基準派生子亂數流')
 
-
+parser.add_argument('--eval_model_name', type=str, default="new",  
+                    help='用於儲存CSV的檔名')      
 
 
 # 兩段式解析（最小化寫法）：

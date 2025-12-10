@@ -24,7 +24,7 @@ from fjsp_env_same_op_nums_online import FJSPEnvForSameOpNums
 import torch
 from model.PPO import PPO_initialize
 from params import configs
-from common_utils import heuristic_select_action, greedy_select_action
+from common_utils import heuristic_select_action, greedy_select_action, sample_action
 
 
 # ==============================================================================
@@ -127,7 +127,7 @@ class EventBurstGenerator:
         old_n_j = getattr(cfg, "n_j", None)
         try:
             setattr(cfg, "n_j", K)
-            job_length, op_pt, _ = self.sd2_fn(cfg)
+            job_length, op_pt, _ = self.sd2_fn(cfg, rng=self.rng)
         finally:
             if old_n_j is not None:
                 setattr(cfg, "n_j", old_n_j)
@@ -342,7 +342,11 @@ class GlobalTimelineOrchestrator:
                     # print("mch free (norm):", self.current_env.mch_free_time[0])  # 正規化
                     # print("state m[6] (norm):", state.fea_m_tensor[0, :, 6])
 
-                    act = greedy_select_action(pi)  # 你原本常用的 greedy
+                    selection_strategy = getattr(configs, 'eval_action_selection', 'greedy').lower()
+                    if selection_strategy == 'sample':
+                        act, _ = sample_action(pi)
+                    else: # default to greedy
+                        act = greedy_select_action(pi)
                     act_idx = int(np.array(act.cpu().numpy()).reshape(-1)[0])
                     self.capture_planned_op(env, act_idx)
                     state, _, done_flag = self._recorder.record_step(env, act_idx)
@@ -395,22 +399,31 @@ class GlobalTimelineOrchestrator:
         if env is not self.current_env:
             raise AssertionError("finalize() 參數必須是目前 active 的批次環境")
 
-        # [REMOVED] base 加回：不需要；true_* 已是絕對時間
-        # base = float(getattr(self, "_time_base", 0.0))  # [REMOVED]
-
         # [FIXED] 回寫機台可用時間（本批排到底）→ 直接拷貝絕對時間
         self.machine_free_time = env.true_mch_free_time[0].astype(float).copy()  # [CHANGED]
 
-        # 本批完整 rows（全域 op）；存成上一批「完整」快照（start/end 已是絕對）
+        # PPO剛剛完成的、針對子問題的排程結果
         batch_rows: List[Dict] = []
         if self._active_plan and self._committed_jobs:
             batch_rows = self._plan_to_rows_with_offset(self._committed_jobs, self._active_plan)
 
+        # ======================= [BUG FIX: MERGE LOGIC] =======================
+        # 找出PPO本次處理的工單ID集合
+        committed_job_ids = {js.job_id for js in self._committed_jobs} if self._committed_jobs else set()
 
+        # 找出在舊的「未來規劃」中，但本次未被PPO處理的「遠期工單」
+        unaffected_jobs = [js for js in self._last_jobs_snapshot if js.job_id not in committed_job_ids]
+        unaffected_rows = [row for row in self._last_full_rows if row['job'] not in committed_job_ids]
 
-        # [ADDED] 保存上一批完整結果（絕對時間）
-        self._last_full_rows = list(batch_rows)
-        self._last_jobs_snapshot = copy.deepcopy(self._committed_jobs)
+        # 將「遠期工單」與PPO新排程的工單合併，形成新的、完整的未來規劃
+        new_snapshot = unaffected_jobs + (self._committed_jobs if self._committed_jobs else [])
+        new_full_rows = unaffected_rows + batch_rows
+
+        # =====================================================================
+
+        # [FIXED] 保存合併後新的、完整的未來規劃
+        self._last_full_rows = new_full_rows
+        self._last_jobs_snapshot = copy.deepcopy(new_snapshot)
 
         # [ADDED] 「右半」給畫圖（此批全部當作 newplan 顯示）
         self._R_rows = list(batch_rows)

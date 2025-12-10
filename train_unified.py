@@ -180,7 +180,7 @@ def train_unified():
     reward_scale = float(getattr(configs, "reward_scale", 50.0))
     # Penalty
     enable_final_flush_penalty = bool(getattr(configs, "enable_final_flush_penalty", True))
-
+    flush_heuristic = ""
     ppo_model_path =  str(getattr(configs, "ppo_model_path", ""))
 
 
@@ -228,6 +228,9 @@ def train_unified():
     ppo_episode_avg_pi_losses = []
     ppo_episode_avg_v_losses = []
 
+
+
+
     # --- Main Training Loop ---
     for ep in tqdm(range(1, ddqn_episodes + 1), desc="Episodes"):
         # --- Environment & Orchestrator Reset for each episode ---
@@ -245,9 +248,24 @@ def train_unified():
 
         # Initial jobs
         if init_jobs > 0:
-            # This part is simplified; assumes OrchestratorAdapter handles init if needed
-            pass 
-        
+            tmp_cfg = copy.deepcopy(configs)
+            old_n_j = getattr(tmp_cfg, "n_j", None)
+            try:
+                setattr(tmp_cfg, "n_j", int(init_jobs))
+                jl, pt, _ = SD2_instance_generator(tmp_cfg)
+            finally:
+                if old_n_j is not None:
+                    setattr(tmp_cfg, "n_j", old_n_j)
+            
+            init_jobs_specs = split_matrix_to_jobs(jl, pt, base_job_id=0, t_arrive=0.0)
+            orchestrator.buffer.extend(init_jobs_specs)
+            
+            max_existing = max((j.job_id for j in orchestrator.buffer), default=-1)
+            job_generator.bump_next_id(max_existing + 1) 
+            
+            # Perform initial heuristic schedule at t=0.0
+            orchestrator.event_release_and_reschedule(0.0, flush_heuristic)
+
         t_now = 0.0
         events_done = 0
         ep_return = 0.0
@@ -260,7 +278,8 @@ def train_unified():
         mk_prev = 0.0
         if len(orchestrator.machine_free_time) > 0:
             mk_prev = float(np.max(orchestrator.machine_free_time))
-            
+        
+
         # --- Event Loop ---
         while events_done < event_horizon:
             # 1. Get DDQN State
@@ -312,7 +331,6 @@ def train_unified():
             # 4. Environment Transition
             t_next = job_generator.sample_next_time(t_now)
             
-            # Use orchestrator to get metrics for DDQN reward
             metrics = orchestrator.compute_interval_metrics(t_now, t_next)
             total_idle = float(metrics.get("total_idle", 0.0))
             mk_now = float(np.max(orchestrator.machine_free_time)) if len(orchestrator.machine_free_time) > 0 else mk_prev
@@ -324,7 +342,6 @@ def train_unified():
             events_done += 1
             mk_prev = mk_now
 
-            # Arrive new jobs for the *next* step
             new_jobs = job_generator.generate_burst(t_now)
             if new_jobs:
                 orchestrator.buffer.extend(new_jobs)
@@ -333,12 +350,9 @@ def train_unified():
             next_state_ddqn = _get_gate_obs(orchestrator, configs.n_m, t_now, burst_K, 0, norm_scale)
             done = (events_done >= event_horizon)
             
-            # --- Final Flush Penalty ---
-            flush_heuristic = ""
             if done and enable_final_flush_penalty and len(orchestrator.buffer) > 0:
                 mk_final, _ = _run_final_flush_and_get_cost(orchestrator, t_now, flush_heuristic)
                 final_flush_penalty = mk_final / (reward_scale /2)
-                # reward_ddqn -= len(orchestrator.buffer) *100
                 reward_ddqn -= final_flush_penalty
 
             ddqn_buffer.push(state_ddqn, action_ddqn, reward_ddqn, next_state_ddqn, float(done))
@@ -362,7 +376,6 @@ def train_unified():
                 ddqn_optimizer.step()
                 soft_update(q_net, q_target, ddqn_tau)
 
-        # --- End of Episode: Aggregate and Log Data ---
         plot_episodes.append(ep)
         ddqn_episode_returns.append(ep_return)
         ddqn_episode_avg_losses.append(np.mean(ep_ddqn_losses) if ep_ddqn_losses else 0)

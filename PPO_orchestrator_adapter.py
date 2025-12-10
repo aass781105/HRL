@@ -70,6 +70,10 @@ class OrchestratorAdapter:
         # === (1.5) 切出新的 R_jobs（剩餘未做完的片段），保留 op_offset 與 ready_at（絕對） ===
         remain_jobs = []
         if o._last_jobs_snapshot:
+            # ======================= [DEBUG LIFECYCLE START] =======================
+            job_ids_before = {js.job_id for js in o._last_jobs_snapshot}
+            # print(f"\n[DEBUG LIFECYCLE @ t={o.t:.2f}] Starting new batch. 'Future Plan' currently contains Job IDs: {sorted(list(job_ids_before))}")
+            # ======================= [DEBUG LIFECYCLE END] =========================
             for js in o._last_jobs_snapshot:
                 jid = int(js.job_id)
                 seq = sorted(by_job.get(jid, []), key=lambda x: x["op"]) if jid in by_job else []
@@ -99,6 +103,16 @@ class OrchestratorAdapter:
         jobs_from_B = list(o.buffer)
         o.buffer.clear()
         jobs_new = list(remain_jobs) + jobs_from_B
+        
+        # ======================= [DIRECT DEBUG LOG] =======================
+        num_ops_remain = sum(len(j.operations) for j in remain_jobs)
+        num_ops_buffer = sum(len(j.operations) for j in jobs_from_B)
+        # print(f"[DEBUG SUBPROBLEM @ t={o.t:.2f}] Creating new PPO sub-problem.")
+        # print(f"    - Ops from 'remain_jobs' (R): {num_ops_remain}")
+        # print(f"    - Ops from 'jobs_from_B' (B): {num_ops_buffer}")
+        # print(f"    - Total Ops for PPO (this batch): {num_ops_remain + num_ops_buffer}")
+        # ====================================================================
+
         if not jobs_new:
             # 沒東西可排：不建立 env，讓呼叫端決定是否前推到下一事件
             return None
@@ -216,3 +230,5 @@ class OrchestratorAdapter:
           - 以 H 跨切點更新機台 busy-until（絕對）
         """
         return self.o.tick_without_release(t_event)
+
+

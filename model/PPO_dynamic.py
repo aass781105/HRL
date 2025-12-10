@@ -93,7 +93,7 @@ class Memory:
     def get_gae_advantages(self):
         """
             Compute the generalized advantage estimates
-        :return: advantage sequences, state value sequence
+        :return: un-normalized advantage sequences, state value sequence
         """
 
         reward_arr = torch.stack(self.reward_seq, dim=0)
@@ -117,10 +117,7 @@ class Memory:
         # [sz_b, N]
         v_target_seq = (t_advantage_seq + self.t_old_val_seq).flatten(0, 1)
 
-        # normalization
-        t_advantage_seq = (t_advantage_seq - t_advantage_seq.mean(dim=1, keepdim=True)) \
-                          / (t_advantage_seq.std(dim=1, keepdim=True) + 1e-8)
-
+        # MODIFICATION: Return un-normalized advantages. Normalization will be done in the update function.
         return t_advantage_seq.flatten(0, 1), v_target_seq
 
 
@@ -165,9 +162,15 @@ class PPO:
         t_data = [x.detach().cpu() for x in t_data]
 
         # 優勢 & value target 也丟回 CPU
-        t_advantage_seq, v_target_seq = memory.get_gae_advantages()  # [N] 或 [N,1]
-        t_advantage_seq = t_advantage_seq.detach().cpu()
+        unnormalized_advantage, v_target_seq = memory.get_gae_advantages()  # Now returns un-normalized advantages
+        unnormalized_advantage = unnormalized_advantage.detach().cpu()
         v_target_seq    = v_target_seq.detach().cpu()
+        
+        # 在標準化之前計算統計量
+        adv_std_before_norm = unnormalized_advantage.std().item()
+        
+        # 現在於此處進行標準化
+        t_advantage_seq = (unnormalized_advantage - unnormalized_advantage.mean()) / (adv_std_before_norm + 1e-8)
 
         # 統一成 [N,1]
         if t_advantage_seq.dim() == 1:
@@ -181,6 +184,9 @@ class PPO:
         loss_epochs = 0.0
         v_loss_epochs = 0.0
         p_loss_epochs = 0.0  # Added for plotting policy loss
+        
+        with torch.no_grad():
+            old_vals_for_log = memory.t_old_val_seq.flatten(0, 1).mean().item()
 
         for _ in range(self.k_epochs):
 
@@ -258,6 +264,18 @@ class PPO:
         # ===== 4. soft update policy_old =====
         for p_old, p in zip(self.policy_old.parameters(), self.policy.parameters()):
             p_old.data.copy_(self.tau * p_old.data + (1 - self.tau) * p.data)
+
+        # ===== [CRITIC DIAGNOSTIC LOG] =====
+        # k_epochs and num_batch could be zero if the batch is empty.
+        if self.k_epochs > 0 and num_batch > 0:
+            avg_v_loss = v_loss_epochs.item() / (self.k_epochs * num_batch)
+        else:
+            avg_v_loss = 0.0
+            
+        mean_actual_return = v_target_seq.mean().item() if v_target_seq.numel() > 0 else 0.0
+        batch_steps = len(t_data[0]) if t_data and len(t_data) > 0 else 0
+
+        # print(f"[CRITIC DIAGNOSTIC] Steps: {batch_steps:<4} | Mean Actual Return (G_t): {mean_actual_return:<8.4f} | Mean Predicted Value V(s): {old_vals_for_log:<8.4f} | Mean Value Loss: {avg_v_loss:<8.4f}")
 
         return loss_epochs.item() / self.k_epochs, v_loss_epochs.item() / self.k_epochs, p_loss_epochs.item() / self.k_epochs
 

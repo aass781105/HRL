@@ -153,7 +153,7 @@ def run_event_driven_until_nevents(*,
         old_nj = getattr(init_cfg, "n_j", None)
         try:
             setattr(init_cfg, "n_j", INIT_J)
-            job_length, op_pt, _ = SD2_instance_generator(init_cfg,42)
+            job_length, op_pt, _ = SD2_instance_generator(init_cfg, rng)
         finally:
             if old_nj is not None:
                 setattr(init_cfg, "n_j", old_nj)
@@ -235,10 +235,10 @@ def run_event_driven_until_nevents(*,
             reward = (- delta_mk - total_idle) / reward_scale
 
             # 4) 偶爾印一下（例如每 10 個 arrival）
-            if stats["arrive"] % 1 == 0:
-                print(
-                    f"Δmk={delta_mk:.2f} idle={total_idle:.2f} R={reward:.3f}"
-                )
+            # if stats["arrive"] % 1 == 0:
+            #     print(
+            #         f"Δmk={delta_mk:.2f} idle={total_idle:.2f} R={reward:.3f}"
+            #     )
 
             # 5) 更新 baseline，下一段區間會從這裡開始算
             mk_prev = mk_now
@@ -279,10 +279,10 @@ def run_event_driven_until_nevents(*,
 
                 q_list = qv.detach().cpu().numpy().ravel().tolist()  # 例如 [-26.27..., -26.48...]
                 q_str = "[" + ", ".join(f"{x:.2f}" for x in q_list) + "]"
-                print(f"[DDQN] t={t_now:.2f}  buf={len(orch.buffer)}  "
-                        f"obs={obs_str}  "
-                        f"Q={q_str}  "
-                        f"act={act}  ")
+                # print(f"[DDQN] t={t_now:.2f}  buf={len(orch.buffer)}  "
+                #         f"obs={obs_str}  "
+                #         f"Q={q_str}  "
+                #         f"act={act}  ")
             decide_release = (act == 1)
 
         elif gate_policy == "time":
@@ -405,12 +405,12 @@ def run_event_driven_until_nevents(*,
             print(f"[FLUSH][WARN] after {flush_round} rounds, buffer still has {len(orch.buffer)} jobs.")
 
     # ===== [END FLUSH] =====
-    c = 0
-    for i in all_hist:
-        for j in i:
-            print(j)
-            c += 1
-    print(c)
+    # c = 0
+    # for i in all_hist:
+    #     for j in i:
+    #         print(j)
+    #         c += 1
+    # print(c)
     stats["wall_time_sec"] = time.time() - t0_wall
     dynamic_makespan = float(np.max(orch.machine_free_time))
     return dynamic_makespan, stats
@@ -425,13 +425,14 @@ def main():
     E_MAX     = int(getattr(configs, "event_horizon", 200))          # [ADDED] 到達事件上限
     interarrival_mean = float(getattr(configs, "interarrival_mean", 0.100))
     BURST_K   = int(getattr(configs, "burst_size", 1))
+    name = str(getattr(configs, "eval_model_name", "plots/global"))
 
     if hasattr(configs, "test_method") and len(configs.test_method) > 0:
         HEURISTIC = configs.test_method[0]
     else:
         HEURISTIC = "SPT"
 
-    PLOT_GLOBAL_DIR = getattr(configs, "plot_global_dir", "plots/global")
+    PLOT_GLOBAL_DIR = getattr(configs, "plot_global_dir", "plots/global") + "/" +name
     PLOT_BATCH_DIR  = getattr(configs, "plot_batch_dir",  "plots/batch")
     INIT_J = int(getattr(configs, "init_jobs", getattr(configs, "initial_jobs", 10)))
 
