@@ -1,0 +1,26 @@
+# DDQN（augmented）：r = -(time_avg / Δt) - 0.5 * idle_ratio
+ddqn_train: true
+ddqn_reward_mode: augmented
+
+# 終止/到達流程
+event_horizon: 1000
+interarrival_mean: 50
+burst_size: 1
+init_jobs: 10
+
+# 訓練超參
+ddqn_episodes: 100
+ddqn_lr: 0.001
+ddqn_gamma: 0.99
+ddqn_eps_start: 0.20
+ddqn_eps_end: 0.01
+ddqn_eps_decay_episodes: 120
+ddqn_batch_size: 128
+ddqn_buffer_capacity: 100000
+ddqn_target_tau: 0.005
+
+# 隨機種子
+event_seed: 43
+
+# 存檔位置
+ddqn_out_dir: ddqn_ckpt/augmented
