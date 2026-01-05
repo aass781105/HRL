@@ -122,6 +122,7 @@ def run_dynamic_ppo_episode(adapter, ppo_policy, action_selection, device, max_e
     """
     orch = adapter.o
     ddqn_device = torch.device(configs.device)
+    release_count = 0
 
     # Variables for 'time' gate policy
     gate_time_threshold = float(getattr(configs, "gate_time_threshold", 50.0))
@@ -151,11 +152,11 @@ def run_dynamic_ppo_episode(adapter, ppo_policy, action_selection, device, max_e
             with torch.no_grad():
                 qv = ddqn_model(torch.from_numpy(obs).float().unsqueeze(0).to(ddqn_device))
                 if action_selection == 'sample':
-                    log_probs = F.log_softmax(qv, dim=1)
-                    act_tensor, _ = sample_action(log_probs)
-                    act = act_tensor.item()
+                    # Use Softmax (Boltzmann) exploration based on Q-values
+                    act = torch.distributions.Categorical(logits=qv).sample().item()
                 else:
-                    act = greedy_select_action(qv).item()
+                    # Greedy
+                    act = qv.argmax(dim=1).item()
             decide_release = (act == 1)
         elif gate_policy == 'time':
             acc_since_release += dt_interval
@@ -171,6 +172,7 @@ def run_dynamic_ppo_episode(adapter, ppo_policy, action_selection, device, max_e
         if decide_release:
             state_ppo = adapter.begin_new_batch(t_now)
             if state_ppo:
+                release_count += 1
                 while True:
                     with torch.no_grad():
                         pi, _ = ppo_policy(
@@ -197,6 +199,7 @@ def run_dynamic_ppo_episode(adapter, ppo_policy, action_selection, device, max_e
     flush_rounds = 0
     while len(orch.buffer) > 0 and flush_rounds < 50:
         flush_rounds += 1
+        release_count += 1
         t_flush = orch.t
         state_ppo = adapter.begin_new_batch(t_flush)
         if not state_ppo: break
@@ -218,13 +221,13 @@ def run_dynamic_ppo_episode(adapter, ppo_policy, action_selection, device, max_e
         adapter.finalize_batch()
 
     final_makespan = np.max(adapter.o.machine_free_time) if len(adapter.o.machine_free_time) > 0 else 0.0
-    return final_makespan
+    return final_makespan, release_count
 
 
 def main():
     # --- 1. Load Configuration from params.configs ---
     test_seed = getattr(configs, 'eval_seed', 42)
-    runs_per_instance = getattr(configs, 'eval_runs_per_instance', 1)
+    runs_per_instance = getattr(configs, 'eval_runs_per_instance', 10)
     num_test_instances = getattr(configs, 'eval_num_instances', 10)
     
     event_horizon = configs.event_horizon
@@ -289,6 +292,7 @@ def main():
     for i in tqdm(range(num_test_instances), desc=f"Instances for {model_name}"):
         instance_seed = test_instance_seeds[i]
         instance_makespans = []
+        instance_release_counts = []
         for run_num in trange(runs_per_instance, desc="Runs", leave=False):
             run_rng = np.random.default_rng(instance_seed)
             job_generator = EventBurstGenerator(
@@ -302,21 +306,24 @@ def main():
             )
             adapter = OrchestratorAdapter(orchestrator, n_machines=configs.n_m)
             
-            makespan = run_dynamic_ppo_episode(
+            makespan, rel_cnt = run_dynamic_ppo_episode(
                 adapter, ppo_policy, action_selection, device, event_horizon,
                 gate_policy, ddqn_model, burst_size, interarrival_mean,
                 job_generator
             )
             instance_makespans.append(makespan)
+            instance_release_counts.append(rel_cnt)
 
         avg_makespan = np.mean(instance_makespans)
         std_makespan = np.std(instance_makespans)
+        avg_release_count = np.mean(instance_release_counts)
         
         instance_result = {
             "model_name": model_name,
             "instance_id": i + 1,
             "avg_makespan": avg_makespan,
             "std_makespan": std_makespan,
+            "avg_release_count": avg_release_count,
         }
         for r_idx, r_makespan in enumerate(instance_makespans):
             instance_result[f"run{r_idx + 1}"] = r_makespan
@@ -327,10 +334,10 @@ def main():
     tqdm.write("\n" + "=" * 25 + " Evaluation Results " + "=" * 25)
     tqdm.write(f"\nModel: {model_name}")
     tqdm.write("-" * 55)
-    tqdm.write(f"{'Instance':<12} | {'Avg Makespan':<15} | {'Std Dev':<15}")
+    tqdm.write(f"{'Instance':<12} | {'Avg Makespan':<15} | {'Std Dev':<15} | {'Avg Rel Cnt':<15}")
     tqdm.write("-" * 55)
     for res in all_results:
-        tqdm.write(f"{res['instance_id']:<12} | {res['avg_makespan']:<15.2f} | {res['std_makespan']:<15.2f}")
+        tqdm.write(f"{res['instance_id']:<12} | {res['avg_makespan']:<15.2f} | {res['std_makespan']:<15.2f} | {res['avg_release_count']:<15.2f}")
 
     safe_model_name = re.sub(r'[\\/*?:"<>|]', "", model_name)
     csv_file = f'dynamic_evaluation_results_{safe_model_name}.csv'
@@ -340,12 +347,12 @@ def main():
             writer = csv.writer(f)
             header = ["Model Name", "Instance ID"]
             header.extend([f"Run {j+1}" for j in range(runs_per_instance)])
-            header.extend(["Avg Makespan", "Std Dev Makespan"])
+            header.extend(["Avg Makespan", "Std Dev Makespan", "Avg Release Count"])
             writer.writerow(header)
             for res in all_results:
                 row_data = [res['model_name'], res['instance_id']]
                 row_data.extend([res.get(f"run{j+1}") for j in range(runs_per_instance)])
-                row_data.extend([res['avg_makespan'], res['std_makespan']])
+                row_data.extend([res['avg_makespan'], res['std_makespan'], res['avg_release_count']])
                 writer.writerow(row_data)
         tqdm.write("Successfully saved results to CSV.")
     except IOError as e:

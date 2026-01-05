@@ -17,10 +17,8 @@ class EventGateEnv(gym.Env):
       - 一步 = 一次『到達事件時間』 t_now
       - action: 0=HOLD, 1=RELEASE
       - reward:
-          pure               : - time_avg / scale
-          augmented          : -(time_avg/dt + 0.5*idle_ratio) / scale
-          delta_makespan     : -(0.3*ΔMk + 0.7*total_idle) / scale
-          delta_makespan_avg : -(ΔMk/dt + idle_ratio) / scale
+          original           : - total_idle*0.5 - delta_mk *0.5 / scale
+          stability          : original - stability_penalty
     """
     metadata = {"render.modes": []}
 
@@ -56,10 +54,6 @@ class EventGateEnv(gym.Env):
         self.t_now = 0.0
         self.t_next = None
         self.events_done = 0
-
-        # 額外懲罰設定
-        self.enable_full_idle_penalty = bool(getattr(configs, "enable_full_idle_penalty", False))
-        self.full_idle_penalty = float(getattr(configs, "full_idle_penalty", 100.0))
 
         self.enable_final_flush_penalty = bool(getattr(configs, "enable_final_flush_penalty", True))
 
@@ -195,10 +189,6 @@ class EventGateEnv(gym.Env):
         if new_jobs:
             self.orch.buffer.extend(new_jobs)
 
-        # 判斷此刻是否全 idle（給 full_idle_penalty 用）
-        mft_abs = np.asarray(self.orch.machine_free_time, dtype=float)
-        all_idle_now = bool(np.all(mft_abs <= t_event + 1e-9))
-
         # (2) HOLD / RELEASE
         if int(action) == 1:
             # RELEASE：做一次完整重排
@@ -226,34 +216,24 @@ class EventGateEnv(gym.Env):
             mk_now = self._mk_prev
 
         # reward_scale：跟訓練時一致
-        scale = float(getattr(configs, "reward_scale", 50.0))
+        scale = float(getattr(configs, "reward_scale", 10.0))
+        stability_scale = float(getattr(configs, "stability_scale", 5))
+        alpha = float(getattr(configs, "reward_alpha", 0.3))
 
         # (4) reward （依 mode）
-        if self.reward_mode == "pure":
-            reward = (- time_avg) / scale
-
-        elif self.reward_mode == "augmented":
-            reward = (- (time_avg / (dt + 1e-9)) - 0.5 * idle_ratio) / scale
-
-        elif self.reward_mode == "idle_final_mk":
-            delta_mk = (mk_now - self._mk_prev)
-            reward =  (- total_idle) / scale
-            # reward =  (- total_idle*0.5 - delta_mk *0.5) / scale
-
-        elif self.reward_mode == "delta_makespan_avg":
-            delta_mk = (mk_now - self._mk_prev) / dt
-            reward = (- float(delta_mk) - idle_ratio) / scale
-
+        stability_penalty = 0.0
+        delta_mk = (mk_now - self._mk_prev)
+        
+        # Base reward: - [(1-alpha)*idle + alpha*mk_delta] / scale
+        base_reward = - ((total_idle * (1.0 - alpha)) + (delta_mk * alpha)) / scale
+        
+        if self.reward_mode == "original":
+            reward = base_reward
+        elif self.reward_mode == "stability":
+            stability_penalty = int(action) * stability_scale
+            reward = base_reward - stability_penalty
         else:
-            reward = (- time_avg) / scale
-
-        # 可選：全 idle 懲罰（buffer 有件、全 idle、且 HOLD）
-        full_idle_penalized = False
-        if self.enable_full_idle_penalty:
-            if (int(action) == 0) and (len(self.orch.buffer) > 0) and all_idle_now:
-                reward -= float(self.full_idle_penalty)
-                full_idle_penalized = True
-                
+            reward = base_reward # fallback
 
         # (5) 前進時鐘 & episode 計數
         self.t_now = t_new
@@ -267,31 +247,35 @@ class EventGateEnv(gym.Env):
 
         # （6）若終局且 buffer 還有工單 → 強制 flush，並把成本加到最後一步 reward
         final_flush_penalty = 0.0
-        delta_mk_flush = 0.0
-        idle_flush = 0.0
-        if done and self.enable_final_flush_penalty and len(self.orch.buffer) > 0:
-            mk_final, idle_flush = self._run_final_flush_and_get_cost()
-            final_flush_penalty = -mk_final / scale
-            temp = - len(self.orch.buffer)*50
+        # delta_mk_flush = 0.0 # Unused in info now
+        # idle_flush = 0.0     # Unused in info now
+        
+        if done and self.enable_final_flush_penalty:
+            if len(self.orch.buffer) > 0:
+                mk_final, idle_flush = self._run_final_flush_and_get_cost()
+            else:
+                mk_final = self._current_makespan()
+
+            final_flush_penalty = -mk_final / scale 
             reward += final_flush_penalty
 
         # 新觀測 & info
         obs = self._observe()
+        
+        # [CHANGED] Info cleanup
         info = {
             "t_now": self.t_now,
-            "time_avg": time_avg,
-            "idle_ratio": idle_ratio,
-            "dt": dt,
             "buffer_size": len(self.orch.buffer),
             "released": bool(int(action) == 1),
-            "full_idle_penalized": full_idle_penalized,
+            "total_reward": float(reward),
+            
+            # Reward breakdown (using alpha)
+            "reward_makespan_delta": - (delta_mk * alpha) / scale,
+            "reward_idle_cost": - (total_idle * (1.0 - alpha)) / scale,
+            "reward_stability_penalty": - stability_penalty,
+            "reward_final_flush_penalty": final_flush_penalty,
         }
-        if done and self.enable_final_flush_penalty:
-            info.update({
-                "final_flush_penalty": final_flush_penalty,
-                "delta_mk_flush": delta_mk_flush,
-                "idle_flush": idle_flush,
-            })
+        
         # print(f"obs:{obs},rewards:{reward:.3},act:{action},t_now:{t_event},t_next:{t_new},mk:{mk_now}, mk_prev:{temp}")
         return obs, float(reward), bool(done), bool(trunc), info
 

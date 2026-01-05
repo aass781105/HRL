@@ -1,0 +1,12 @@
+# load_ppo.yml
+
+
+
+eval_model_name: original
+ppo_model_path: trained_network\SD2\sample_num_job.pth
+ddqn_model_path: ddqn_ckpt\original.pth
+gate_policy: ddqn
+ddqn_reward_mode: original
+
+
+

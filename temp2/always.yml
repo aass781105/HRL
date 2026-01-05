@@ -1,0 +1,10 @@
+# load_ppo.yml
+
+
+
+eval_model_name: always
+ppo_model_path: trained_network\SD2\sample_num_job.pth
+gate_policy: always
+
+
+

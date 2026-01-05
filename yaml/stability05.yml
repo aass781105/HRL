@@ -1,0 +1,26 @@
+# load_ppo.yml
+
+
+# eval_model_name: stability05
+# ppo_model_path: trained_network\SD2\sample_num_job.pth
+# ddqn_model_path: ddqn_ckpt\stability05.pth
+# gate_policy: ddqn
+# ddqn_reward_mode: stability
+
+
+eval_model_name: stability05_300
+ppo_model_path: trained_network\SD2\sample_num_job.pth
+ddqn_model_path: ddqn_ckpt\stability05_300.pth
+gate_policy: ddqn
+ddqn_reward_mode: stability
+stability_scale: 0.5
+
+ddqn_episodes: 300
+ddqn_lr: 1e-4
+ddqn_gamma: 0.995
+ddqn_eps_start: 0.7
+ddqn_eps_end: 0.02
+ddqn_eps_decay_episodes: 220
+ddqn_batch_size: 128
+ddqn_buffer_capacity: 200000
+ddqn_target_tau: 0.005

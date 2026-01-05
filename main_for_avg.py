@@ -285,7 +285,7 @@ def main():
     print(f"Initial jobs @ t=0  : {INIT_J}")
     print(f"Gate policy         : {getattr(configs, 'gate_policy', 'always')}")
 
-    runs = 30
+    runs = 15
     mk_list = []
     sum_arrive = 0
     sum_release = 0

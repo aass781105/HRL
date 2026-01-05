@@ -128,14 +128,12 @@ def train_ddqn(
     returns = []               # 純回報列表
     makespans = []
     steps_list = []            # 每集步數（=到達事件數）
-    sparse_mode = (reward_mode == "sparse_makespan")
 
 # === Episodes 進度條 ===
     for ep in tqdm(range(1, episodes + 1), desc="Episodes", dynamic_ncols=True):
         state, _ = env.reset(seed=seed + ep)
         ep_return = 0.0
         ep_steps = 0
-        ep_traj = []  # 稀疏回饋時暫存 transition（s, a, ns, done）
         debug = []
         # === 每集步數（到達事件）進度條 ===
         with tqdm(total=event_horizon, desc=f"Ep{ep} steps", leave=False, dynamic_ncols=True) as pbar:
@@ -143,12 +141,12 @@ def train_ddqn(
                 a = select_action(state, epsilon(ep))
                 ns, r, done, trunc, info = env.step(a)
 
-                if sparse_mode:
-                    # 稀疏：先不把 transition 丟 replay，reward 暫設 0
-                    ep_traj.append((state.copy(), int(a), 0.0, ns.copy(), float(done)))
-                else:
-                    buf.push(state, a, r, ns, float(done))
-                    ep_return += float(r)
+                # [ADDED] 準確印出每個 step 的資訊
+                state_str = "[" + ", ".join(f"{x:6.3f}" for x in state) + "]"
+                # tqdm.write(f"[Ep {ep:03d} Step {ep_steps:03d}] Obs: {state_str} | Act: {a} | Rew: {r:8.4f}")
+
+                buf.push(state, a, r, ns, float(done))
+                ep_return += float(r)
                 debug.append((float(state[0]), float(state[1]), int(a), float(r)))
 
                 state = ns
@@ -182,61 +180,9 @@ def train_ddqn(
                     soft_update(q, q_tgt, target_tau)
 
                 if done or trunc:
-                    # last_r = float(r)
-                    # # 這一步是否有 flush penalty（如果有開 enable_final_flush_penalty）
-                    # final_pen = float(info.get("final_flush_penalty", 0.0))
-                    # delta_mk_flush = float(info.get("delta_mk_flush", 0.0))
-                    # idle_flush = float(info.get("idle_flush", 0.0))
-
-
-                    # print(
-                    #     f"[Ep {ep:03d} DONE] steps={ep_steps} "
-                    #     f"ep_return={ep_return:.3f} last_r={last_r:.3f} "
-                    #     f"final_flush_penalty={final_pen:.3f} "
-                    #     f"delta_mk_flush={delta_mk_flush:.3f} idle_flush={idle_flush:.3f}"
-                    # )
                     break
 
 
-        # ====== 稀疏回饋：終局後計算 makespan，均分回報並入 replay ======
-        if sparse_mode:
-            try:
-                ep_mk = float(np.max(getattr(env.orch, "machine_free_time", np.array([0.0]))))
-            except Exception:
-                ep_mk = 0.0
-
-            if len(ep_traj) > 0:
-                per_step_r = - ep_mk / float(len(ep_traj))
-                ep_return = - ep_mk
-                for (s0, a0, _r_ignored, s1, d0) in ep_traj:
-                    buf.push(s0, a0, per_step_r, s1, d0)
-
-                # 終局後做幾次額外更新，加速吸收稀疏訊號
-                updates = min(len(ep_traj), 10)
-                for _ in range(updates):
-                    if len(buf) < batch_size:
-                        break
-                    s, a_, r_, s2, d_ = buf.sample(batch_size)
-                    s  = torch.from_numpy(s).to(device)
-                    a_ = torch.from_numpy(a_).to(device)
-                    r_ = torch.from_numpy(r_).to(device)
-                    s2 = torch.from_numpy(s2).to(device)
-                    d_ = torch.from_numpy(d_).to(device)
-                    
-                    q_sa = q(s).gather(1, a_.view(-1, 1)).squeeze(1)
-                    with torch.no_grad():
-                        a2 = torch.argmax(q(s2), dim=1, keepdim=True)
-                        q_s2a2 = q_tgt(s2).gather(1, a2).squeeze(1)
-                        y = r_ + (1.0 - d_) * gamma * q_s2a2
-                    
-                    loss = loss_fn(q_sa, y)
-                    opt.zero_grad(set_to_none=True)
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(q.parameters(), max_norm=5.0)
-                    opt.step()
-                    soft_update(q, q_tgt, target_tau)
-            else:
-                ep_return = 0.0
         # for i, (o0, o1, aa, rr) in enumerate(debug, 1):
         #     tqdm.write(f"{i:4d} {o0:9.3f} {o1:11.3f} {aa:3d} {rr:10.4f}")
 
@@ -287,17 +233,24 @@ def train_ddqn(
 
     fig.tight_layout()
 
-    png_path = os.path.join(plot_dir, f"train_curve_{reward_mode}_{episodes}ep_for_{event_horizon}events_with_makespan.png")  # [CHANGED]
+    # [CHANGED] 使用 eval_model_name 命名圖檔
+    model_name = str(getattr(configs, "eval_model_name", "default"))
+    png_name = f"train_curve_{model_name}_{reward_mode}_{episodes}ep.png"
+    png_path = os.path.join(plot_dir, png_name)
     fig.savefig(png_path, dpi=150)
     plt.close(fig)
     print(f"[DONE] saved plots to {png_path}")
     
 
-    # ====================== [CHANGED] 只存 state_dict，檔名含 reward_mode 與 event_horizon ======================
+    # ====================== [CHANGED] 使用 eval_model_name 作為 ckpt 檔名 ======================
     out_dir = getattr(configs, "ddqn_out_dir", "ddqn_ckpt")
     os.makedirs(out_dir, exist_ok=True)
 
-    ckpt_name = f"ddqn_gate_{reward_mode}_{episodes}ep{int(event_horizon)}.pth"   # 例如 ddqn_gate_pure_200.pth
+    if hasattr(configs, "eval_model_name") and configs.eval_model_name:
+        ckpt_name = f"{configs.eval_model_name}.pth"
+    else:
+        ckpt_name = f"ddqn_gate_{reward_mode}_{episodes}ep{int(event_horizon)}.pth"
+    
     ckpt_path = os.path.join(out_dir, ckpt_name)
 
     torch.save(q.state_dict(), ckpt_path)  # 只存 online Q 的 state_dict（與 PPO 一樣的做法）

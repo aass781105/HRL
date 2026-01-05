@@ -15,7 +15,7 @@ from global_env import (
 from data_utils import SD2_instance_generator
 
 # 繪圖
-from gantt import plot_global_gantt, plot_batch_gantt
+from gantt import plot_global_gantt
 # --- Minimal reproducible seed ---
 SEED = int(getattr(configs, "event_seed", 42))
 np.random.seed(SEED)
@@ -91,13 +91,29 @@ def _gate_obs(orch: GlobalTimelineOrchestrator,
     return np.array([o0, o1, o2], dtype=np.float32)
 
 
+def get_current_makespan(orch: GlobalTimelineOrchestrator) -> float:
+    """[ADDED] 穩健地獲取當前全局 Makespan (避免 machine_free_time 在 HOLD 時的語意不一致)"""
+    # 1. 優先使用 _metric_rows (最準確的累計)
+    if hasattr(orch, "_metric_rows") and orch._metric_rows:
+        return max(float(r["end"]) for r in orch._metric_rows.values())
+    
+    # 2. 次選 _last_full_rows (上一批完整規劃)
+    if hasattr(orch, "_last_full_rows") and orch._last_full_rows:
+        return max(float(r["end"]) for r in orch._last_full_rows)
+        
+    # 3. 最後才用 machine_free_time (Fallback)
+    mft = getattr(orch, "machine_free_time", [])
+    if len(mft) > 0:
+        return float(np.max(mft))
+    return 0.0
+
+
 def run_event_driven_until_nevents(*,
                                 max_events: int,
                                 heuristic: str,
                                 interarrival_mean: float,
                                 burst_K: int = 1,
-                                plot_global_dir: Optional[str] = None,
-                                plot_batch_dir: Optional[str] = None):
+                                plot_global_dir: Optional[str] = None):
 
     # ---- 建到達生成器（事件驅動） ----
     base_cfg = copy.deepcopy(configs)
@@ -184,19 +200,35 @@ def run_event_driven_until_nevents(*,
 
     # ---- 圖檔輸出資料夾 ----
     plot_global_dir = plot_global_dir or getattr(configs, "plot_global_dir", "plots/global")
-    plot_batch_dir  = plot_batch_dir  or getattr(configs, "plot_batch_dir",  "plots/batch")
     os.makedirs(plot_global_dir, exist_ok=True)
-    os.makedirs(plot_batch_dir,  exist_ok=True)
 
     # ---- Reward debug state（給 DDQN 推論用）----
-    reward_scale = float(getattr(configs, "norm_scale", 100.0))
-    # 初始 makespan（如果目前還沒排任何東西，machine_free_time 通常是全 0）
-    mk_prev = float(np.max(orch.machine_free_time)) if len(orch.machine_free_time) > 0 else 0.0
-    # 上一次 gate 決策生效的時間（區間 [t_prev_reward, t_now) 用來算 idle）
+    import csv # [ADDED]
+    reward_scale = float(getattr(configs, "reward_scale", 50.0))
+    scale = float(getattr(configs, "norm_scale", 100.0)) # 用於 obs
+    stability_scale = float(getattr(configs, "stability_scale", 5.0))
+    
+    # [ADDED] CSV Logging Setup
+    csv_dir = plot_global_dir or getattr(configs, "plot_global_dir", "plots/global")
+    os.makedirs(csv_dir, exist_ok=True)
+    csv_path = os.path.join(csv_dir, f"inference_log_{int(time.time())}.csv")
+    csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+    csv_writer = csv.writer(csv_file)
+    csv_headers = [
+        "Event_ID", "Time", "Buffer_Size", 
+        "Obs_Buffer", "Obs_Load", "Obs_Idle", 
+        "Q_Hold", "Q_Release", "Action", "Action_Str",
+        "Reward_Total", "Reward_MkDelta", 
+        "Reward_Idle", "Reward_Stab", "Reward_Flush"
+    ]
+    csv_writer.writerow(csv_headers)
+    print(f"[INFO] Logging inference step info to: {csv_path}")
+    
+    # 初始 makespan
+    mk_prev = get_current_makespan(orch)
     t_prev_reward = 0.0
-    # 上一次 DDQN 的 action（0=HOLD, 1=RELEASE），用來印 log
     last_act = None
-
+    pending_row = None # [ADDED] 用於存儲尚未計算 Reward 的決策資料
 
     # ---- 統計 ----
     stats = {
@@ -209,44 +241,53 @@ def run_event_driven_until_nevents(*,
     }
 
     plot_seq = 0
-    t_prev = 0.0                           # [ADDED] 前一個事件時間（用來算間隔）
+    t_prev = 0.0
     t_now = 0.0
-    t_next = gen.sample_next_time(t_now)   # 第一個到達事件
+    t_next = gen.sample_next_time(t_now)
     t0_wall = time.time()
-    # [ADDED] 針對 gate_policy='time' 累積時間的計數器
     acc_since_release = 0.0
 
     while stats["arrive"] < int(max_events):
         t_now = float(t_next)
-        dt_interval = float(t_now - t_prev)   # 這次與上次事件的間隔
+        dt_interval = float(t_now - t_prev)
         t_prev = t_now
 
-                # ---- 先結清上一個 gate 決策在 [t_prev_reward, t_now) 這段的 reward（只對 ddqn 做）----
+        # ---- 先結清上一個 gate 決策在 [t_prev_reward, t_now) 這段的 reward ----
         if gate_policy == "ddqn" and ddqn_model is not None and last_act is not None:
-            # 1) 用你之前寫的 compute_interval_metrics 算這一段 idle
             metrics = orch.compute_interval_metrics(t_prev_reward, t_now)
             total_idle = float(metrics.get("total_idle", 0.0))
+            
+            # [FIX] Use robust makespan getter (handles HOLD/RELEASE consistently)
+            mk_now = get_current_makespan(orch)
 
-            # 2) 算現在的 makespan，取 delta
-            mk_now = float(np.max(orch.machine_free_time))
-            delta_mk = mk_now - mk_prev
-
-            # 3) 套跟訓練一樣的 reward 公式
-            reward = (- delta_mk - total_idle) / reward_scale
-
-            # 4) 偶爾印一下（例如每 10 個 arrival）
-            # if stats["arrive"] % 1 == 0:
-            #     print(
-            #         f"Δmk={delta_mk:.2f} idle={total_idle:.2f} R={reward:.3f}"
-            #     )
-
-            # 5) 更新 baseline，下一段區間會從這裡開始算
+            # [FIX] If HOLD, makespan shouldn't change physically. Force delta=0 to avoid jitter.
+            if last_act == 0:
+                delta_mk = 0.0
+            else:
+                delta_mk = mk_now - mk_prev
+            
+            # Always update baseline to current reality
             mk_prev = mk_now
+
+            # 符合 EventGateEnv 的 "original" 邏輯
+            alpha = float(getattr(configs, "reward_alpha", 0.3))
+            r_mk = - (delta_mk * alpha) / reward_scale
+            r_idle = - (total_idle * (1.0 - alpha)) / reward_scale
+            r_stab = 0.0
+            if str(getattr(configs, "ddqn_reward_mode", "original")) == "stability":
+                r_stab = - float(last_act) * stability_scale
+            
+            step_reward = r_mk + r_idle + r_stab
+
+            # [CHANGED] 如果有待處理的 row，填入剛剛算好的 reward 並寫入 CSV
+            if pending_row is not None:
+                pending_row.extend([
+                    f"{step_reward:.4f}", f"{r_mk:.4f}", f"{r_idle:.4f}", f"{r_stab:.4f}", "0.0000"
+                ])
+                csv_writer.writerow(pending_row)
+                pending_row = None
+
             t_prev_reward = t_now
-
-
-
-
 
         # 事件：生成 K 筆、進 buffer
         new_jobs = gen.generate_burst(t_now)
@@ -255,34 +296,34 @@ def run_event_driven_until_nevents(*,
             stats["arrived_jobs_total"] += len(new_jobs)
             stats["arrive"] += 1
 
-        # ===================== [CHANGED] 放行決策（多策略） =====================
-
+        # ===================== 放行決策 =====================
         if gate_policy == "ddqn" and ddqn_model is not None:
-            # 用與訓練一致的 2D 狀態
             obs = _gate_obs(
-                orch=orch,
-                n_machines=configs.n_m,
-                t_now=t_now,
-                burst_K=burst_K,
-                interarrival_mean=interarrival_mean,
-                buf_cap_cfg=gate_obs_buffer_cap,
-                time_scale_cfg=gate_time_scale,
+                orch=orch, n_machines=configs.n_m, t_now=t_now,
+                burst_K=burst_K, interarrival_mean=interarrival_mean,
+                buf_cap_cfg=gate_obs_buffer_cap, time_scale_cfg=gate_time_scale,
             )
+            
+            act_select = getattr(configs, 'eval_action_selection', 'greedy')
             with torch.no_grad():
                 qv = ddqn_model(torch.from_numpy(obs).float().unsqueeze(0).to(ddqn_device))
-                act = int(torch.argmax(qv, dim=1).item())  # 0=HOLD, 1=RELEASE
+                if act_select == 'sample':
+                    act = torch.distributions.Categorical(logits=qv).sample().item()
+                else:
+                    act = qv.argmax(dim=1).item()
+            
+            # [CHANGED] 準備當前步驟的資料 (不包含 reward)，先存入 pending_row
+            q_vals = qv[0].cpu().numpy()
+            pending_row = [
+                stats['arrive'],                # Event_ID
+                f"{t_now:.4f}",                 # Time
+                len(orch.buffer),               # Buffer_Size
+                f"{obs[0]:.4f}", f"{obs[1]:.4f}", f"{obs[2]:.4f}", # Obs
+                f"{q_vals[0]:.4f}", f"{q_vals[1]:.4f}", # Q_Hold, Q_Release
+                act, "RELEASE" if act == 1 else "HOLD"
+            ]
+            
             last_act = act
-            if stats["arrive"] %1 == 0:
-                mft = np.asarray(orch.machine_free_time, dtype=float)
-                obs_list = obs.tolist()  # 例如 [0.33..., 2.35..., 2.08...]
-                obs_str = "[" + ", ".join(f"{x:.2f}" for x in obs_list) + "]"
-
-                q_list = qv.detach().cpu().numpy().ravel().tolist()  # 例如 [-26.27..., -26.48...]
-                q_str = "[" + ", ".join(f"{x:.2f}" for x in q_list) + "]"
-                # print(f"[DDQN] t={t_now:.2f}  buf={len(orch.buffer)}  "
-                #         f"obs={obs_str}  "
-                #         f"Q={q_str}  "
-                #         f"act={act}  ")
             decide_release = (act == 1)
 
         elif gate_policy == "time":
@@ -328,25 +369,17 @@ def run_event_driven_until_nevents(*,
                     title=f"Global schedule @ t={tcut:.2f} (event #{plot_seq})"
                 )
 
-                # 批次圖（整批靜態結果）
-                if fin.get("rows"):
-                    batch_path = os.path.join(
-                        plot_batch_dir,
-                        f"batch_r{plot_seq:03d}_tcut{tcut_tag}_final_t{int(round(orch.t*100)):08d}.png"
-                    )
-                    plot_batch_gantt(
-                        fin["rows"],
-                        save_path=batch_path,
-                        t_now=tcut,
-                        title=f"Batch result | cut@{tcut:.2f}"
-                    )
         else:
-            # [KEPT] HOLD：不放行，buffer 繼續累積
-            pass
+            # HOLD：不放行，與 EventGateEnv 同步
+            orch.tick_without_release(t_now)
+            
         t_next = gen.sample_next_time(t_now)   # 下一個事件時間
-        # ===== [ADDED] 最後一個到達事件後，若 buffer 尚有工單 → 強制釋放全排（Flush） =====
-    if len(orch.buffer) > 0:
-        print(f"[FLUSH] last arrival reached; buffer still has {len(orch.buffer)} jobs → force release until empty.")
+        
+    # ===== [ADDED] 最後一個到達事件後，若 buffer 尚有工單 → 強制釋放全排（Flush） =====
+    buffer_before_flush = len(orch.buffer)
+    if buffer_before_flush > 0:
+        print(f"[FLUSH] last arrival reached; buffer still has {buffer_before_flush} jobs → force release until empty.")
+        # ... (其餘 flush 邏輯不變) ...
 
         # 為保險起見：若一次 release 未清空 buffer（例如容量/規則限制），用小迴圈多排幾次
         max_flush_rounds = 16
@@ -382,19 +415,6 @@ def run_event_driven_until_nevents(*,
                     t_now=tcut,
                     title=f"Global schedule (FLUSH round {flush_round}) @ t={tcut:.2f}"
                 )
-
-                # 批次圖（整批靜態結果）
-                if fin.get("rows"):
-                    batch_path = os.path.join(
-                        plot_batch_dir,
-                        f"batch_flush{plot_seq:03d}_tcut{tcut_tag}_final_t{int(round(orch.t*100)):08d}.png"
-                    )
-                    plot_batch_gantt(
-                        fin["rows"],
-                        save_path=batch_path,
-                        t_now=tcut,
-                        title=f"Batch result (FLUSH round {flush_round}) | cut@{tcut:.2f}"
-                    )
             else:
                 # 理論上不該進來；保護性終止以免死迴圈
                 print("[FLUSH] finalize did not return 'batch_finalized' — stop flushing.")
@@ -405,12 +425,38 @@ def run_event_driven_until_nevents(*,
             print(f"[FLUSH][WARN] after {flush_round} rounds, buffer still has {len(orch.buffer)} jobs.")
 
     # ===== [END FLUSH] =====
-    # c = 0
-    # for i in all_hist:
-    #     for j in i:
-    #         print(j)
-    #         c += 1
-    # print(c)
+    # [CHANGED] 結算最後一個動作的 Reward，並填入最後一個 pending_row
+    if gate_policy == "ddqn" and ddqn_model is not None and last_act is not None:
+        mk_final = get_current_makespan(orch)
+        metrics = orch.compute_interval_metrics(t_prev_reward, mk_final)
+        total_idle = float(metrics.get("total_idle", 0.0))
+        delta_mk = mk_final - mk_prev
+        
+        alpha = float(getattr(configs, "reward_alpha", 0.3))
+        r_mk = - (delta_mk * alpha) / reward_scale
+        r_idle = - (total_idle * (1.0 - alpha)) / reward_scale
+        r_stab = 0.0
+        if str(getattr(configs, "ddqn_reward_mode", "original")) == "stability":
+            r_stab = - float(last_act) * stability_scale
+        
+        # Flush Penalty
+        r_flush = 0.0
+        if bool(getattr(configs, "enable_final_flush_penalty", True)):
+            r_flush = - mk_final / reward_scale 
+            
+        final_step_reward = r_mk + r_idle + r_stab + r_flush
+        
+        if pending_row is not None:
+            pending_row.extend([
+                f"{final_step_reward:.4f}", f"{r_mk:.4f}", f"{r_idle:.4f}", f"{r_stab:.4f}", f"{r_flush:.4f}"
+            ])
+            csv_writer.writerow(pending_row)
+
+    # [ADDED] Close CSV file
+    if 'csv_file' in locals() and not csv_file.closed:
+        csv_file.close()
+        print(f"[INFO] Closed inference log CSV: {csv_path}")
+
     stats["wall_time_sec"] = time.time() - t0_wall
     dynamic_makespan = float(np.max(orch.machine_free_time))
     return dynamic_makespan, stats
@@ -433,7 +479,6 @@ def main():
         HEURISTIC = "SPT"
 
     PLOT_GLOBAL_DIR = getattr(configs, "plot_global_dir", "plots/global") + "/" +name
-    PLOT_BATCH_DIR  = getattr(configs, "plot_batch_dir",  "plots/batch")
     INIT_J = int(getattr(configs, "init_jobs", getattr(configs, "initial_jobs", 10)))
 
     print("-" * 20 + " Event-driven Orchestrated Scheduling (Event Horizon) " + "-" * 20)
@@ -445,7 +490,6 @@ def main():
     print(f"Initial jobs @ t=0  : {INIT_J}")
     print(f"Gate policy         : {getattr(configs, 'gate_policy', 'always')}")
     print(f"Global plots dir    : {PLOT_GLOBAL_DIR}")
-    print(f"Batch  plots dir    : {PLOT_BATCH_DIR}")
 
     mk, stats = run_event_driven_until_nevents(
         max_events=E_MAX,
@@ -453,7 +497,6 @@ def main():
         interarrival_mean=interarrival_mean,
         burst_K=BURST_K,
         plot_global_dir=PLOT_GLOBAL_DIR,
-        plot_batch_dir=PLOT_BATCH_DIR,
     )
 
     print("\n== Summary ==")

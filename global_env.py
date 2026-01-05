@@ -410,14 +410,31 @@ class GlobalTimelineOrchestrator:
         # ======================= [BUG FIX: MERGE LOGIC] =======================
         # 找出PPO本次處理的工單ID集合
         committed_job_ids = {js.job_id for js in self._committed_jobs} if self._committed_jobs else set()
+        t_batch_start = float(self._batch_tcut) if self._batch_tcut is not None else self.t
 
-        # 找出在舊的「未來規劃」中，但本次未被PPO處理的「遠期工單」
+        # 建構新的完整 rows
+        # 1. 沒參與重排的 job -> 保留所有 rows
+        # 2. 有參與重排的 job -> 只保留 History 部分 (start < t)，其餘用 batch_rows 取代
+        kept_rows = []
+        if self._last_full_rows:
+            for r in self._last_full_rows:
+                jid = int(r["job"])
+                if jid not in committed_job_ids:
+                    kept_rows.append(r)
+                else:
+                    # 參與重排者，保留 H (嚴格小於切點)
+                    if float(r["start"]) < t_batch_start:
+                        kept_rows.append(r)
+
+        # 合併：保留的舊 rows (History + Unaffected) + 新排的 rows (Future of Committed)
+        new_full_rows = kept_rows + batch_rows
+
+        # 更新 jobs snapshot
+        # 對於 committed jobs，直接用新的狀態取代；對於 unaffected，保留舊的
+        # 注意：這裡 jobs snapshot 主要用於下一次切分，邏輯上 committed jobs 已經包含了剩下的工序
+        # 但為了保持完整性，我們需要把 unaffected jobs 加回來
         unaffected_jobs = [js for js in self._last_jobs_snapshot if js.job_id not in committed_job_ids]
-        unaffected_rows = [row for row in self._last_full_rows if row['job'] not in committed_job_ids]
-
-        # 將「遠期工單」與PPO新排程的工單合併，形成新的、完整的未來規劃
         new_snapshot = unaffected_jobs + (self._committed_jobs if self._committed_jobs else [])
-        new_full_rows = unaffected_rows + batch_rows
 
         # =====================================================================
 
@@ -568,8 +585,7 @@ class GlobalTimelineOrchestrator:
         [ADDED] 在 t_event 事件時刻『不放行』：
           - 更新 self.t
           - 把上一批完整計畫中，start < t_event 的片段加入歷史 H（只做左半段，R 不動）
-          - 用 H 跨切點占用更新 self.machine_free_time
-          - 不建立新 env、不 finalize、不改 _last_full_rows（仍然沿用上一批計畫）
+          - [FIXED] 用 _last_full_rows (H+R) 更新 machine_free_time，確保 obs 反映真實負載
         """
         self.t = float(t_event)
 
@@ -581,8 +597,18 @@ class GlobalTimelineOrchestrator:
         if H_add:
             self._extend_global_rows_dedup(H_add)
 
-        # 只看 H 的跨切點在製，更新機台 busy-until（絕對時間）
-        self.machine_free_time = self._compute_mft_from_H(self.t)
+        # [FIXED] 更新機台 busy-until（絕對時間）：考慮所有已排程工單（H+R）
+        # 這樣 o1 (Load) 和 o2 (Idle) 在 HOLD 時才不會因為忽略 R 而錯誤歸零
+        busy_until = np.full(self.M, float(self.t), dtype=float)
+        if self._last_full_rows:
+            for r in self._last_full_rows:
+                m = int(r["machine"])
+                e = float(r["end"])
+                # 只要該工單結束時間比目前記錄的晚，就更新
+                if e > busy_until[m]:
+                    busy_until[m] = e
+        
+        self.machine_free_time = busy_until
 
         # 不改 R_rows / 不改 jobs snapshot
         return {
