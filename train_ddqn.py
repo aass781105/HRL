@@ -14,26 +14,10 @@ import torch.optim as optim
 
 from event_gate_env import EventGateEnv
 from params import configs
+from model.ddqn_model import QNet
 
 # [ADDED] for plotting
 import matplotlib.pyplot as plt
-import csv
-
-
-# --------- Q-Network ---------
-class QNet(nn.Module):  # [KEPT]
-    def __init__(self, obs_dim: int, hidden: int = 128, n_actions: int = 2):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, n_actions),
-        )
-
-    def forward(self, x):
-        return self.net(x)
 
 
 # --------- Replay Buffer ---------
@@ -147,7 +131,11 @@ def train_ddqn(
 
                 buf.push(state, a, r, ns, float(done))
                 ep_return += float(r)
-                debug.append((float(state[0]), float(state[1]), int(a), float(r)))
+                # [CHANGED] 記錄完整 state (4維) + action + reward
+                debug.append((
+                    float(state[0]), float(state[1]), float(state[2]), float(state[3]),
+                    int(a), float(r)
+                ))
 
                 state = ns
                 ep_steps += 1
@@ -183,8 +171,8 @@ def train_ddqn(
                     break
 
 
-        # for i, (o0, o1, aa, rr) in enumerate(debug, 1):
-        #     tqdm.write(f"{i:4d} {o0:9.3f} {o1:11.3f} {aa:3d} {rr:10.4f}")
+        # for i, (o0, o1, o2, o3, aa, rr) in enumerate(debug, 1):
+        #     tqdm.write(f"{i:4d} | Buf:{o0:5.2f} AvgL:{o1:5.2f} MinL:{o2:5.2f} WIdle:{o3:5.2f} | Act:{aa} Rew:{rr:8.4f}")
 
         # 紀錄本集統計
         log.append((ep, ep_return, ep_steps))

@@ -9,7 +9,7 @@ from gymnasium import spaces
 from params import configs
 from data_utils import SD2_instance_generator
 from global_env import GlobalTimelineOrchestrator, EventBurstGenerator, split_matrix_to_jobs
-
+from model.ddqn_model import calculate_ddqn_state
 
 class EventGateEnv(gym.Env):
     """
@@ -60,10 +60,10 @@ class EventGateEnv(gym.Env):
         # 上一輪 makespan
         self._mk_prev = 0.0
 
-        # Gym space（狀態 3 維；動作 {0,1}）
-        # state = [ n_buffer_norm, S_norm, L_min_norm ]
+        # Gym space（狀態 4 維；動作 {0,1}）
+        # state = [ n_buffer_norm, S_norm, L_min_norm, Weighted_Idle_norm ]
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32
         )
         self.action_space = spaces.Discrete(2)
 
@@ -80,25 +80,20 @@ class EventGateEnv(gym.Env):
 
     # --------------------------- 狀態抽取 ---------------------------
     def _observe(self) -> np.ndarray:
-        # 1) buffer 大小
-        buf_size = len(self.orch.buffer)
-
-        # 2) 機台剩餘忙碌時間 rem_k = max(machine_free_time_k - t_now, 0)
-        mft_abs = np.asarray(self.orch.machine_free_time, dtype=float)
-        rem = np.maximum(0.0, mft_abs - float(self.t_now))  # [M]
-
-        if rem.size > 0:
-            total_rem = float(rem.sum()) / self.M   # 平均剩餘負載
-            first_idle_rem = float(rem.min())       # 離第一台 idle 還有多久
-        else:
-            total_rem = 0.0
-            first_idle_rem = 0.0
-
-        o0 = self._norm_buffer(buf_size)
-        o1 = self._norm_time(total_rem)
-        o2 = self._norm_time(first_idle_rem)
-
-        return np.array([o0, o1, o2], dtype=np.float32)
+        # 1) Buffer Cap Determination
+        cap = self.obs_buffer_cap
+        if cap is None or cap <= 0:
+            cap = max(1, self.burst_K * 3)
+        
+        # 2) Call centralized state calculation
+        return calculate_ddqn_state(
+            buffer_size=len(self.orch.buffer),
+            machine_free_time=self.orch.machine_free_time,
+            t_now=float(self.t_now),
+            n_machines=self.M,
+            obs_buffer_cap=int(cap),
+            time_scale=self.time_scale
+        )
 
     # --------------------------- 工具：目前 makespan ---------------------------
     def _current_makespan(self) -> float:

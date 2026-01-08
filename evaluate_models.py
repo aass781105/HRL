@@ -65,18 +65,7 @@ BatchScheduleRecorder.record_step = patched_record_step
 
 
 # --- DDQN Gating Components (from main.py) ---
-class _QNet(nn.Module):
-    def __init__(self, obs_dim: int = 3, hidden: int = 128, n_actions: int = 2):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, n_actions),
-        )
-    def forward(self, x):
-        return self.net(x)
+from model.ddqn_model import QNet, calculate_ddqn_state
 
 def fixed_k_sampler(K: int):
     """[ADDED] 固定一次釋放 K 筆的 sampler。"""
@@ -92,11 +81,16 @@ def _gate_obs(orch: GlobalTimelineOrchestrator, n_machines: int, t_now: float,
     Mirrors the observation function used in training.
     """
     scale = float(getattr(configs, "norm_scale", 100.0))
-    
-    # Buffer size feature
-    buf_size = len(orch.buffer)
     cap = int(buf_cap_cfg) if int(buf_cap_cfg) > 0 else max(1, int(burst_K) * 3)
-    o0 = float(buf_size) / float(cap)
+    
+    return calculate_ddqn_state(
+        buffer_size=len(orch.buffer),
+        machine_free_time=orch.machine_free_time,
+        t_now=t_now,
+        n_machines=n_machines,
+        obs_buffer_cap=cap,
+        time_scale=scale
+    )
 
     # Time-based features
     mft_abs = np.asarray(orch.machine_free_time, dtype=float)
@@ -255,7 +249,7 @@ def main():
             tqdm.write("       Falling back to 'always' release policy.")
             gate_policy = 'always'
         else:
-            ddqn_model = _QNet(obs_dim=3, hidden=128, n_actions=2).to(device)
+            ddqn_model = QNet(obs_dim=4, hidden=128, n_actions=2).to(device)
             ddqn_model.load_state_dict(torch.load(ddqn_model_path, map_location=device))
             ddqn_model.eval()
             tqdm.write(f"Successfully loaded DDQN gate model from: {ddqn_model_path}")

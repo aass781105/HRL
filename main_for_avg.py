@@ -23,19 +23,7 @@ random.seed(SEED)
 # ======================= [ADDED] DDQN 推論用最小 QNetwork =======================
 import torch
 import torch.nn as nn
-
-class _QNet(nn.Module):  # [ADDED]
-    def __init__(self, obs_dim: int = 2, hidden: int = 128, n_actions: int = 2):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, n_actions),
-        )
-    def forward(self, x):
-        return self.net(x)
+from model.ddqn_model import QNet, calculate_ddqn_state
 
 # -----------------------------------------------------------------------------
 
@@ -60,32 +48,16 @@ def _gate_obs(orch: GlobalTimelineOrchestrator,
     """
     scale = float(getattr(configs, "norm_scale", 100.0))
     # buffer
-    buf_size = len(orch.buffer)
     cap = int(buf_cap_cfg) if int(buf_cap_cfg) > 0 else max(1, int(burst_K) * 3)
-    o0 = float(buf_size) / float(cap)
-
-    # time variance
-    mft_abs = np.asarray(orch.machine_free_time, dtype=float)
-    rem = np.maximum(0.0, mft_abs - float(t_now))
-    if rem.size > 0:
-        # 總剩餘負載 S = Σ R_k
-        total_rem = float(rem.sum()) /n_machines
-
-        # 離第一台 idle 還有多久 L_min = min R_k
-        #   - 若有機器已經 idle，對應 rem=0 => L_min = 0
-        #   - 若所有機器都還在忙，L_min > 0
-        first_idle_rem = float(rem.min())
-    else:
-        total_rem = 0.0
-        first_idle_rem = 0.0
-
-     # 3) 正規化
-    o0 = float(buf_size) / cap          # buffer 大小 -> [0,1] 之類
-    o1 = float(total_rem) /scale          # S_norm：整體未來負載
-    o2 = float(first_idle_rem) / scale    # L_min_norm：離第一台 idle 還有多久
-
-    # 4) high-level state = [ n_buffer, S_norm, L_min_norm ]
-    return np.array([o0, o1, o2], dtype=np.float32)
+    
+    return calculate_ddqn_state(
+        buffer_size=len(orch.buffer),
+        machine_free_time=orch.machine_free_time,
+        t_now=t_now,
+        n_machines=n_machines,
+        obs_buffer_cap=cap,
+        time_scale=scale
+    )
 
 
 def run_event_driven_until_nevents(*,
@@ -127,9 +99,9 @@ def run_event_driven_until_nevents(*,
     # DDQN 推論初始化（僅當 gate_policy='ddqn'）
     ddqn_model = None
     ddqn_device = torch.device(getattr(configs, "device", "cpu"))
-    if gate_policy == "ddqn":  # [ADDED]
+    if gate_policy == "ddqn":
         ddqn_model_path = str(getattr(configs, "ddqn_model_path", "ddqn_ckpt/ddqn_gate_pure.pth"))
-        ddqn_model = _QNet(obs_dim=3, hidden=128, n_actions=2).to(ddqn_device)
+        ddqn_model = QNet(obs_dim=4, hidden=128, n_actions=2).to(ddqn_device)
         try:
             sd = torch.load(ddqn_model_path, map_location=ddqn_device)
             ddqn_model.load_state_dict(sd)

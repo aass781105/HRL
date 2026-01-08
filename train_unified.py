@@ -22,19 +22,9 @@ from common_utils import sample_action
 from global_env import GlobalTimelineOrchestrator, EventBurstGenerator, split_matrix_to_jobs
 from data_utils import SD2_instance_generator
 from PPO_orchestrator_adapter import OrchestratorAdapter
+from model.ddqn_model import QNet, calculate_ddqn_state
 
 # --- DDQN Components (brought in from train_ddqn.py for self-containment) ---
-class QNet(nn.Module):
-    def __init__(self, obs_dim: int, hidden: int = 128, n_actions: int = 2):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden), nn.ReLU(inplace=True),
-            nn.Linear(hidden, hidden), nn.ReLU(inplace=True),
-            nn.Linear(hidden, n_actions),
-        )
-    def forward(self, x):
-        return self.net(x)
-
 class ReplayBuffer:
     def __init__(self, capacity: int = 100_000):
         self.buf = deque(maxlen=int(capacity))
@@ -53,20 +43,15 @@ class ReplayBuffer:
 
 # --- Helper function to get DDQN state (from main.py) ---
 def _get_gate_obs(orch: GlobalTimelineOrchestrator, n_machines: int, t_now: float, burst_K: int, obs_buffer_cap: int, norm_scale: float) -> np.ndarray:
-    buf_size = len(orch.buffer)
     cap = int(obs_buffer_cap) if int(obs_buffer_cap) > 0 else max(1, int(burst_K) * 3)
-    o0 = float(buf_size) / float(cap)
-
-    mft_abs = np.asarray(orch.machine_free_time, dtype=float)
-    rem = np.maximum(0.0, mft_abs - float(t_now))
-    
-    total_rem = float(rem.sum()) / n_machines if rem.size > 0 else 0.0
-    first_idle_rem = float(rem.min()) if rem.size > 0 else 0.0
-
-    o1 = total_rem / norm_scale
-    o2 = first_idle_rem / norm_scale
-    
-    return np.array([o0, o1, o2], dtype=np.float32)
+    return calculate_ddqn_state(
+        buffer_size=len(orch.buffer),
+        machine_free_time=orch.machine_free_time,
+        t_now=t_now,
+        n_machines=n_machines,
+        obs_buffer_cap=cap,
+        time_scale=norm_scale
+    )
 
 def _run_final_flush_and_get_cost(
     orchestrator: GlobalTimelineOrchestrator,
