@@ -490,6 +490,10 @@ class GlobalTimelineOrchestrator:
             for r in self._last_full_rows:
                 by_job.setdefault(int(r["job"]), []).append(r)
 
+        # [DIAGNOSTIC] 註解掉診斷日誌
+        # diag_file = open("reschedule_diagnostic.txt", "a", encoding="utf-8")
+        # diag_file.write(f"\n--- Reschedule Event at t={self.t:.4f} ---\n")
+
         # 機台在製佔用：只看 H 的跨切點（s < t < e）→ 回傳「絕對 busy-until」
         self.machine_free_time = self._compute_mft_from_H(self.t)
 
@@ -499,29 +503,53 @@ class GlobalTimelineOrchestrator:
             for js in self._last_jobs_snapshot:
                 jid = int(js.job_id)
                 seq = sorted(by_job.get(jid, []), key=lambda x: x["op"]) if jid in by_job else []
-                k_done = sum(1 for r in seq if float(r["start"]) < self.t)
-                inprog = [r for r in seq if (float(r["start"]) < self.t < float(r["end"]))]
+                # [FIXED LOGIC] 修正工單遺失問題
+                # 1. 找出所有「已開始」的工序 (Global Op ID)
+                started_ops = [int(r["op"]) for r in seq if float(r["start"]) < self.t]
+                if started_ops:
+                    next_op_global = max(started_ops) + 1
+                else:
+                    next_op_global = 0
 
+                # 2. 計算局部切分點
+                base_offset = int(js.meta.get("op_offset", 0))
+                slice_from = next_op_global - base_offset
+                slice_from = max(0, slice_from)
+
+                # 3. 計算 ready_at
+                inprog = [r for r in seq if (float(r["start"]) < self.t < float(r["end"]))]
                 if inprog:
-                    ready_at = float(inprog[0]["end"])  # 非搶占：下一道等此在製結束（絕對）
-                    slice_from = int([r["op"] for r in seq].index(inprog[0]["op"]) + 1)
+                    ready_at = float(inprog[0]["end"])
                 else:
                     ready_at = self.t
-                    slice_from = int(k_done)
 
-                base_offset = int(js.meta.get("op_offset", 0))
+                # [DIAGNOSTIC] 記錄切分詳情
+                # diag_file.write(f"Job {jid:3d}: offset={base_offset:2d}, next_op_glob={next_op_global:2d}, slice={slice_from:2d}")
+
                 new_offset = base_offset + slice_from
                 ops_left = js.operations[slice_from:]
+                
                 if ops_left:
                     js2 = JobSpec(job_id=jid, operations=list(ops_left), meta=dict(js.meta))
                     js2.meta["op_offset"] = new_offset
                     js2.meta["ready_at"] = ready_at  # [CHANGED] 儲存絕對時間
                     remain_jobs.append(js2)
+                    # diag_file.write(f" -> KEEP: {len(ops_left):2d} ops left\n")
+                else:
+                    # diag_file.write(" -> FINISHED\n")
+                    pass
 
         # === 2) 新批 = R ∪ B（B 事件當下清空） ===
         jobs_from_B = list(self.buffer)
+        # for jb in jobs_from_B:
+        #     diag_file.write(f"New Job {jb.job_id:3d} arrived from buffer.\n")
+            
         self.buffer.clear()
         jobs_new = list(remain_jobs) + jobs_from_B
+        
+        # diag_file.write(f"Total jobs to builder: {len(jobs_new)}\n")
+        # diag_file.close()
+
         if not jobs_new:
             # 沒東西可排：只更新 t 即可
             return {"event": "tick", "t": self.t, "buffer": 0, "new_jobs": 0, "t_cut": self.t}
