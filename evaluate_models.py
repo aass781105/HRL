@@ -83,13 +83,20 @@ def _gate_obs(orch: GlobalTimelineOrchestrator, n_machines: int, t_now: float,
     scale = float(getattr(configs, "norm_scale", 100.0))
     cap = int(buf_cap_cfg) if int(buf_cap_cfg) > 0 else max(1, int(burst_K) * 3)
     
+    mft_abs = np.asarray(orch.machine_free_time, dtype=float)
+    rem = np.maximum(0.0, mft_abs - float(t_now))
+    horizon = float(rem.min()) if rem.size > 0 else 0.0
+    
+    w_idle = orch.compute_weighted_idle(t_now, horizon)
+    
     return calculate_ddqn_state(
         buffer_size=len(orch.buffer),
         machine_free_time=orch.machine_free_time,
         t_now=t_now,
         n_machines=n_machines,
         obs_buffer_cap=cap,
-        time_scale=scale
+        time_scale=scale,
+        weighted_idle=w_idle
     )
 
     # Time-based features

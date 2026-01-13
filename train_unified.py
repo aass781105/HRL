@@ -44,13 +44,22 @@ class ReplayBuffer:
 # --- Helper function to get DDQN state (from main.py) ---
 def _get_gate_obs(orch: GlobalTimelineOrchestrator, n_machines: int, t_now: float, burst_K: int, obs_buffer_cap: int, norm_scale: float) -> np.ndarray:
     cap = int(obs_buffer_cap) if int(obs_buffer_cap) > 0 else max(1, int(burst_K) * 3)
+    
+    # Calculate Horizon (min remaining time)
+    mft_abs = np.asarray(orch.machine_free_time, dtype=float)
+    rem = np.maximum(0.0, mft_abs - float(t_now))
+    horizon = float(rem.min()) if rem.size > 0 else 0.0
+    
+    w_idle = orch.compute_weighted_idle(t_now, horizon)
+    
     return calculate_ddqn_state(
         buffer_size=len(orch.buffer),
         machine_free_time=orch.machine_free_time,
         t_now=t_now,
         n_machines=n_machines,
         obs_buffer_cap=cap,
-        time_scale=norm_scale
+        time_scale=norm_scale,
+        weighted_idle=w_idle
     )
 
 def _run_final_flush_and_get_cost(

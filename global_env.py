@@ -733,6 +733,86 @@ class GlobalTimelineOrchestrator:
             "interval_dt": dt,
         }
 
+    def compute_weighted_idle(self, t_now: float, horizon: float) -> float:
+        """
+        [ADDED] 計算在 [t_now, t_now + horizon] 區間內的加權閒置時間。
+        能夠捕捉排程中間的「碎片化閒置」。
+        權重函數：w(t) = 1 - (t - t_now) / horizon (線性遞減，越近權重越大)
+        """
+        if horizon <= 1e-9:
+            return 0.0
+            
+        t_end = t_now + horizon
+        
+        # 1. 收集每台機器的忙碌區間
+        machine_intervals = [[] for _ in range(self.M)]
+        
+        # 使用 _metric_rows (包含歷史與最新的完整視圖) 或 _last_full_rows
+        # _last_full_rows 足夠，因為它包含了當前最新的排程狀態
+        rows = self._last_full_rows
+        
+        for r in rows:
+            m = int(r["machine"])
+            s = float(r["start"])
+            e = float(r["end"])
+            
+            # 取交集：只關心落在 [t_now, t_end] 內的忙碌部分
+            # max(t_now, s) ~ min(t_end, e)
+            act_s = max(t_now, s)
+            act_e = min(t_end, e)
+            
+            if act_e > act_s:
+                machine_intervals[m].append((act_s, act_e))
+                
+        total_weighted_idle = 0.0
+        
+        # 2. 對每台機器計算閒置積分
+        for m in range(self.M):
+            intervals = machine_intervals[m]
+            intervals.sort(key=lambda x: x[0])
+            
+            # 合併重疊區間 (Merge Intervals)
+            merged = []
+            if intervals:
+                curr_s, curr_e = intervals[0]
+                for next_s, next_e in intervals[1:]:
+                    if next_s < curr_e: # Overlap or touch
+                        curr_e = max(curr_e, next_e)
+                    else:
+                        merged.append((curr_s, curr_e))
+                        curr_s, curr_e = next_s, next_e
+                merged.append((curr_s, curr_e))
+            
+            # 3. 找出閒置區間 (Gaps)
+            # 視窗起點 t_now
+            curr_ptr = t_now
+            gaps = []
+            
+            for (s, e) in merged:
+                if s > curr_ptr:
+                    gaps.append((curr_ptr, s))
+                curr_ptr = max(curr_ptr, e)
+            
+            # 視窗終點 check
+            if curr_ptr < t_end:
+                gaps.append((curr_ptr, t_end))
+                
+            # 4. 積分計算
+            # Int_{s}^{e} (1 - (t - t0)/H) dt
+            # Let u = t - t0, then du = dt. Range: s-t0 to e-t0
+            # Int (1 - u/H) du = [u - u^2/(2H)]
+            for (g_s, g_e) in gaps:
+                u1 = g_s - t_now
+                u2 = g_e - t_now
+                
+                # 積分公式: (u2 - u1) - (u2^2 - u1^2) / (2H)
+                term1 = u2 - u1
+                term2 = (u2**2 - u1**2) / (2.0 * horizon)
+                val = term1 - term2
+                total_weighted_idle += val
+
+        return total_weighted_idle / self.M
+
 
 
 

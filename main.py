@@ -52,27 +52,26 @@ def _gate_obs(orch: GlobalTimelineOrchestrator,
     scale = float(getattr(configs, "norm_scale", 100.0))
     cap = int(buf_cap_cfg) if int(buf_cap_cfg) > 0 else max(1, int(burst_K) * 3)
     
+    mft_abs = np.asarray(orch.machine_free_time, dtype=float)
+    rem = np.maximum(0.0, mft_abs - float(t_now))
+    horizon = float(rem.min()) if rem.size > 0 else 0.0
+    
+    w_idle = orch.compute_weighted_idle(t_now, horizon)
+    
     return calculate_ddqn_state(
         buffer_size=len(orch.buffer),
         machine_free_time=orch.machine_free_time,
         t_now=t_now,
         n_machines=n_machines,
         obs_buffer_cap=cap,
-        time_scale=scale
+        time_scale=scale,
+        weighted_idle=w_idle
     )
 
 
 def get_current_makespan(orch: GlobalTimelineOrchestrator) -> float:
-    """[ADDED] 穩健地獲取當前全局 Makespan (避免 machine_free_time 在 HOLD 時的語意不一致)"""
-    # 1. 優先使用 _metric_rows (最準確的累計)
-    if hasattr(orch, "_metric_rows") and orch._metric_rows:
-        return max(float(r["end"]) for r in orch._metric_rows.values())
-    
-    # 2. 次選 _last_full_rows (上一批完整規劃)
-    if hasattr(orch, "_last_full_rows") and orch._last_full_rows:
-        return max(float(r["end"]) for r in orch._last_full_rows)
-        
-    # 3. 最後才用 machine_free_time (Fallback)
+    """[ADDED] 穩健地獲取當前全局 Makespan"""
+    # 直接使用 machine_free_time，因為 Orchestrator 現在保證它在 HOLD/RELEASE/FLUSH 後都是最新的絕對時間
     mft = getattr(orch, "machine_free_time", [])
     if len(mft) > 0:
         return float(np.max(mft))
@@ -346,8 +345,11 @@ def run_event_driven_until_nevents(*,
             
         t_next = gen.sample_next_time(t_now)   # 下一個事件時間
         
+        
     # ===== [ADDED] 最後一個到達事件後，若 buffer 尚有工單 → 強制釋放全排（Flush） =====
+    mk_before_flush = get_current_makespan(orch)  # [ADDED] 記錄 flush 前的 makespan
     buffer_before_flush = len(orch.buffer)
+    
     if buffer_before_flush > 0:
         print(f"[FLUSH] last arrival reached; buffer still has {buffer_before_flush} jobs → force release until empty.")
         # ... (其餘 flush 邏輯不變) ...
@@ -397,11 +399,19 @@ def run_event_driven_until_nevents(*,
 
     # ===== [END FLUSH] =====
     # [CHANGED] 結算最後一個動作的 Reward，並填入最後一個 pending_row
+    # 邏輯修正：嚴格對齊 event_gate_env.py
+    # 1. Step Reward: 計算 [t_prev_reward, t_next] 的 idle 與 mk_delta (使用 mk_before_flush)
+    # 2. Flush Penalty: - mk_final / scale
     if gate_policy == "ddqn" and ddqn_model is not None and last_act is not None:
         mk_final = get_current_makespan(orch)
-        metrics = orch.compute_interval_metrics(t_prev_reward, mk_final)
+        
+        # 計算 Step 部分 (只到 t_next, 不含 flush 延伸)
+        # 注意: t_next 是最後一個事件的時間 (Episode End Time)
+        metrics = orch.compute_interval_metrics(t_prev_reward, t_next)
         total_idle = float(metrics.get("total_idle", 0.0))
-        delta_mk = mk_final - mk_prev
+        
+        # Delta MK: 這裡只看 Step 造成的變化，不看 Flush 造成的暴增
+        delta_mk = mk_before_flush - mk_prev
         
         alpha = float(getattr(configs, "reward_alpha", 0.3))
         r_mk = - (delta_mk * alpha) / reward_scale
@@ -410,7 +420,7 @@ def run_event_driven_until_nevents(*,
         if str(getattr(configs, "ddqn_reward_mode", "original")) == "stability":
             r_stab = - float(last_act) * stability_scale
         
-        # Flush Penalty
+        # Flush Penalty (Terminal Reward)
         r_flush = 0.0
         if bool(getattr(configs, "enable_final_flush_penalty", True)):
             r_flush = - mk_final / reward_scale 

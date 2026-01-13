@@ -84,15 +84,25 @@ class EventGateEnv(gym.Env):
         cap = self.obs_buffer_cap
         if cap is None or cap <= 0:
             cap = max(1, self.burst_K * 3)
+            
+        # 2) Horizon Determination for Weighted Idle
+        # 使用 min(rem) 作為 horizon，因為 user 希望計算「從 t_now 到第一台完工」這段時間的碎片閒置
+        mft_abs = np.asarray(self.orch.machine_free_time, dtype=float)
+        rem = np.maximum(0.0, mft_abs - float(self.t_now))
+        horizon = float(rem.min()) if rem.size > 0 else 0.0
         
-        # 2) Call centralized state calculation
+        # 3) Calculate Weighted Idle (Fragmented)
+        w_idle = self.orch.compute_weighted_idle(float(self.t_now), horizon)
+        
+        # 4) Call centralized state calculation
         return calculate_ddqn_state(
             buffer_size=len(self.orch.buffer),
             machine_free_time=self.orch.machine_free_time,
             t_now=float(self.t_now),
             n_machines=self.M,
             obs_buffer_cap=int(cap),
-            time_scale=self.time_scale
+            time_scale=self.time_scale,
+            weighted_idle=w_idle
         )
 
     # --------------------------- 工具：目前 makespan ---------------------------
