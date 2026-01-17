@@ -1,0 +1,20 @@
+# load_ppo.yml
+
+
+# eval_model_name: stability01
+# ppo_model_path: trained_network\SD2\sample_num_job.pth
+# ddqn_model_path: ddqn_ckpt\stability01.pth
+# gate_policy: ddqn
+# ddqn_reward_mode: stability
+
+
+
+eval_model_name: 55_100_30
+ppo_model_path: trained_network\SD2\sample_num_job.pth
+ddqn_model_path: ddqn_ckpt\5510030.pth
+gate_policy: ddqn
+ddqn_reward_mode: original
+
+interarrival_mean: 55
+init_jobs: 100
+event_horizon: 30

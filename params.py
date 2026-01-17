@@ -153,7 +153,7 @@ parser.add_argument('--gate_policy', type=str, default='ddqn',
 parser.add_argument('--eval_action_selection', type=str, default='greedy',
                     choices=['sample', 'greedy'],
                     help='sample or greedy')
-parser.add_argument('--ddqn_model_path', type=str, default=r"temp\original.pth", help='DDQN 推論權重路徑（.pth）')
+parser.add_argument('--ddqn_model_path', type=str, default=r"yaml\55_100_30.yml", help='DDQN 推論權重路徑（.pth）')
 
 # Gate Thresholds & Obs Params
 parser.add_argument('--gate_time_threshold', type=float, default=250.0, help='當 gate_policy=time 時，兩次釋放之間所需的最小事件間隔（可累加）')

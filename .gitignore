@@ -1,10 +1,10 @@
+
 *.txt
 *.fjs
- __pycache__/
+__pycache__/
 *.png
 *.csv
 *.xlsx
 *.npy
-.yml
 *.pyc
 data/
