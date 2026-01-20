@@ -12,7 +12,7 @@ from global_env import (
     EventBurstGenerator,     # [ADDED] 事件驅動生成器
     split_matrix_to_jobs,
 )
-from data_utils import SD2_instance_generator
+from data_utils import SD2_instance_generator, generate_due_dates
 
 # --- Minimal reproducible seed ---
 SEED = int(getattr(configs, "event_seed", 42))
@@ -32,6 +32,28 @@ def fixed_k_sampler(K: int):
     def _fn(rng: np.random.Generator) -> int:
         return int(K)
     return _fn
+
+def get_buffer_stats(buffer, t_now):
+    """計算 Buffer 的急迫度統計特徵"""
+    if not buffer:
+        return {"tardiness_ratio": 0.0, "min_slack": 0.0, "avg_slack": 0.0}
+        
+    slacks = []
+    num_tardy = 0
+    for job in buffer:
+        due_date = float(job.meta.get("due_date", float('inf')))
+        total_pt = float(job.meta.get("total_proc_time", 0.0))
+        slack = due_date - t_now - total_pt
+        slacks.append(slack)
+        
+        if t_now > due_date:
+            num_tardy += 1
+            
+    return {
+        "tardiness_ratio": num_tardy / len(buffer),
+        "min_slack": min(slacks),
+        "avg_slack": sum(slacks) / len(slacks)
+    }
 
 
 # ======================= [ADDED] Gate 觀測量（與訓練環境一致） =======================
@@ -56,6 +78,10 @@ def _gate_obs(orch: GlobalTimelineOrchestrator,
     
     w_idle = orch.compute_weighted_idle(t_now, horizon)
     
+    # [ADDED] Calculate Urgency Stats
+    buf_stats = get_buffer_stats(orch.buffer, t_now)
+    wip_stats = orch.get_wip_stats(t_now)
+    
     return calculate_ddqn_state(
         buffer_size=len(orch.buffer),
         machine_free_time=orch.machine_free_time,
@@ -63,7 +89,9 @@ def _gate_obs(orch: GlobalTimelineOrchestrator,
         n_machines=n_machines,
         obs_buffer_cap=cap,
         time_scale=scale,
-        weighted_idle=w_idle
+        weighted_idle=w_idle,
+        buffer_stats=buf_stats,
+        wip_stats=wip_stats
     )
 
 
@@ -108,7 +136,7 @@ def run_event_driven_until_nevents(*,
     ddqn_device = torch.device(getattr(configs, "device", "cpu"))
     if gate_policy == "ddqn":
         ddqn_model_path = str(getattr(configs, "ddqn_model_path", "ddqn_ckpt/ddqn_gate_pure.pth"))
-        ddqn_model = QNet(obs_dim=4, hidden=128, n_actions=2).to(ddqn_device)
+        ddqn_model = QNet(obs_dim=8, hidden=128, n_actions=2).to(ddqn_device)
         try:
             sd = torch.load(ddqn_model_path, map_location=ddqn_device)
             ddqn_model.load_state_dict(sd)
@@ -132,7 +160,12 @@ def run_event_driven_until_nevents(*,
         finally:
             if old_nj is not None:
                 setattr(init_cfg, "n_j", old_nj)
-        initial_jobs = split_matrix_to_jobs(job_length, op_pt, base_job_id=0, t_arrive=0.0)
+        
+        # [ADDED] Generate Due Dates for initial jobs
+        dd_rel = generate_due_dates(job_length, op_pt)
+        dd_abs = 0.0 + dd_rel
+        
+        initial_jobs = split_matrix_to_jobs(job_length, op_pt, base_job_id=0, t_arrive=0.0, due_dates=dd_abs)
         orch.buffer.extend(initial_jobs)
         max_existing = max((j.job_id for j in orch.buffer), default=-1)
         gen.bump_next_id(max_existing + 1)  # 對齊 next_id
@@ -147,6 +180,7 @@ def run_event_driven_until_nevents(*,
         "scheduled_ops": 0,
         "wall_time_sec": 0.0,
         "event_horizon": int(max_events),
+        "total_tardiness": 0.0, # [ADDED]
     }
 
     t_prev = 0.0                           # [ADDED] 前一個事件時間（用來算間隔）
@@ -212,6 +246,7 @@ def run_event_driven_until_nevents(*,
             if fin.get("event") == "batch_finalized":
                 stats["scheduled_ops"] += len(fin.get("rows", []))
                 stats["release"] += 1
+                stats["total_tardiness"] += float(fin.get("batch_tardiness", 0.0)) # [ADDED]
         # 下一個事件時間
         t_next = gen.sample_next_time(t_now)
 
@@ -226,6 +261,7 @@ def run_event_driven_until_nevents(*,
             if fin.get("event") == "batch_finalized":
                 stats["scheduled_ops"] += len(fin.get("rows", []))
                 stats["release"] += 1
+                stats["total_tardiness"] += float(fin.get("batch_tardiness", 0.0)) # [ADDED]
             else:
                 print("[FLUSH] finalize did not return 'batch_finalized' — stop flushing.")
                 break
@@ -266,6 +302,7 @@ def main():
 
     runs = 15
     mk_list = []
+    td_list = [] # [ADDED]
     sum_arrive = 0
     sum_release = 0
     sum_eh = 0
@@ -283,6 +320,7 @@ def main():
             seed_offset=i
         )
         mk_list.append(mk)
+        td_list.append(stats.get('total_tardiness', 0.0)) # [ADDED]
         sum_arrive  += stats.get('arrive', 0)
         sum_release += stats.get('release', 0)
         sum_eh      += stats.get('event_horizon', 0)
@@ -292,6 +330,7 @@ def main():
         # 單次 Summary
         print("\n== Summary ==")
         print(f"Dynamic makespan     : {mk:.3f}")
+        print(f"Total Tardiness      : {stats.get('total_tardiness', 0.0):.3f}") # [ADDED]
         print(f"Arrive events        : {stats.get('arrive')}")
         print(f"Release decisions    : {stats.get('release')}")
         print(f"Event horizon (E)    : {stats.get('event_horizon')}")
@@ -303,6 +342,7 @@ def main():
     std_mk = float(np.std(mk_list, ddof=1)) if len(mk_list) > 1 else 0.0
     max_mk = float(np.max(mk_list)) if len(mk_list) > 1 else 0.0
     min_mk = float(np.min(mk_list)) if len(mk_list) > 1 else 0.0
+    avg_td   = float(np.mean(td_list)) if td_list else 0.0 # [ADDED]
     avg_arr  = sum_arrive / runs
     avg_rel  = sum_release / runs
     avg_eh   = sum_eh / runs
@@ -314,6 +354,7 @@ def main():
     print(f"Dynamic makespan (std) : {std_mk:.3f}")
     print(f"Dynamic makespan (max) : {max_mk:.3f}")
     print(f"Dynamic makespan (min) : {min_mk:.3f}")
+    print(f"Total Tardiness (avg)  : {avg_td:.3f}") # [ADDED]
     print(f"Arrive events (avg)    : {avg_arr:.2f}")
     print(f"Release decisions (avg): {avg_rel:.2f}")
     print(f"Event horizon (avg)    : {avg_eh:.2f}")

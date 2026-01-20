@@ -12,7 +12,7 @@ from global_env import (
     EventBurstGenerator,     # [ADDED] 事件驅動生成器
     split_matrix_to_jobs,
 )
-from data_utils import SD2_instance_generator
+from data_utils import SD2_instance_generator, generate_due_dates
 
 # 繪圖
 from gantt import plot_global_gantt
@@ -36,6 +36,39 @@ def fixed_k_sampler(K: int):
         return int(K)
     return _fn
 
+def calculate_buffer_penalty(buffer, t_now):
+    """計算 Buffer 中已遲交工單的數量（用於計算邊際懲罰）"""
+    num_late = 0
+    for job in buffer:
+        due_date = float(job.meta.get("due_date", float('inf')))
+        if t_now > due_date:
+            num_late += 1
+    return float(num_late)
+
+def get_buffer_stats(buffer, t_now):
+    
+    """計算 Buffer 的急迫度統計特徵"""
+    if not buffer:
+        return {"tardiness_ratio": 0.0, "min_slack": 0.0, "avg_slack": 0.0}
+        
+    slacks = []
+    num_tardy = 0
+    for job in buffer:
+        due_date = float(job.meta.get("due_date", float('inf')))
+        total_pt = float(job.meta.get("total_proc_time", 0.0))
+        slack = due_date - t_now - total_pt
+        slacks.append(slack)
+        
+        # 判斷遲交 (這裡用簡單的 t > d)
+        if t_now > due_date:
+            num_tardy += 1
+            
+    return {
+        "tardiness_ratio": num_tardy / len(buffer),
+        "min_slack": min(slacks),
+        "avg_slack": sum(slacks) / len(slacks)
+    }
+
 
 # ======================= [ADDED] Gate 觀測量（與訓練環境一致） =======================
 def _gate_obs(orch: GlobalTimelineOrchestrator,
@@ -58,6 +91,10 @@ def _gate_obs(orch: GlobalTimelineOrchestrator,
     
     w_idle = orch.compute_weighted_idle(t_now, horizon)
     
+    # [ADDED] Calculate Urgency Stats
+    buf_stats = get_buffer_stats(orch.buffer, t_now)
+    wip_stats = orch.get_wip_stats(t_now)
+    
     return calculate_ddqn_state(
         buffer_size=len(orch.buffer),
         machine_free_time=orch.machine_free_time,
@@ -65,7 +102,9 @@ def _gate_obs(orch: GlobalTimelineOrchestrator,
         n_machines=n_machines,
         obs_buffer_cap=cap,
         time_scale=scale,
-        weighted_idle=w_idle
+        weighted_idle=w_idle,
+        buffer_stats=buf_stats,
+        wip_stats=wip_stats
     )
 
 
@@ -119,7 +158,7 @@ def run_event_driven_until_nevents(*,
     ddqn_device = torch.device(getattr(configs, "device", "cpu"))
     if gate_policy == "ddqn":  # [ADDED]
         ddqn_model_path = str(getattr(configs, "ddqn_model_path", "ddqn_ckpt/ddqn_gate_pure.pth"))
-        ddqn_model = QNet(obs_dim=4, hidden=128, n_actions=2).to(ddqn_device)
+        ddqn_model = QNet(obs_dim=8, hidden=128, n_actions=2).to(ddqn_device)
         try:
             sd = torch.load(ddqn_model_path, map_location=ddqn_device)
             ddqn_model.load_state_dict(sd)
@@ -143,7 +182,12 @@ def run_event_driven_until_nevents(*,
         finally:
             if old_nj is not None:
                 setattr(init_cfg, "n_j", old_nj)
-        initial_jobs = split_matrix_to_jobs(job_length, op_pt, base_job_id=0, t_arrive=0.0)
+        
+        # [ADDED] Generate Due Dates for initial jobs
+        dd_rel = generate_due_dates(job_length, op_pt)
+        dd_abs = 0.0 + dd_rel
+        
+        initial_jobs = split_matrix_to_jobs(job_length, op_pt, base_job_id=0, t_arrive=0.0, due_dates=dd_abs)
         orch.buffer.extend(initial_jobs)
         max_existing = max((j.job_id for j in orch.buffer), default=-1)
         gen.bump_next_id(max_existing + 1)  # 對齊 next_id
@@ -177,6 +221,8 @@ def run_event_driven_until_nevents(*,
     reward_scale = float(getattr(configs, "reward_scale", 50.0))
     scale = float(getattr(configs, "norm_scale", 100.0)) # 用於 obs
     stability_scale = float(getattr(configs, "stability_scale", 5.0))
+    buffer_penalty_coef = float(getattr(configs, "buffer_penalty_coef", 0.1))
+    release_penalty_coef = float(getattr(configs, "release_penalty_coef", 1.0))
     
     # [ADDED] CSV Logging Setup
     csv_dir = plot_global_dir or getattr(configs, "plot_global_dir", "plots/global")
@@ -189,7 +235,8 @@ def run_event_driven_until_nevents(*,
         "Obs_Buffer", "Obs_Load", "Obs_Idle", 
         "Q_Hold", "Q_Release", "Action", "Action_Str",
         "Reward_Total", "Reward_MkDelta", 
-        "Reward_Idle", "Reward_Stab", "Reward_Flush"
+        "Reward_Idle", "Reward_Stab", "Reward_Buffer", "Reward_Release", "Reward_Flush",
+        "Buf_Tardy_Raw", "Rel_Tardy_Raw"
     ]
     csv_writer.writerow(csv_headers)
     print(f"[INFO] Logging inference step info to: {csv_path}")
@@ -198,6 +245,7 @@ def run_event_driven_until_nevents(*,
     mk_prev = get_current_makespan(orch)
     t_prev_reward = 0.0
     last_act = None
+    last_release_tardiness = 0.0
     pending_row = None # [ADDED] 用於存儲尚未計算 Reward 的決策資料
 
     # ---- 統計 ----
@@ -247,15 +295,24 @@ def run_event_driven_until_nevents(*,
             if str(getattr(configs, "ddqn_reward_mode", "original")) == "stability":
                 r_stab = - float(last_act) * stability_scale
             
-            step_reward = r_mk + r_idle + r_stab
+            # [FIXED] Tardiness Penalties - Use Marginal Increase
+            late_count = calculate_buffer_penalty(orch.buffer, t_now)
+            r_buffer = - (late_count * dt_interval * buffer_penalty_coef) / reward_scale
+            r_release = - (last_release_tardiness * release_penalty_coef) / reward_scale
+            
+            step_reward = r_mk + r_idle + r_stab + r_buffer + r_release
 
             # [CHANGED] 如果有待處理的 row，填入剛剛算好的 reward 並寫入 CSV
             if pending_row is not None:
                 pending_row.extend([
-                    f"{step_reward:.4f}", f"{r_mk:.4f}", f"{r_idle:.4f}", f"{r_stab:.4f}", "0.0000"
+                    f"{step_reward:.4f}", f"{r_mk:.4f}", f"{r_idle:.4f}", f"{r_stab:.4f}",
+                    f"{r_buffer:.4f}", f"{r_release:.4f}", "0.0000",
+                    f"{(late_count * dt_interval):.4f}", f"{last_release_tardiness:.4f}"
                 ])
                 csv_writer.writerow(pending_row)
                 pending_row = None
+            
+            last_release_tardiness = 0.0 # Reset after logging
 
             t_prev_reward = t_now
 
@@ -315,6 +372,7 @@ def run_event_driven_until_nevents(*,
             if fin.get("event") == "batch_finalized":
                 stats["scheduled_ops"] += len(fin.get("rows", []))
                 stats["release"] += 1
+                last_release_tardiness = float(fin.get("batch_tardiness", 0.0))
 
                 # ---- 畫圖（t_now = tcut）----
                 plot_seq += 1
@@ -429,7 +487,9 @@ def run_event_driven_until_nevents(*,
         
         if pending_row is not None:
             pending_row.extend([
-                f"{final_step_reward:.4f}", f"{r_mk:.4f}", f"{r_idle:.4f}", f"{r_stab:.4f}", f"{r_flush:.4f}"
+                f"{final_step_reward:.4f}", f"{r_mk:.4f}", f"{r_idle:.4f}", f"{r_stab:.4f}",
+                "0.0000", "0.0000", f"{r_flush:.4f}",
+                "0.0000", "0.0000"
             ])
             csv_writer.writerow(pending_row)
 

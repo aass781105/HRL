@@ -70,7 +70,7 @@ parser.add_argument('--data_type', type=str, default="test", help='Generated dat
 # ============================
 # PPO Network Architecture
 # ============================
-parser.add_argument('--fea_j_input_dim', type=int, default=10, help='Dimension of operation raw feature vectors')
+parser.add_argument('--fea_j_input_dim', type=int, default=13, help='Dimension of operation raw feature vectors')
 parser.add_argument('--fea_m_input_dim', type=int, default=8, help='Dimension of machine raw feature vectors')
 parser.add_argument('--dropout_prob', type=float, default=0.0, help='Dropout rate (1 - keep probability).')
 parser.add_argument('--num_heads_OAB', nargs='+', type=int, default=[4, 4], help='Number of attention head of operation message attention block')
@@ -117,7 +117,10 @@ parser.add_argument('--test_mode', type=str2bool, default=False, help='Whether u
 parser.add_argument('--sample_times', type=int, default=100, help='Sampling times for the sampling strategy')
 parser.add_argument('--test_model', nargs='+', default=['curriculum_train_10x5+mix','curriculum_train_40x5+mix'], help='List of model for testing')
 parser.add_argument('--test_method', nargs='+', default=["MWKR"], help='List of heuristic methods for testing')
-parser.add_argument('--eval_model_name', type=str, default="original", help='用於儲存CSV的檔名')
+
+
+
+parser.add_argument('--eval_model_name', type=str, default="original_fix12_03", help='用於儲存CSV的檔名')
 
 
 # ============================
@@ -140,7 +143,7 @@ parser.add_argument('--cadence_choices', type=int, nargs='*', default=None, help
 # PPO Orchestrator Integration
 # ============================
 parser.add_argument('--use_ppo', type=str2bool, default=True, help='是否改用 PPO 進行靜態批次的一次排到底')
-parser.add_argument('--ppo_model_path', type=str, default=r'trained_network\SD2\sample_num_job.pth', help='PPO 權重檔 .pth 路徑（use_ppo=True 時必填）')
+parser.add_argument('--ppo_model_path', type=str, default=r'trained_network\due_date\curriculum_train_fix1_2_03.pth', help='PPO 權重檔 .pth 路徑（use_ppo=True 時必填）')
 parser.add_argument('--ppo_sample', type=str2bool, default=False, help='PPO 推論是否採用抽樣；False=貪婪/取最大機率')
 
 
@@ -188,6 +191,8 @@ parser.add_argument('--norm_scale', type=float, default=100, help='norm /scale')
 parser.add_argument('--reward_scale', type=float, default=50.0, help='Scale factor for reward normalization')
 parser.add_argument('--reward_alpha', type=float, default=0.3, help='Weight for Makespan in reward (alpha). Idle weight will be (1-alpha). Default 0.3 matches previous 0.3/0.7 split.')
 parser.add_argument('--stability_scale', type=float, default=0.1, help='Scale factor for stability penalty in reward calculation')
+parser.add_argument('--buffer_penalty_coef', type=float, default=0.0005, help='Coefficient for buffer tardiness penalty')
+parser.add_argument('--release_penalty_coef', type=float, default=0.005, help='Coefficient for release tardiness penalty')
 parser.add_argument('--enable_full_idle_penalty', type=str2bool, default=False, help='If True, penalize HOLD when all machines idle but buffer has jobs')
 parser.add_argument('--full_idle_penalty', type=float, default=100.0, help='Penalty value when full-idle HOLD happens')
 parser.add_argument('--enable_final_flush_penalty', type=str2bool, default=True, help='If True, add final penalty when episode ends with leftover buffer')

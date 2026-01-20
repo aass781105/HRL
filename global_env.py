@@ -18,13 +18,14 @@ import numpy as np
 import numpy.ma as ma
 
 # === 依你的實際檔名調整 ===
-from fjsp_env_same_op_nums_online import FJSPEnvForSameOpNums
+from FJSPEnvForVariousOpNums import FJSPEnvForVariousOpNums
 
 # [ADDED] 直接在檔案最上面 import（依你要求）
 import torch
 from model.PPO import PPO_initialize
 from params import configs
 from common_utils import heuristic_select_action, greedy_select_action, sample_action
+from data_utils import generate_due_dates
 
 
 # ==============================================================================
@@ -53,20 +54,30 @@ class JobSpec:
 
 
 def split_matrix_to_jobs(job_length: np.ndarray, op_pt: np.ndarray, *,
-                         base_job_id: int = 0, t_arrive: Optional[float] = None) -> List[JobSpec]:
+                         base_job_id: int = 0, t_arrive: Optional[float] = None,
+                         due_dates: Optional[np.ndarray] = None) -> List[JobSpec]:
     jobs: List[JobSpec] = []
     J = int(job_length.shape[0])
     cursor = 0
     for j in range(J):
         L = int(job_length[j])
         ops: List[OperationSpec] = []
+        total_proc_time = 0.0
         for _ in range(L):
             row = op_pt[cursor]
+            # Calculate average processing time for this op (ignoring zeros)
+            valid_pt = row[row > 0]
+            avg_pt = np.mean(valid_pt) if valid_pt.size > 0 else 0.0
+            total_proc_time += float(avg_pt)
+            
             ops.append(OperationSpec(time_row=row.astype(float).tolist()))
             cursor += 1
         meta = {}
         if t_arrive is not None:
             meta["t_arrive"] = float(t_arrive)
+        if due_dates is not None:
+            meta["due_date"] = float(due_dates[j])
+        meta["total_proc_time"] = total_proc_time # [ADDED]
         meta.setdefault("op_offset", 0)  # [ADDED]
         jobs.append(JobSpec(job_id=base_job_id + j, operations=ops, meta=meta))
     return jobs
@@ -132,7 +143,11 @@ class EventBurstGenerator:
             if old_n_j is not None:
                 setattr(cfg, "n_j", old_n_j)
 
-        jobs = split_matrix_to_jobs(job_length, op_pt, base_job_id=self._next_id, t_arrive=t_event)
+        # [ADDED] Generate Due Dates
+        due_dates_rel = generate_due_dates(job_length, op_pt)
+        due_dates_abs = float(t_event) + due_dates_rel
+
+        jobs = split_matrix_to_jobs(job_length, op_pt, base_job_id=self._next_id, t_arrive=t_event, due_dates=due_dates_abs)
         self._next_id += len(jobs)
         return jobs
 
@@ -162,7 +177,7 @@ class BatchScheduleRecorder:
         self.machine_queues: List[List[Tuple[int, int, float, float]]] = [[] for _ in range(self.M)]
         self.rows: List[Dict] = []
 
-    def record_step(self, env: FJSPEnvForSameOpNums, action: int, env_idx: int = 0):
+    def record_step(self, env: FJSPEnvForVariousOpNums, action: int, env_idx: int = 0):
         J, M = env.number_of_jobs, env.number_of_machines
         chosen_job = int(action // M)
         chosen_mch = int(action % M)
@@ -178,7 +193,7 @@ class BatchScheduleRecorder:
         start = float(max(env.true_candidate_free_time[env_idx, chosen_job],
                           env.true_mch_free_time[env_idx, chosen_mch]))
 
-        state, reward, done = env.step(np.array([action]))
+        state, reward, done, _ = env.step(np.array([action]))
 
         # [CHANGED] true_op_ct 也應為「絕對時間」
         end = float(env.true_op_ct[env_idx, chosen_op_global])
@@ -225,7 +240,7 @@ class GlobalTimelineOrchestrator:
         # 批次狀態/快照
         self.machine_free_time = np.zeros(self.M, dtype=float)  # [CHANGED] 保存「絕對時間」
         self._builder = _FJSPBatchBuilder(self.M)
-        self.current_env: Optional[FJSPEnvForSameOpNums] = None
+        self.current_env: Optional[FJSPEnvForVariousOpNums] = None
         self._recorder: Optional[BatchScheduleRecorder] = None
         self._committed_jobs: Optional[List[JobSpec]] = None
         self._active_plan: List[Tuple[int, int, int, float, float]] = []
@@ -308,7 +323,7 @@ class GlobalTimelineOrchestrator:
     # [REMOVED] tick(dt) 與時間步進相關 API（事件驅動下不需要）
 
     # ---- 靜態一次排到底（做法 A：PPO；做法 B：派工法則）----
-    def solve_current_batch_static(self, env: FJSPEnvForSameOpNums, initial_state, heuristic: str) -> List[Dict]:
+    def solve_current_batch_static(self, env: FJSPEnvForVariousOpNums, initial_state, heuristic: str) -> List[Dict]:
         """
         [CHANGED] 支援 PPO 或 Heuristic。
         - PPO 路徑：使用 initial_state → 每步用 PPO 取 action（greedy or sample），更新 state。
@@ -359,7 +374,7 @@ class GlobalTimelineOrchestrator:
         return self._recorder.to_rows()
 
     # ---- 記錄一步（把這步規劃的 s,e 先寫入 _active_plan；保留原始 s,e）----  [ADDED]
-    def capture_planned_op(self, env: FJSPEnvForSameOpNums, action: int):
+    def capture_planned_op(self, env: FJSPEnvForVariousOpNums, action: int):
         if env is not self.current_env:
             raise AssertionError("capture_planned_op: env 必須是 current_env")
 
@@ -395,7 +410,7 @@ class GlobalTimelineOrchestrator:
         return job_id, op_id_in_job, mch_idx, start_true, end_true
 
     # ---- 完成一批（不在這裡切 H/R；只存「完整結果快照」供下一次事件切）----
-    def finalize(self, env: FJSPEnvForSameOpNums) -> Dict:
+    def finalize(self, env: FJSPEnvForVariousOpNums) -> Dict:
         if env is not self.current_env:
             raise AssertionError("finalize() 參數必須是目前 active 的批次環境")
 
@@ -445,6 +460,9 @@ class GlobalTimelineOrchestrator:
         # [ADDED] 「右半」給畫圖（此批全部當作 newplan 顯示）
         self._R_rows = list(batch_rows)
 
+        # [ADDED] Read accumulated tardiness from env
+        batch_tardiness = float(np.sum(env.accumulated_tardiness))
+
         # 清理批次狀態
         self.current_env = None
         self._recorder = None
@@ -459,7 +477,8 @@ class GlobalTimelineOrchestrator:
             "t": self.t,
             "machine_free_time": self.machine_free_time.copy(),
             "rows": batch_rows,
-            "t_cut": None
+            "t_cut": None,
+            "batch_tardiness": batch_tardiness
         }
 
     # ---- 事件處理（在 t_event：切 H/R、R∪B 開新批 → 一次排到底 → finalize）----
@@ -556,7 +575,7 @@ class GlobalTimelineOrchestrator:
 
         # === 3) 建 env → 靜態排到底 → finalize ===
         job_length_list, op_pt_list = self._builder.build(jobs_new)
-        env_new = FJSPEnvForSameOpNums(n_j=len(jobs_new), n_m=self.M)
+        env_new = FJSPEnvForVariousOpNums(n_j=len(jobs_new), n_m=self.M)
 
         # [ADDED] 估一個時間尺度：以批中處理時間的 95 分位 × 4，避免過小/過大
         pt = op_pt_list[0]
@@ -812,6 +831,42 @@ class GlobalTimelineOrchestrator:
                 total_weighted_idle += val
 
         return total_weighted_idle / self.M
+
+    def get_wip_stats(self, t_now: float) -> Dict[str, float]:
+        """
+        計算 WIP 中尚未完工部分的統計數據 (例如 Min Slack)。
+        資料來源：self._last_jobs_snapshot (包含所有正在進行或等待的工單)
+        """
+        min_slack = float('inf')
+        
+        if self._last_jobs_snapshot:
+            for js in self._last_jobs_snapshot:
+                # 1. Check if job is finished
+                op_offset = int(js.meta.get("op_offset", 0))
+                if op_offset >= len(js.operations):
+                    continue # Finished job
+                
+                # 2. Calculate remaining processing time
+                rem_proc_time = 0.0
+                for op in js.operations[op_offset:]:
+                    # Since operations is List[OperationSpec], we use time_row
+                    if op.time_row:
+                        row = np.array(op.time_row)
+                        valid = row[row > 0]
+                        avg_pt = np.mean(valid) if valid.size > 0 else 0.0
+                        rem_proc_time += avg_pt
+                
+                # 3. Calculate Slack
+                due_date = float(js.meta.get("due_date", float('inf')))
+                slack = due_date - t_now - rem_proc_time
+                
+                if slack < min_slack:
+                    min_slack = slack
+                    
+        if min_slack == float('inf'):
+            min_slack = 0.0 # No WIP or all finished
+            
+        return {"wip_min_slack": min_slack}
 
 
 

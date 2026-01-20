@@ -121,17 +121,27 @@ class OrchestratorAdapter:
         job_length_list, op_pt_list = o._builder.build(jobs_new)
         env_new = FJSPEnvForVariousOpNums(n_j=len(jobs_new), n_m=self.M)
 
-        # 估時間正規化尺度：批內加工時間 95 分位 × 4
+        # 估時間正規化尺度：使用 max_pt 以匹配 Env 內部的正規化 (op_pt / max_pt)
         pt = op_pt_list[0]
-        pt_nonzero = pt[pt > 0]
-        q95 = np.percentile(pt_nonzero, 95) if pt_nonzero.size else 1.0
-        time_scale = max(1.0, float(q95) * 4.0)
+        max_pt = np.max(pt) if pt.size > 0 else 1.0
+        time_scale = max(1.0, float(max_pt))
 
         # 啟用正規化器（僅用於 state 與非 true_* 欄位）
         o._normalizer = _TimeNormalizer(base=base, scale=time_scale)
 
-        # 初始化靜態資料
-        state0 = env_new.set_initial_data(job_length_list, op_pt_list)
+        # 準備正規化 Due Dates
+        due_dates_norm = []
+        due_dates_abs = []
+        for js in jobs_new:
+             # Get absolute due date from meta
+             dd_abs = float(js.meta.get("due_date", 0.0))
+             # Normalize
+             dd_norm = o._normalizer.f(dd_abs)
+             due_dates_norm.append(dd_norm)
+             due_dates_abs.append(dd_abs)
+
+        # 初始化靜態資料（傳入 normalized due dates）
+        state0 = env_new.set_initial_data(job_length_list, op_pt_list, due_date_list=due_dates_norm, normalize_due_date=False, true_due_date_list=due_dates_abs)
 
         # 絕對/正規化對齊（機台忙到時間）
         mft_abs = o.machine_free_time.astype(float)

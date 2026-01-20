@@ -6,7 +6,7 @@ from typing import List, Dict, Optional, Tuple # Added List, Dict, Optional, Tup
 
 from params import configs
 from data_utils import SD2_instance_generator
-from fjsp_env_same_op_nums_online import FJSPEnvForSameOpNums, EnvState
+from FJSPEnvForVariousOpNums import FJSPEnvForVariousOpNums, EnvState
 from global_env import EventBurstGenerator, split_matrix_to_jobs, JobSpec, OperationSpec # Added JobSpec, OperationSpec
 
 # Helper function to ensure a fixed number of jobs per arrival event
@@ -73,7 +73,7 @@ class DynamicFJSPEnv:
         # 這個內部環境的 num_envs 始終為 1
         static_env_config = deepcopy(config)
         static_env_config.num_envs = 1
-        self.static_env = FJSPEnvForSameOpNums(self.n_j, self.n_m)
+        self.static_env = FJSPEnvForVariousOpNums(self.n_j, self.n_m)
         
         print("Dynamic Environment Initialized.")
 

@@ -23,16 +23,22 @@ def calculate_ddqn_state(
     n_machines: int,
     obs_buffer_cap: int,
     time_scale: float,
-    weighted_idle: float  # [CHANGED] Passed from orchestrator
+    weighted_idle: float,  # [CHANGED] Passed from orchestrator
+    buffer_stats: dict = None, # [ADDED]
+    wip_stats: dict = None     # [ADDED]
 ) -> np.ndarray:
     """
-    Centralized logic for calculating the 4-dimensional state for the DDQN Gate Agent.
+    Centralized logic for calculating the 8-dimensional state for the DDQN Gate Agent.
     
     State:
     o0: Normalized buffer size
     o1: Normalized average remaining load
     o2: Normalized time to first idle
     o3: Normalized weighted idle time (reflecting load imbalance & fragmentation)
+    o4: Buffer Tardiness Ratio (0~1)
+    o5: Buffer Min Slack (Normalized)
+    o6: Buffer Avg Slack (Normalized)
+    o7: WIP Min Slack (Normalized) - Urgency of jobs already on the floor but not finished
     """
     # 1) Buffer Normalization
     cap = float(obs_buffer_cap) if obs_buffer_cap > 0 else 1.0 
@@ -55,4 +61,21 @@ def calculate_ddqn_state(
     # 3) Weighted Idle (o3) - Pre-calculated by orchestrator
     o3 = weighted_idle / time_scale
 
-    return np.array([o0, o1, o2, o3], dtype=np.float32)
+    # 4) Buffer & WIP Urgency Features
+    buf_tardiness_ratio = 0.0
+    buf_min_slack = 0.0 
+    buf_avg_slack = 0.0 
+    wip_min_slack = 0.0 
+    
+    if buffer_stats:
+        buf_tardiness_ratio = float(buffer_stats.get("tardiness_ratio", 0.0))
+        # Normalize Slack by time_scale
+        buf_min_slack = float(buffer_stats.get("min_slack", 0.0)) / time_scale
+        buf_avg_slack = float(buffer_stats.get("avg_slack", 0.0)) / time_scale
+        
+    if wip_stats:
+        wip_min_slack = float(wip_stats.get("wip_min_slack", 0.0)) / time_scale
+
+    return np.array([o0, o1, o2, o3, 
+                     buf_tardiness_ratio, buf_min_slack, buf_avg_slack, wip_min_slack], 
+                    dtype=np.float32)

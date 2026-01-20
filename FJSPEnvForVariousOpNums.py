@@ -2,7 +2,51 @@ import numpy as np
 import numpy.ma as ma
 import copy
 import sys
-from fjsp_env_same_op_nums_online import EnvState
+from dataclasses import dataclass
+import torch
+from params import configs
+
+@dataclass
+class EnvState:
+    """
+        state definition
+    """
+    fea_j_tensor: torch.Tensor = None
+    op_mask_tensor: torch.Tensor = None
+    fea_m_tensor: torch.Tensor = None
+    mch_mask_tensor: torch.Tensor = None
+    dynamic_pair_mask_tensor: torch.Tensor = None
+    comp_idx_tensor: torch.Tensor = None
+    candidate_tensor: torch.Tensor = None
+    fea_pairs_tensor: torch.Tensor = None
+
+    device = torch.device(configs.device)
+
+    def update(self, fea_j, op_mask, fea_m, mch_mask, dynamic_pair_mask,
+               comp_idx, candidate, fea_pairs):
+        """
+            update the state information
+        """
+        device = self.device
+        self.fea_j_tensor = torch.from_numpy(np.copy(fea_j)).float().to(device)
+        self.fea_m_tensor = torch.from_numpy(np.copy(fea_m)).float().to(device)
+        self.fea_pairs_tensor = torch.from_numpy(np.copy(fea_pairs)).float().to(device)
+
+        self.op_mask_tensor = torch.from_numpy(np.copy(op_mask)).to(device)
+        self.candidate_tensor = torch.from_numpy(np.copy(candidate)).to(device)
+        self.mch_mask_tensor = torch.from_numpy(np.copy(mch_mask)).float().to(device)
+        self.comp_idx_tensor = torch.from_numpy(np.copy(comp_idx)).to(device)
+        self.dynamic_pair_mask_tensor = torch.from_numpy(np.copy(dynamic_pair_mask)).to(device)
+
+    def print_shape(self):
+        print(self.fea_j_tensor.shape)
+        print(self.op_mask_tensor.shape)
+        print(self.candidate_tensor.shape)
+        print(self.fea_m_tensor.shape)
+        print(self.mch_mask_tensor.shape)
+        print(self.comp_idx_tensor.shape)
+        print(self.dynamic_pair_mask_tensor.shape)
+        print(self.fea_pairs_tensor.shape)
 
 
 class FJSPEnvForVariousOpNums:
@@ -17,7 +61,7 @@ class FJSPEnvForVariousOpNums:
         self.old_state = EnvState()
 
         # feature dims (keep your original settings)
-        self.op_fea_dim = 10
+        self.op_fea_dim = 13
         self.mch_fea_dim = 8
 
     # -------------------- static properties & init --------------------
@@ -44,18 +88,38 @@ class FJSPEnvForVariousOpNums:
 
         self.flag_exist_dummy_node = ~(self.env_number_of_ops == self.max_number_of_ops).all()
 
-    def set_initial_data(self, job_length_list, op_pt_list):
+    def set_initial_data(self, job_length_list, op_pt_list, due_date_list=None, normalize_due_date=True, true_due_date_list=None):
         """
         Args:
-            job_length_list: List[np.ndarray], each [J] (int)
-            op_pt_list:      List[np.ndarray], each [N_i, M] (float), with zeros for incompatible (process_relation)
-        Returns:
-            EnvState (same structure as original)
+            job_length_list: List[np.ndarray]
+            op_pt_list:      List[np.ndarray]
+            due_date_list:   Normalized or raw due dates used for state features.
+            normalize_due_date: If True, due_date_list will be normalized internally.
+            true_due_date_list: Absolute due dates used for Tardiness/Reward calculation.
         """
         self.number_of_envs = len(job_length_list)
         self.job_length = np.array(job_length_list)
         self.number_of_machines = op_pt_list[0].shape[1]
         self.number_of_jobs = job_length_list[0].shape[0]
+
+        # Handle Due Date for Features
+        if due_date_list is None:
+            self.due_date = np.zeros((self.number_of_envs, self.number_of_jobs))
+        else:
+            self.due_date = np.array(due_date_list)
+
+        # Handle True Due Date for Rewards (Absolute time)
+        if true_due_date_list is None:
+            # Fallback for static training
+            self.true_due_date = np.array(due_date_list) if due_date_list is not None else np.zeros((self.number_of_envs, self.number_of_jobs))
+        else:
+            self.true_due_date = np.array(true_due_date_list)
+        
+        # [FIX] Ensure true_due_date is 2D [E, J]
+        if self.true_due_date.ndim == 1:
+            self.true_due_date = self.true_due_date[np.newaxis, :]
+        elif self.true_due_date.ndim == 0:
+            self.true_due_date = self.true_due_date.reshape(1, 1)
 
         # various ops across envs
         self.env_number_of_ops = np.array([op_pt_list[k].shape[0] for k in range(self.number_of_envs)])
@@ -76,9 +140,16 @@ class FJSPEnvForVariousOpNums:
         self.pt_lower_bound = np.min(self.op_pt)
         self.pt_upper_bound = np.max(self.op_pt)
         self.true_op_pt = np.copy(self.op_pt)
+        
+        # Calculate scale for normalization
+        scale = self.pt_upper_bound - self.pt_lower_bound + 1e-8
 
         # normalize to [0,1] (zeros remain zeros = incompatible)
-        self.op_pt = (self.op_pt - self.pt_lower_bound) / (self.pt_upper_bound - self.pt_lower_bound + 1e-8)
+        self.op_pt = (self.op_pt - self.pt_lower_bound) / scale
+
+        # Apply internal normalization to feature due_date if requested
+        if due_date_list is not None and normalize_due_date:
+            self.due_date = self.due_date / scale
 
         self.process_relation = (self.op_pt != 0)              # True where feasible
         self.reverse_process_relation = ~self.process_relation  # True where infeasible (or dummy)
@@ -87,6 +158,11 @@ class FJSPEnvForVariousOpNums:
         self.compatible_mch = np.sum(self.process_relation, 1) # [E, M]
 
         self.unmasked_op_pt = np.copy(self.op_pt)
+
+        # [ADDED] Calculate mean operation processing time for reward normalization
+        # Consider only non-dummy and feasible operations
+        valid_pts = self.true_op_pt[self.process_relation]
+        self.mean_op_pt = np.mean(valid_pts) if valid_pts.size > 0 else 1.0
 
         head_op_id = np.zeros((self.number_of_envs, 1))
         self.job_first_op_id = np.concatenate([head_op_id, np.cumsum(self.job_length, axis=1)[:, :-1]], axis=1).astype(int)
@@ -164,6 +240,9 @@ class FJSPEnvForVariousOpNums:
         self.old_candidate_process_relation = np.copy(self.candidate_process_relation)
         self.old_mch_current_available_op_nums = np.copy(self.mch_current_available_op_nums)
         self.old_mch_current_available_jc_nums = np.copy(self.mch_current_available_jc_nums)
+        self.old_due_date = np.copy(self.due_date)
+        self.old_true_due_date = np.copy(self.true_due_date)
+        self.old_accumulated_tardiness = np.copy(self.accumulated_tardiness)
 
         # state
         self.state = copy.deepcopy(self.old_state)
@@ -182,6 +261,9 @@ class FJSPEnvForVariousOpNums:
         self.candidate_process_relation = np.copy(self.old_candidate_process_relation)
         self.mch_current_available_op_nums = np.copy(self.old_mch_current_available_op_nums)
         self.mch_current_available_jc_nums = np.copy(self.old_mch_current_available_jc_nums)
+        self.due_date = np.copy(self.old_due_date)
+        self.true_due_date = np.copy(self.old_true_due_date)
+        self.accumulated_tardiness = np.copy(self.old_accumulated_tardiness)
         # state
         self.state = copy.deepcopy(self.old_state)
         return self.state
@@ -190,6 +272,7 @@ class FJSPEnvForVariousOpNums:
         self.step_count = 0
         self.done_flag = np.full(shape=(self.number_of_envs,), fill_value=0, dtype=bool)
         self.current_makespan = np.full(self.number_of_envs, float("-inf"))
+        self.accumulated_tardiness = np.zeros(self.number_of_envs)
 
         self.mch_queue = np.full(shape=[self.number_of_envs, self.number_of_machines,
                                         self.max_number_of_ops + 1], fill_value=-99, dtype=int)
@@ -229,11 +312,21 @@ class FJSPEnvForVariousOpNums:
     # -------------------- step / done --------------------
 
     def step(self, actions):
+        # [FIX] Ensure input actions are 1D array to prevent broadcasting issues
+        actions = np.array(actions).flatten()
+
         self.incomplete_env_idx = np.where(self.done_flag == 0)[0]
         self.number_of_incomplete_envs = int(self.number_of_envs - np.sum(self.done_flag))
 
+        # [FIX] Filter actions to only include those for incomplete environments
+        # Check if actions include all environments or just incomplete ones
+        if actions.size == self.number_of_envs:
+            actions = actions[self.incomplete_env_idx]
+
         chosen_job = actions // self.number_of_machines
         chosen_mch = actions % self.number_of_machines
+        
+        # [FIX] Correctly index candidate using incomplete_env_idx for row and chosen_job for column
         chosen_op = self.candidate[self.incomplete_env_idx, chosen_job]
 
         if (self.reverse_process_relation[self.incomplete_env_idx, chosen_op, chosen_mch]).any():
@@ -271,6 +364,17 @@ class FJSPEnvForVariousOpNums:
 
         self.current_makespan[self.incomplete_env_idx] = np.maximum(self.current_makespan[self.incomplete_env_idx],
                                                                     self.true_op_ct[self.incomplete_env_idx, chosen_op])
+
+        # Calculate tardiness for the chosen operation (only if it is the last operation of the job)
+        relevant_due_dates = self.true_due_date[self.incomplete_env_idx, chosen_job]
+        relevant_completion_times = self.true_op_ct[self.incomplete_env_idx, chosen_op]
+        
+        is_last_op = (chosen_op == self.job_last_op_id[self.incomplete_env_idx, chosen_job])
+        
+        tardiness = np.maximum(0, relevant_completion_times - relevant_due_dates)
+        tardiness = tardiness * is_last_op
+        
+        self.accumulated_tardiness[self.incomplete_env_idx] += tardiness
 
         for k, j in enumerate(self.incomplete_env_idx):
             if candidate_add_flag[k]:
@@ -347,8 +451,18 @@ class FJSPEnvForVariousOpNums:
 
         self.construct_pair_features()
 
-        reward = self.max_endTime - np.max(self.op_ct_lb, axis=1)
+        # Compute reward: 
+        # 1. Gain in estimated makespan (positive is good)
+        reward_mk = self.max_endTime - np.max(self.op_ct_lb, axis=1)
         self.max_endTime = np.max(self.op_ct_lb, axis=1)
+        
+        # 2. [ALIGNED] Penalty for tardiness (negative is bad)
+        # tardiness is absolute time. Normalize by mean_op_pt and weight by 0.1
+        reward_td = - 1 * (tardiness / (self.mean_op_pt + 1e-8))
+        
+        # [NEW] Total reward normalized by number of jobs to reduce curriculum fluctuations
+        reward = (reward_mk + reward_td) / self.number_of_jobs
+        # reward = (reward_mk + reward_td)
 
         self.state.update(self.fea_j, self.op_mask, self.fea_m, self.mch_mask,
                           self.dynamic_pair_mask, self.comp_idx, self.candidate,
@@ -389,6 +503,23 @@ class FJSPEnvForVariousOpNums:
     # -------------------- feature builders --------------------
 
     def construct_op_features(self):
+        # Calculate Due Date related features
+        # Expand due_date to op dimension: [E, N]
+        op_due_date = np.array([np.repeat(self.due_date[k], repeats=self.virtual_job_length[k]) 
+                                for k in range(self.number_of_envs)])
+        
+        # Current time reference: using next_schedule_time (earliest next event)
+        # [E, 1] -> [E, N]
+        current_time = self.next_schedule_time[:, np.newaxis]
+        
+        # Normalized values (due_date is normalized by adapter, current_time is normalized by adapter)
+        feat_rem_time = (op_due_date - current_time) 
+        
+        feat_slack = (feat_rem_time - self.op_match_job_remain_work)
+        
+        feat_cr = feat_rem_time / (self.op_match_job_remain_work + 1e-5)
+        # Log CR to handle range
+        feat_cr_log = np.sign(feat_cr) * np.log1p(np.abs(feat_cr))
 
         self.fea_j = np.stack((self.op_scheduled_flag,
                                self.op_ct_lb,
@@ -399,7 +530,10 @@ class FJSPEnvForVariousOpNums:
                                self.op_remain_work,
                                self.op_match_job_left_op_nums,
                                self.op_match_job_remain_work,
-                               self.op_available_mch_nums), axis=2)
+                               self.op_available_mch_nums,
+                               feat_rem_time,
+                               feat_slack,
+                               feat_cr_log), axis=2)
 
         if self.flag_exist_dummy_node:
             mask_all = np.logical_or(self.dummy_mask_fea_j, self.delete_mask_fea_j)

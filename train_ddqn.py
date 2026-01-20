@@ -111,6 +111,8 @@ def train_ddqn(
     log = []                   # (ep, return, steps)
     returns = []               # 純回報列表
     makespans = []
+    tardiness_list = []        # [ADDED]
+    weighted_obj_list = []     # [ADDED]
     steps_list = []            # 每集步數（=到達事件數）
 
 # === Episodes 進度條 ===
@@ -119,6 +121,7 @@ def train_ddqn(
         ep_return = 0.0
         ep_steps = 0
         debug = []
+        info = {} # Init info
         # === 每集步數（到達事件）進度條 ===
         with tqdm(total=event_horizon, desc=f"Ep{ep} steps", leave=False, dynamic_ncols=True) as pbar:
             while True:
@@ -183,6 +186,12 @@ def train_ddqn(
         makespans.append(ep_mk)
         returns.append(ep_return)
         steps_list.append(ep_steps)
+        
+        # [ADDED] Record Tardiness & Weighted Obj
+        ep_td = info.get("episode_tardiness", 0.0)
+        tardiness_list.append(ep_td)
+        mk_val = ep_mk if not math.isnan(ep_mk) else 0.0
+        weighted_obj_list.append(0.5 * mk_val + 0.5 * ep_td)
 
         if ep % 10 == 0:
             avg_R = np.mean(returns[-10:]) if len(returns) >= 10 else ep_return
@@ -197,11 +206,13 @@ def train_ddqn(
     idle_penalty = bool(getattr(configs, "enable_full_idle_penalty", False))
     # [CHANGED] x 軸、移動平均（視窗=10）
     x = np.arange(1, len(returns) + 1)
-    mv_ret = np.array([np.mean(returns[max(0, i-10):i]) for i in range(1, len(returns) + 1)])  # [CHANGED]
-    mv_mk  = np.array([np.mean(makespans[max(0, i-10):i]) for i in range(1, len(makespans) + 1)])  # [ADDED]
+    mv_ret = np.array([np.mean(returns[max(0, i-10):i]) for i in range(1, len(returns) + 1)])  
+    mv_mk  = np.array([np.mean(makespans[max(0, i-10):i]) for i in range(1, len(makespans) + 1)]) 
+    mv_td  = np.array([np.mean(tardiness_list[max(0, i-10):i]) for i in range(1, len(tardiness_list) + 1)]) 
+    mv_w   = np.array([np.mean(weighted_obj_list[max(0, i-10):i]) for i in range(1, len(weighted_obj_list) + 1)])
 
-    # [CHANGED] 兩個子圖：上=Return，下=Makespan
-    fig, axs = plt.subplots(2, 1, figsize=(9, 7.2), sharex=True)  # [CHANGED]
+    # [CHANGED] 4個子圖
+    fig, axs = plt.subplots(4, 1, figsize=(9, 12), sharex=True) 
 
     # --- 子圖1：Return ---
     axs[0].plot(x, returns, label="Return per Episode")
@@ -214,10 +225,24 @@ def train_ddqn(
     # --- 子圖2：Makespan ---
     axs[1].plot(x, makespans, label="Dynamic Makespan")
     axs[1].plot(x, mv_mk, linestyle="--", label="Moving Avg (10)")
-    axs[1].set_xlabel("Episode")
     axs[1].set_ylabel("Makespan")
     axs[1].legend(loc="best")
     axs[1].grid(True, alpha=0.3)
+    
+    # --- 子圖3：Tardiness ---
+    axs[2].plot(x, tardiness_list, label="Total Tardiness")
+    axs[2].plot(x, mv_td, linestyle="--", label="Moving Avg (10)")
+    axs[2].set_ylabel("Tardiness")
+    axs[2].legend(loc="best")
+    axs[2].grid(True, alpha=0.3)
+    
+    # --- 子圖4：Weighted Obj ---
+    axs[3].plot(x, weighted_obj_list, label="0.5*MK + 0.5*TD")
+    axs[3].plot(x, mv_w, linestyle="--", label="Moving Avg (10)")
+    axs[3].set_ylabel("Weighted Obj")
+    axs[3].set_xlabel("Episode")
+    axs[3].legend(loc="best")
+    axs[3].grid(True, alpha=0.3)
 
     fig.tight_layout()
 

@@ -7,7 +7,7 @@ from typing import Optional, Tuple, Dict
 import gymnasium as gym
 from gymnasium import spaces
 from params import configs
-from data_utils import SD2_instance_generator
+from data_utils import SD2_instance_generator, generate_due_dates
 from global_env import GlobalTimelineOrchestrator, EventBurstGenerator, split_matrix_to_jobs
 from model.ddqn_model import calculate_ddqn_state
 
@@ -60,10 +60,10 @@ class EventGateEnv(gym.Env):
         # 上一輪 makespan
         self._mk_prev = 0.0
 
-        # Gym space（狀態 4 維；動作 {0,1}）
-        # state = [ n_buffer_norm, S_norm, L_min_norm, Weighted_Idle_norm ]
+        # Gym space（狀態 8 維；動作 {0,1}）
+        # state = [ n_buffer_norm, S_norm, L_min_norm, Weighted_Idle_norm, Tardy_Ratio, Buf_Min_Slack, Buf_Avg_Slack, WIP_Min_Slack ]
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(8,), dtype=np.float32
         )
         self.action_space = spaces.Discrete(2)
 
@@ -77,6 +77,37 @@ class EventGateEnv(gym.Env):
     def _norm_time(self, x: float) -> float:
         scale = self.time_scale
         return float(x) / float(scale)
+
+    def _get_buffer_stats(self, t_now: float):
+        """計算 Buffer 的急迫度統計特徵"""
+        if not self.orch.buffer:
+            return {"tardiness_ratio": 0.0, "min_slack": 0.0, "avg_slack": 0.0}
+            
+        slacks = []
+        num_tardy = 0
+        for job in self.orch.buffer:
+            due_date = float(job.meta.get("due_date", float('inf')))
+            total_pt = float(job.meta.get("total_proc_time", 0.0))
+            slack = due_date - t_now - total_pt
+            slacks.append(slack)
+            
+            if t_now > due_date:
+                num_tardy += 1
+                
+        return {
+            "tardiness_ratio": num_tardy / len(self.orch.buffer),
+            "min_slack": min(slacks),
+            "avg_slack": sum(slacks) / len(slacks)
+        }
+
+    def _calculate_buffer_penalty(self, t_now: float) -> float:
+        """計算 Buffer 中已遲交的工單數量（用於計算邊際懲罰）"""
+        num_late = 0
+        for job in self.orch.buffer:
+            due_date = float(job.meta.get("due_date", float('inf')))
+            if t_now > due_date:
+                num_late += 1
+        return float(num_late)
 
     # --------------------------- 狀態抽取 ---------------------------
     def _observe(self) -> np.ndarray:
@@ -94,6 +125,10 @@ class EventGateEnv(gym.Env):
         # 3) Calculate Weighted Idle (Fragmented)
         w_idle = self.orch.compute_weighted_idle(float(self.t_now), horizon)
         
+        # [ADDED] Calculate Urgency Stats
+        buf_stats = self._get_buffer_stats(float(self.t_now))
+        wip_stats = self.orch.get_wip_stats(float(self.t_now))
+        
         # 4) Call centralized state calculation
         return calculate_ddqn_state(
             buffer_size=len(self.orch.buffer),
@@ -102,7 +137,9 @@ class EventGateEnv(gym.Env):
             n_machines=self.M,
             obs_buffer_cap=int(cap),
             time_scale=self.time_scale,
-            weighted_idle=w_idle
+            weighted_idle=w_idle,
+            buffer_stats=buf_stats,
+            wip_stats=wip_stats
         )
 
     # --------------------------- 工具：目前 makespan ---------------------------
@@ -151,6 +188,7 @@ class EventGateEnv(gym.Env):
 
         self.t_now = 0.0
         self.events_done = 0
+        self.episode_tardiness = 0.0 # [ADDED]
 
         # 初始注入
         if self.init_jobs > 0:
@@ -162,7 +200,12 @@ class EventGateEnv(gym.Env):
             finally:
                 if old_nj is not None:
                     setattr(tmp_cfg, "n_j", old_nj)
-            init_jobs = split_matrix_to_jobs(jl, pt, base_job_id=0, t_arrive=0.0)
+            
+            # [ADDED] Generate Due Dates for initial jobs
+            dd_rel = generate_due_dates(jl, pt)
+            dd_abs = 0.0 + dd_rel 
+            
+            init_jobs = split_matrix_to_jobs(jl, pt, base_job_id=0, t_arrive=0.0, due_dates=dd_abs)
             self.orch.buffer.extend(init_jobs)
             max_existing = max((j.job_id for j in self.orch.buffer), default=-1)
             self.gen.bump_next_id(max_existing + 1)
@@ -195,9 +238,11 @@ class EventGateEnv(gym.Env):
             self.orch.buffer.extend(new_jobs)
 
         # (2) HOLD / RELEASE
+        batch_tardiness = 0.0
         if int(action) == 1:
             # RELEASE：做一次完整重排
-            self.orch.event_release_and_reschedule(t_event, self.heuristic)
+            fin = self.orch.event_release_and_reschedule(t_event, self.heuristic)
+            batch_tardiness = float(fin.get("batch_tardiness", 0.0))
         else:
             # HOLD：不放行，只更新 H 與機台占用
             self.orch.tick_without_release(t_event)
@@ -224,13 +269,26 @@ class EventGateEnv(gym.Env):
         scale = float(getattr(configs, "reward_scale", 10.0))
         stability_scale = float(getattr(configs, "stability_scale", 5))
         alpha = float(getattr(configs, "reward_alpha", 0.3))
+        buf_coef = float(getattr(configs, "buffer_penalty_coef", 0.1))
+        rel_coef = float(getattr(configs, "release_penalty_coef", 1.0))
 
         # (4) reward （依 mode）
         stability_penalty = 0.0
         delta_mk = (mk_now - self._mk_prev)
         
+        # [FIXED] Tardiness Penalties - Use Marginal Increase (Delta)
+        late_count = self._calculate_buffer_penalty(t_event)
+        marginal_tardiness = late_count * dt + batch_tardiness
+        self.episode_tardiness += marginal_tardiness
+
+        # r_buffer represents the additional delay minutes accumulated by all jobs in buffer during this step
+        # Divided by scale to keep it in the same range as Makespan
+        r_buffer = - (late_count * dt * buf_coef) / scale
+        r_release = - (batch_tardiness * rel_coef) / scale
+        
         # Base reward: - [(1-alpha)*idle + alpha*mk_delta] / scale
         base_reward = - ((total_idle * (1.0 - alpha)) + (delta_mk * alpha)) / scale
+        base_reward += (r_buffer + r_release)
         
         if self.reward_mode == "original":
             reward = base_reward
@@ -278,7 +336,10 @@ class EventGateEnv(gym.Env):
             "reward_makespan_delta": - (delta_mk * alpha) / scale,
             "reward_idle_cost": - (total_idle * (1.0 - alpha)) / scale,
             "reward_stability_penalty": - stability_penalty,
+            "reward_buffer_penalty": r_buffer,
+            "reward_release_penalty": r_release,
             "reward_final_flush_penalty": final_flush_penalty,
+            "episode_tardiness": self.episode_tardiness,
         }
         
         # print(f"obs:{obs},rewards:{reward:.3},act:{action},t_now:{t_event},t_next:{t_new},mk:{mk_now}, mk_prev:{temp}")
@@ -308,6 +369,7 @@ class EventGateEnv(gym.Env):
             fin = self.orch.event_release_and_reschedule(self.t_now, self.heuristic)
             if fin.get("event") != "batch_finalized":
                 break
+            self.episode_tardiness += float(fin.get("batch_tardiness", 0.0))
 
         # flush 後的 makespan（= mk_final）
         mk_after = float(np.max(self.orch.machine_free_time)) if len(self.orch.machine_free_time) > 0 else mk_before

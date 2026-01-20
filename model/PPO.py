@@ -167,6 +167,7 @@ class PPO:
 
         loss_epochs = 0
         v_loss_epochs = 0
+        p_loss_epochs = 0
 
         for _ in range(self.k_epochs):
 
@@ -205,13 +206,14 @@ class PPO:
                 self.optimizer.zero_grad()
                 loss_epochs += loss.mean().detach()
                 v_loss_epochs += v_loss.mean().detach()
+                p_loss_epochs += p_loss.mean().detach()
                 loss.mean().backward()
                 self.optimizer.step()
         # soft update
         for policy_old_params, policy_params in zip(self.policy_old.parameters(), self.policy.parameters()):
             policy_old_params.data.copy_(self.tau * policy_old_params.data + (1 - self.tau) * policy_params.data)
 
-        return loss_epochs.item() / self.k_epochs, v_loss_epochs.item() / self.k_epochs
+        return loss_epochs.item() / self.k_epochs, v_loss_epochs.item() / self.k_epochs, p_loss_epochs.item() / self.k_epochs
 
 
 def PPO_initialize():
