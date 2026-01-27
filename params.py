@@ -32,7 +32,7 @@ parser.add_argument('--path_name', type=str, default='test', help='path name for
 parser.add_argument('--model_suffix', type=str, default='', help='Suffix of the model')
 parser.add_argument('--data_suffix', type=str, default='mix', help='Suffix of the data')
 parser.add_argument('--model_source', type=str, default='static_ppo', help='Suffix of the data that model trained on')
-parser.add_argument('--data_source', type=str, default='BenchData', help='Suffix of test data')
+parser.add_argument('--data_source', type=str, default='SD2', help='Suffix of test data')
 
 
 # ============================
@@ -70,7 +70,7 @@ parser.add_argument('--data_type', type=str, default="test", help='Generated dat
 # ============================
 # PPO Network Architecture
 # ============================
-parser.add_argument('--fea_j_input_dim', type=int, default=13, help='Dimension of operation raw feature vectors')
+parser.add_argument('--fea_j_input_dim', type=int, default=14, help='Dimension of operation raw feature vectors')
 parser.add_argument('--fea_m_input_dim', type=int, default=8, help='Dimension of machine raw feature vectors')
 parser.add_argument('--dropout_prob', type=float, default=0.0, help='Dropout rate (1 - keep probability).')
 parser.add_argument('--num_heads_OAB', nargs='+', type=int, default=[4, 4], help='Number of attention head of operation message attention block')
@@ -87,10 +87,12 @@ parser.add_argument('--hidden_dim_critic', type=int, default=64, help='Hidden di
 # ============================
 # PPO Training Algorithm
 # ============================
-parser.add_argument('--seed_train', type=int, default=300, help='Seed for training')
-parser.add_argument('--num_envs', type=int, default=20, help='Batch size for training environments')
+parser.add_argument('--seed_train', type=int, default=1223, help='Seed for training')
+parser.add_argument('--num_envs', type=int, default=100, help='Batch size for training environments')
 parser.add_argument('--max_updates', type=int, default=1000, help='No. of episodes of each env for training')
 parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
+parser.add_argument('--lr_decay', type=str2bool, default=True, help='Whether to decay learning rate linearly')
+parser.add_argument('--lr_end', type=float, default=1e-4, help='Final learning rate at end of training')
 parser.add_argument('--gamma', type=float, default=1, help='Discount factor used in training')
 parser.add_argument('--k_epochs', type=int, default=4, help='Update frequency of each episode')
 parser.add_argument('--eps_clip', type=float, default=0.2, help='Clip parameter')
@@ -101,8 +103,8 @@ parser.add_argument('--tau', type=float, default=0, help='Policy soft update coe
 parser.add_argument('--gae_lambda', type=float, default=0.98, help='GAE parameter')
 parser.add_argument('--train_size', type=str, default="10x5", help='Size of training instances')
 parser.add_argument('--validate_timestep', type=int, default=10, help='Interval for validation and data log')
-parser.add_argument('--reset_env_timestep', type=int, default=20, help='Interval for reseting the environment')
-parser.add_argument('--minibatch_size', type=int, default=512, help='Batch size for computing the gradient')
+parser.add_argument('--reset_env_timestep', type=int, default=40, help='Interval for reseting the environment')
+parser.add_argument('--minibatch_size', type=int, default=1024, help='Batch size for computing the gradient')
 
 
 # ============================
@@ -117,10 +119,7 @@ parser.add_argument('--test_mode', type=str2bool, default=False, help='Whether u
 parser.add_argument('--sample_times', type=int, default=100, help='Sampling times for the sampling strategy')
 parser.add_argument('--test_model', nargs='+', default=['curriculum_train_10x5+mix','curriculum_train_40x5+mix'], help='List of model for testing')
 parser.add_argument('--test_method', nargs='+', default=["MWKR"], help='List of heuristic methods for testing')
-
-
-
-parser.add_argument('--eval_model_name', type=str, default="original_fix12_03", help='用於儲存CSV的檔名')
+parser.add_argument('--eval_model_name', type=str, default="new_state_setnjob_1000_5122_log_beta", help='用於儲存檔案的檔名')
 
 
 # ============================
@@ -132,6 +131,13 @@ parser.add_argument('--init_jobs', type=int, default= 10, help='初始工單數'
 parser.add_argument('--burst_size', type=int, default=1, help='每次生成工單數')
 parser.add_argument('--event_seed', type=int, default=42, help='事件驅動到達過程的亂數種子（Exponential 間隔）')
 parser.add_argument('--episode_seed_base', type=int, default=12345, help='episode 級別的基種子；每個 episode 以此為基準派生子亂數流')
+
+# ============================
+# Curriculum Learning Specifics
+# ============================
+parser.add_argument('--curriculum_cycle', type=int, default=250, help='Updates per curriculum stage')
+parser.add_argument('--tardiness_dilution_power', type=float, default=1, help='Beta factor for tardiness dilution')
+parser.add_argument('--schedule_type', type=str, default='deep_dive', choices=['standard', 'deep_dive', 'alt', 'same'], help='Type of curriculum schedule to use')
 
 # Cadence Sampling
 parser.add_argument('--cadence_min', type=int, default=8, help='固定事件次數（cadence）抽樣下限（含）')
@@ -190,6 +196,7 @@ parser.add_argument('--ddqn_out_dir', type=str, default='ddqn_ckpt', help='DDQN 
 parser.add_argument('--norm_scale', type=float, default=100, help='norm /scale')
 parser.add_argument('--reward_scale', type=float, default=50.0, help='Scale factor for reward normalization')
 parser.add_argument('--reward_alpha', type=float, default=0.3, help='Weight for Makespan in reward (alpha). Idle weight will be (1-alpha). Default 0.3 matches previous 0.3/0.7 split.')
+parser.add_argument('--tardiness_alpha', type=float, default=1.0, help='Weight for Tardiness in PPO reward calculation.')
 parser.add_argument('--stability_scale', type=float, default=0.1, help='Scale factor for stability penalty in reward calculation')
 parser.add_argument('--buffer_penalty_coef', type=float, default=0.0005, help='Coefficient for buffer tardiness penalty')
 parser.add_argument('--release_penalty_coef', type=float, default=0.005, help='Coefficient for release tardiness penalty')

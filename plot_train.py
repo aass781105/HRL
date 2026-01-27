@@ -4,10 +4,10 @@ from pathlib import Path
 from typing import List, Tuple, Union
 import matplotlib.pyplot as plt
 import numpy as np
+from params import configs
+from common_utils import strToSuffix
 
-# ======= 在這裡設定 =======
-LOG_BASE_DIR = "train_log/SD2/"
-CORE_NAME    = "mix_1_div_njob_10x5+mix"  # 請確認這與您的 Log 檔名一致
+# ======= 設定 =======
 OUTPUT_PLOT_DIR  = "train_log_plot"
 LINE_WIDTH       = 1.5
 # =========================
@@ -17,6 +17,7 @@ PAIR_RE = re.compile(r"\[\s*(" + NUM + r")\s*,\s*(" + NUM + r")\s*\]")
 NUM_LIST_RE = re.compile(NUM)
 
 def parse_content(text: str) -> Union[List[Tuple[float,float]], List[float]]:
+    # ... (Keep existing parse logic) ...
     text = text.strip()
     try:
         data = ast.literal_eval(text)
@@ -35,30 +36,205 @@ def parse_content(text: str) -> Union[List[Tuple[float,float]], List[float]]:
     return []
 
 def load_xy(txt_path: Path) -> List[Tuple[float,float]]:
+    # ... (Keep existing load logic) ...
     if not txt_path.exists():
         return []
     text = txt_path.read_text(encoding="utf-8")
     parsed = parse_content(text)
     if not parsed: return []
-    # 如果只有 y 值，自動補上 x (index)
     if isinstance(parsed[0], tuple):
         return parsed
     ys = parsed
     return list(enumerate(ys))
 
+def plot_reward_components(detailed_path: Path, output_path: Path, core_name: str):
+    """
+    Reads detailed_reward_*.txt which contains: [ep, r, mk_mean, mk_std, td_mean, td_std]
+    Plots Total Reward, Makespan Gain (with std), Tardiness Penalty (with std).
+    """
+    if not detailed_path.exists():
+        print(f"Detailed reward log not found: {detailed_path}")
+        return
+
+    text = detailed_path.read_text(encoding="utf-8")
+    
+    # [FIX] Use ast.literal_eval directly as parse_content is designed for 2D plots
+    try:
+        data = ast.literal_eval(text)
+    except Exception as e:
+        print(f"Error parsing detailed log: {e}")
+        return
+    
+    if not data or len(data) == 0 or len(data[0]) < 8:
+        print("Detailed reward data format incorrect (need 8 columns).")
+        return
+
+    ep = [x[0] for x in data]
+    r = [x[1] for x in data]
+    mk_mean = [x[2] for x in data]
+    mk_std = [x[3] for x in data]
+    td_mean = [x[4] for x in data]
+    td_std = [x[5] for x in data]
+    raw_mk = [x[6] for x in data]
+    raw_td = [x[7] for x in data]
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 15), sharex=True)
+    fig.suptitle(f"Training Analysis: {core_name}", fontsize=16)
+
+    # 1. Raw Performance (Dual Axis)
+    axes[0].set_title('Training Performance: Raw Makespan vs Tardiness')
+    ln1 = axes[0].plot(ep, raw_mk, color='blue', label='Makespan (Raw)')
+    axes[0].set_ylabel('Makespan', color='blue')
+    axes[0].tick_params(axis='y', labelcolor='blue')
+    axes[0].grid(True, alpha=0.3)
+    
+    ax0_r = axes[0].twinx()
+    ln2 = ax0_r.plot(ep, raw_td, color='orange', label='Tardiness (Raw)')
+    ax0_r.set_ylabel('Tardiness', color='orange')
+    ax0_r.tick_params(axis='y', labelcolor='orange')
+    
+    lns = ln1 + ln2
+    labs = [l.get_label() for l in lns]
+    axes[0].legend(lns, labs, loc='upper center')
+
+    # 2. Normalized Components (Single Axis, No Band)
+    axes[1].plot(ep, mk_mean, color='green', label='Mk Gain (Norm)')
+    axes[1].plot(ep, td_mean, color='red', label='Td Penalty (Norm)')
+    axes[1].set_ylabel('Normalized Reward')
+    axes[1].set_title('Reward Components (Learning Signal)')
+    axes[1].legend(loc='best')
+    axes[1].grid(True, alpha=0.3)
+    # Add zero line for reference
+    axes[1].axhline(0, color='black', linewidth=0.5, linestyle='--')
+
+    # 3. Components Std (Stability)
+    axes[2].plot(ep, mk_std, color='green', linestyle='--', label='Mk Std')
+    axes[2].plot(ep, td_std, color='red', linestyle='--', label='Td Std')
+    axes[2].set_ylabel('Standard Deviation')
+    axes[2].set_xlabel('Episodes')
+    axes[2].set_title('Reward Stability (Std Dev)')
+    axes[2].legend()
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"✅ Reward 組成分析圖已輸出：{output_path}")
+
+def plot_indist_validation(log_dir: Path, output_path: Path, log_file_suffix: str, core_name: str):
+    """
+    Scans for vali_indist_G*_{suffix}.txt files.
+    Plots one subplot per group: Solid Obj line, translucent MK and TD lines in the same plot.
+    """
+    # 1. Scan for files
+    files = list(log_dir.glob(f"vali_indist_G*_{log_file_suffix}.txt"))
+    if not files:
+        print("No in-distribution validation logs found.")
+        return
+
+    # Extract group names and sort
+    name_to_file = {}
+    for f in files:
+        # Match "vali_indist_G1_..."
+        match = re.search(r"vali_indist_(G\d+)_", f.name)
+        if match:
+            name_to_file[match.group(1)] = f
+    
+    # Sort by group number (G1, G2...)
+    sorted_names = sorted(name_to_file.keys(), key=lambda x: int(x[1:]))
+    n_subplots = len(sorted_names)
+    
+    # 2. Setup Figure Grid
+    cols = 2
+    rows = (n_subplots + 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(15, 5 * rows), squeeze=False)
+    fig.suptitle(f"In-Distribution Validation: {core_name}", fontsize=16)
+    
+    axes_flat = axes.flatten()
+    
+    # 3. Plot each group
+    for i, name in enumerate(sorted_names):
+        ax = axes_flat[i]
+        f_path = name_to_file[name]
+        text = f_path.read_text(encoding="utf-8")
+        try:
+            data = ast.literal_eval(text)
+        except:
+            ax.set_title(f"Group {name} (Parse Error)")
+            continue
+            
+        if not data: continue
+        
+        mk_vals = np.array([x[0] for x in data])
+        td_vals = np.array([x[1] for x in data])
+        obj_vals = 0.5 * mk_vals + 0.5 * td_vals
+        
+        # Correctly map steps (assuming validate_timestep=10 from params default, or read from config if possible)
+        # Here we just use index * 10
+        steps = np.arange(len(obj_vals)) * 10
+        
+        # Plot translucent components
+        ax.plot(steps, mk_vals, color='green', alpha=0.3, label='Raw Makespan')
+        ax.plot(steps, td_vals, color='red', alpha=0.3, label='Raw Tardiness')
+        
+        # Plot solid objective
+        ax.plot(steps, obj_vals, color='black', linewidth=2, label='Objective (0.5/0.5)')
+        
+        ax.set_title(f"Validation Group: {name}")
+        ax.set_ylabel("Absolute Time / Score")
+        ax.set_xlabel("Update Step")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.2)
+
+    # Hide unused axes
+    for j in range(i + 1, len(axes_flat)):
+        axes_flat[j].axis('off')
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+    print(f"✅ In-Dist 驗證趨勢圖已輸出：{output_path}")
+
 def main():
-    log_dir = Path(LOG_BASE_DIR).expanduser().resolve()
+    # 1. Construct dynamic log name
+    model_name = configs.eval_model_name
+    # Assuming initial n_j=10, n_m=5 from configs default or current
+    # Note: train_curriculum uses 'self.initial_n_j' which defaults to 10 in Trainer.__init__
+    init_nj = 10 
+    n_m = configs.n_m
+    suffix = strToSuffix(configs.data_suffix)
+    
+    # Full name used in log files
+    log_file_suffix = f"{model_name}_{init_nj}x{n_m}{suffix}"
+    
+    # 2. Setup Paths
+    log_dir = Path(f"train_log/{configs.data_source}/").expanduser().resolve()
+    
+    print(f"Looking for logs with suffix: {log_file_suffix} in {log_dir}")
     
     # 統一構建所有路徑
-    reward_path = log_dir / f"reward_{CORE_NAME}.txt"
-    ms_path     = log_dir / f"valiquality_{CORE_NAME}.txt"
-    td_path     = log_dir / f"valitardiness_{CORE_NAME}.txt"
-    loss_path   = log_dir / f"loss_{CORE_NAME}.txt"
+    reward_path = log_dir / f"reward_{log_file_suffix}.txt"
+    detailed_path = log_dir / f"detailed_reward_{log_file_suffix}.txt" 
+    ms_path     = log_dir / f"valiquality_{log_file_suffix}.txt"
+    td_path     = log_dir / f"valitardiness_{log_file_suffix}.txt"
+    loss_path   = log_dir / f"loss_{log_file_suffix}.txt"
 
     if not reward_path.exists():
         print(f"找不到 Reward 檔案：{reward_path}")
-        print(f"請確認 CORE_NAME 是否正確：{CORE_NAME}")
         return
+
+    CORE_NAME = model_name # For plot title
+    out_dir = Path(OUTPUT_PLOT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # [ADDED] Plot Detailed Reward Components
+    if detailed_path.exists():
+        comp_out_path = out_dir / f"components_{CORE_NAME}.png"
+        plot_reward_components(detailed_path, comp_out_path, CORE_NAME)
+        
+    # [ADDED] Plot In-Distribution Validation Analysis
+    indist_out_path = out_dir / f"indist_vali_{CORE_NAME}.png"
+    plot_indist_validation(log_dir, indist_out_path, log_file_suffix, CORE_NAME)
 
     # 讀取數據
     reward_pairs = load_xy(reward_path)

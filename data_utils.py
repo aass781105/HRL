@@ -149,6 +149,7 @@ def generate_due_dates(job_length, op_pt, tightness='random_mix'):
     
     tightness options:
     - 'random_mix': Randomly selects one of the predefined profiles.
+    - float/int: Uses this specific k for all jobs in the instance.
     - Specific profiles: 'easy', 'moderate', 'hard', 'crisis'
     """
     n_j = job_length.shape[0]
@@ -163,6 +164,12 @@ def generate_due_dates(job_length, op_pt, tightness='random_mix'):
             if len(compat_pt) > 0:
                 job_work[j] += np.mean(compat_pt)
             op_idx += 1
+
+    # [NEW] Handle specific numerical k value
+    if isinstance(tightness, (float, int, np.float64, np.int64)):
+        k = np.full(n_j, float(tightness))
+        due_dates = job_work * k
+        return due_dates
 
     # Define Profiles: {Mode: Probability}
     # loose: 1.6~2.0, medium: 1.3~1.6, tight: 1.0~1.3, extreme: 0.8~1.0

@@ -1,0 +1,7 @@
+# Curriculum PPO Configuration: Deep Dive (Alpha 1.5)
+eval_model_name: "standard-3"
+curriculum_cycle: 250
+schedule_type: "standard"
+tardiness_alpha: 3
+seed_train: 2
+max_updates: 1000

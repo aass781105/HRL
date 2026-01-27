@@ -1,0 +1,7 @@
+# Curriculum PPO Configuration: Same (Alpha 1, Seed 2)
+eval_model_name: "same3-1"
+curriculum_cycle: 1000
+schedule_type: "same3"
+tardiness_alpha: 1
+seed_train: 2
+max_updates: 1000

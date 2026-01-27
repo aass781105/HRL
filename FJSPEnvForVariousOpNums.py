@@ -61,7 +61,8 @@ class FJSPEnvForVariousOpNums:
         self.old_state = EnvState()
 
         # feature dims (keep your original settings)
-        self.op_fea_dim = 13
+        # Increment to 14 to include is_tardy flag
+        self.op_fea_dim = 14
         self.mch_fea_dim = 8
 
     # -------------------- static properties & init --------------------
@@ -143,6 +144,7 @@ class FJSPEnvForVariousOpNums:
         
         # Calculate scale for normalization
         scale = self.pt_upper_bound - self.pt_lower_bound + 1e-8
+        self.pt_scale = scale # [ADDED] Store for restoring absolute time
 
         # normalize to [0,1] (zeros remain zeros = incompatible)
         self.op_pt = (self.op_pt - self.pt_lower_bound) / scale
@@ -191,14 +193,28 @@ class FJSPEnvForVariousOpNums:
         self.op_match_job_left_op_nums = np.array([np.repeat(self.job_length[k],
                                                              repeats=self.virtual_job_length[k])
                                                    for k in range(self.number_of_envs)])
+        
+        # [ADDED] Calculate true (absolute) mean processing time per operation
+        # true_op_pt has 0 for incompatible, compatible_op counts valid machines
+        self.true_op_mean_pt = np.sum(self.true_op_pt, axis=2) / (self.compatible_op + 1e-8)
+        
         self.job_remain_work = []
+        self.true_job_remain_work = [] # [ADDED]
         for k in range(self.number_of_envs):
+            # Normal (normalized) remain work for features
             self.job_remain_work.append(
                 [np.sum(self.op_mean_pt[k][self.job_first_op_id[k][i]:self.job_last_op_id[k][i] + 1])
+                 for i in range(self.number_of_jobs)])
+            # True (absolute) remain work for rewards
+            self.true_job_remain_work.append(
+                [np.sum(self.true_op_mean_pt[k][self.job_first_op_id[k][i]:self.job_last_op_id[k][i] + 1])
                  for i in range(self.number_of_jobs)])
 
         self.op_match_job_remain_work = np.array([np.repeat(self.job_remain_work[k], repeats=self.virtual_job_length[k])
                                                   for k in range(self.number_of_envs)])
+        # [ADDED] Map true job remain work to operation dimension
+        self.true_op_match_job_remain_work = np.array([np.repeat(self.true_job_remain_work[k], repeats=self.virtual_job_length[k])
+                                                       for k in range(self.number_of_envs)])
 
         self.construct_op_features()
 
@@ -243,6 +259,7 @@ class FJSPEnvForVariousOpNums:
         self.old_due_date = np.copy(self.due_date)
         self.old_true_due_date = np.copy(self.true_due_date)
         self.old_accumulated_tardiness = np.copy(self.accumulated_tardiness)
+        self.old_job_current_tardiness = np.copy(self.job_current_tardiness)
 
         # state
         self.state = copy.deepcopy(self.old_state)
@@ -264,6 +281,7 @@ class FJSPEnvForVariousOpNums:
         self.due_date = np.copy(self.old_due_date)
         self.true_due_date = np.copy(self.old_true_due_date)
         self.accumulated_tardiness = np.copy(self.old_accumulated_tardiness)
+        self.job_current_tardiness = np.copy(self.old_job_current_tardiness)
         # state
         self.state = copy.deepcopy(self.old_state)
         return self.state
@@ -273,6 +291,9 @@ class FJSPEnvForVariousOpNums:
         self.done_flag = np.full(shape=(self.number_of_envs,), fill_value=0, dtype=bool)
         self.current_makespan = np.full(self.number_of_envs, float("-inf"))
         self.accumulated_tardiness = np.zeros(self.number_of_envs)
+        
+        # [NEW] Track cumulative tardiness (overflow) for each job to calculate marginal penalty
+        self.job_current_tardiness = np.zeros((self.number_of_envs, self.number_of_jobs))
 
         self.mch_queue = np.full(shape=[self.number_of_envs, self.number_of_machines,
                                         self.max_number_of_ops + 1], fill_value=-99, dtype=int)
@@ -365,17 +386,6 @@ class FJSPEnvForVariousOpNums:
         self.current_makespan[self.incomplete_env_idx] = np.maximum(self.current_makespan[self.incomplete_env_idx],
                                                                     self.true_op_ct[self.incomplete_env_idx, chosen_op])
 
-        # Calculate tardiness for the chosen operation (only if it is the last operation of the job)
-        relevant_due_dates = self.true_due_date[self.incomplete_env_idx, chosen_job]
-        relevant_completion_times = self.true_op_ct[self.incomplete_env_idx, chosen_op]
-        
-        is_last_op = (chosen_op == self.job_last_op_id[self.incomplete_env_idx, chosen_job])
-        
-        tardiness = np.maximum(0, relevant_completion_times - relevant_due_dates)
-        tardiness = tardiness * is_last_op
-        
-        self.accumulated_tardiness[self.incomplete_env_idx] += tardiness
-
         for k, j in enumerate(self.incomplete_env_idx):
             if candidate_add_flag[k]:
                 self.candidate_pt[j, chosen_job[k]] = self.unmasked_op_pt[j, chosen_op[k] + 1]
@@ -413,6 +423,8 @@ class FJSPEnvForVariousOpNums:
             self.op_match_job_left_op_nums[j][self.job_first_op_id[j, chosen_job[k]]:self.job_last_op_id[j, chosen_job[k]] + 1] -= 1
             self.op_match_job_remain_work[j][self.job_first_op_id[j, chosen_job[k]]:self.job_last_op_id[j, chosen_job[k]] + 1] -= \
                 self.op_mean_pt[j, chosen_op[k]]
+            self.true_op_match_job_remain_work[j][self.job_first_op_id[j, chosen_job[k]]:self.job_last_op_id[j, chosen_job[k]] + 1] -= \
+                self.true_op_mean_pt[j, chosen_op[k]]
 
         self.op_waiting_time = np.zeros((self.number_of_envs, self.max_number_of_ops))
         self.op_waiting_time[self.env_job_idx, self.candidate] = \
@@ -456,13 +468,35 @@ class FJSPEnvForVariousOpNums:
         reward_mk = self.max_endTime - np.max(self.op_ct_lb, axis=1)
         self.max_endTime = np.max(self.op_ct_lb, axis=1)
         
-        # 2. [ALIGNED] Penalty for tardiness (negative is bad)
-        # tardiness is absolute time. Normalize by mean_op_pt and weight by 0.1
-        reward_td = - 1 * (tardiness / (self.mean_op_pt + 1e-8))
+        # [FIX] Define relevant variables for tardiness calculation
+        relevant_due_dates = self.true_due_date[self.incomplete_env_idx, chosen_job]
+        relevant_completion_times = self.true_op_ct[self.incomplete_env_idx, chosen_op]
+        is_last_op = (chosen_op == self.job_last_op_id[self.incomplete_env_idx, chosen_job])
+        
+        # 2. Penalty for tardiness (negative is bad)
+        # [REVERTED] Sparse Reward Logic
+        # Calculate tardiness only at the completion of the job.
+        
+        # Calculate tardiness for the chosen operation
+        # relevant_completion_times and relevant_due_dates are absolute times
+        tardiness = np.maximum(0, relevant_completion_times - relevant_due_dates)
+        
+        # Only apply if it is the last operation of the job
+        tardiness = tardiness * is_last_op
+        
+        # Update accumulated total tardiness
+        self.accumulated_tardiness[self.incomplete_env_idx] += tardiness
+        
+        alpha = float(getattr(configs, "tardiness_alpha", 1.0))
+        dilution_power = float(getattr(configs, "tardiness_dilution_power", 1.0))
+        
+        base_scale = self.mean_op_pt * (self.number_of_jobs ** dilution_power) + 1e-8
+        
+        # Linear Scaling
+        reward_td = - alpha * (tardiness / base_scale)
         
         # [NEW] Total reward normalized by number of jobs to reduce curriculum fluctuations
         reward = (reward_mk + reward_td) / self.number_of_jobs
-        # reward = (reward_mk + reward_td)
 
         self.state.update(self.fea_j, self.op_mask, self.fea_m, self.mch_mask,
                           self.dynamic_pair_mask, self.comp_idx, self.candidate,
@@ -491,7 +525,14 @@ class FJSPEnvForVariousOpNums:
         }
         
         info = {
-            "scheduled_op_details": scheduled_op_details
+            "scheduled_op_details": scheduled_op_details,
+            "reward_mk": reward_mk / self.number_of_jobs, # Keep as array for batch training
+            "reward_td": reward_td / self.number_of_jobs, # Keep as array
+            # [ADDED] Raw values for debugging (Keep index 0 for simplicity or use arrays if needed)
+            "raw_mk_gain": float(reward_mk[env_idx]), 
+            "raw_local_tardiness": float(tardiness[env_idx]),
+            "raw_accumulated_tardiness": float(self.accumulated_tardiness[env_idx]),
+            "current_makespan": float(self.current_makespan[env_idx])
         }
         # --- End collect scheduling details ---
 
@@ -520,6 +561,9 @@ class FJSPEnvForVariousOpNums:
         feat_cr = feat_rem_time / (self.op_match_job_remain_work + 1e-5)
         # Log CR to handle range
         feat_cr_log = np.sign(feat_cr) * np.log1p(np.abs(feat_cr))
+        
+        # [NEW] Binary flag for tardiness
+        feat_is_tardy = (feat_rem_time < 0).astype(float)
 
         self.fea_j = np.stack((self.op_scheduled_flag,
                                self.op_ct_lb,
@@ -533,7 +577,8 @@ class FJSPEnvForVariousOpNums:
                                self.op_available_mch_nums,
                                feat_rem_time,
                                feat_slack,
-                               feat_cr_log), axis=2)
+                               feat_cr_log,
+                               feat_is_tardy), axis=2)
 
         if self.flag_exist_dummy_node:
             mask_all = np.logical_or(self.dummy_mask_fea_j, self.delete_mask_fea_j)

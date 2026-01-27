@@ -103,12 +103,14 @@ def test_benchmark_multifactors(data_set, model_path, factors=[0.9, 1.2, 1.5]):
             # env.current_makespan is an array [ms]
             ms = env.current_makespan[0]
             td = env.accumulated_tardiness[0]
+            obj = 0.5 * ms + 0.5 * td
             
             results.append({
                 'Instance_ID': i,
                 'Tightness_Factor': k,
                 'Makespan': ms,
                 'Tardiness': td,
+                'Objective': obj,
                 'Solve_Time': t_end - t_start
             })
 
@@ -119,9 +121,12 @@ def main():
     # Example: Test Hurink_vdata using model 'due_date_ppo'
     
     # 1. Define Model Path
-    # Assuming the model is saved as 'due_date_ppo.pth' in 'SD2' folder
-    model_name = 'ablation_12_div_njob.pth'
-    model_dir = './trained_network/SD2/'
+    # Using eval_model_name from configs
+    model_name = configs.eval_model_name
+    if not model_name.endswith('.pth'):
+        model_name += '.pth'
+        
+    model_dir = f'./trained_network/{configs.data_source}/'
     model_path = os.path.join(model_dir, model_name)
     
     # 2. Define Data Source
@@ -178,7 +183,7 @@ def main():
         print("\n" + "="*30)
         print(f"Test Complete! Results saved to: {csv_path}")
         print("Summary by Factor:")
-        print(df_results.groupby('Tightness_Factor')[['Makespan', 'Tardiness']].mean())
+        print(df_results.groupby('Tightness_Factor')[['Makespan', 'Tardiness', 'Objective']].mean())
         print("="*30)
     else:
         print("Test failed or no results generated.")

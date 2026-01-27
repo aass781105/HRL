@@ -59,31 +59,74 @@ class Trainer:
 
         # Model name will reflect the initial job size and then dynamically change
         self.data_name = f'{self.initial_n_j}x{self.fixed_n_m}{strToSuffix(config.data_suffix)}' 
-        self.model_name = f'mix_1_div_njob' 
+        self.model_name = configs.eval_model_name
 
-        # --- New: Dynamic Fixed Validation Suite (120 Instances) ---
+        # --- New: Dynamic Fixed Validation Suite (150 Instances) ---
         self.vali_data_batches = self.generate_fixed_validation_data()
+
+        # [NEW] In-Distribution Validation Suite (Manually Defined Groups)
+        # These 4 groups run throughout the entire training to monitor cross-size performance.
+        self.indist_schedule = [
+            {"name": "G1", "n_j": 10, "k": 1.0, "num": 20},
+            {"name": "G2", "n_j": 10, "k": 1.2, "num": 20},
+            {"name": "G3", "n_j": 10, "k": 1.5, "num": 20},
+            {"name": "G4", "n_j": 20, "k": 1.2, "num": 20},
+        ]
+        
+        self.vali_indist_batches = self.generate_indist_validation_data(self.indist_schedule)
+        self.vali_indist_logs = { g['name']: [] for g in self.indist_schedule }
         
         self.ppo = PPO_initialize()
         self.memory = Memory(gamma=config.gamma, gae_lambda=config.gae_lambda)
 
+    def generate_indist_validation_data(self, schedule):
+        """
+        Generates fixed validation batches based on manual schedule.
+        """
+        print("-" * 25 + "Generating In-Dist Validation Suite" + "-" * 25)
+        batches = {}
+        old_n_j = configs.n_j
+        
+        for group in schedule:
+            name = group['name']
+            n_j = group['n_j']
+            k = group['k']
+            num = group['num']
+            
+            configs.n_j = n_j
+            jl_list, pt_list, dd_list = [], [], []
+            
+            for i in range(num):
+                # Seed base 2000+
+                s = 2000 + n_j * 100 + i
+                jl, pt, _ = SD2_instance_generator(configs, seed=s)
+                dd = generate_due_dates(jl, pt, tightness=k)
+                jl_list.append(jl); pt_list.append(pt); dd_list.append(dd)
+            
+            batches[name] = {'n_j': n_j, 'jl': jl_list, 'pt': pt_list, 'dd': dd_list, 'k': k}
+            print(f"Generated In-Dist Batch {name}: Size {n_j}, k={k}")
+            
+        configs.n_j = old_n_j
+        return batches
+
     def generate_fixed_validation_data(self):
         """
-        Generates 120 fixed validation instances: 
+        Generates fixed validation instances: 
         Sizes: [10, 15, 20] jobs
-        Profiles: [Easy, Moderate, Hard, Crisis]
+        K Values: [0.6, 0.8, 1.0, 1.2, 1.5]
         Count: 10 per combination.
-        Total: 3 * 4 * 10 = 120.
-        Batched by 20 for efficient inference.
+        Total: 3 * 5 * 10 = 150.
+        Batched by size for efficient inference.
         """
         print("-" * 25 + "Generating Validation Suite" + "-" * 25)
-        print("Creating 120 fixed instances (Sizes: 10, 15, 20 | All Profiles incl. Crisis)")
+        k_levels = [0.6, 0.8, 1.0, 1.2, 1.5]
+        sizes = [10, 15, 20]
+        num_per_combo = 10
+        total_instances = len(sizes) * len(k_levels) * num_per_combo
+        
+        print(f"Creating {total_instances} fixed instances (Sizes: {sizes} | K: {k_levels})")
         
         vali_batches = []
-        sizes = [10, 15, 20]
-        profiles = ['easy', 'moderate', 'hard', 'crisis']
-        num_per_profile = 10
-        
         old_n_j = configs.n_j
         
         for n_j in sizes:
@@ -92,27 +135,27 @@ class Trainer:
             size_pt = []
             size_dd = []
             
-            for profile in profiles:
-                for _ in range(num_per_profile):
-                    jl, pt, _ = SD2_instance_generator(configs)
-                    # Note: data_utils.generate_due_dates handles 'crisis' specifically if passed as tightness
-                    # ensuring crisis instances can still be generated for validation even if excluded from random_mix
-                    dd = generate_due_dates(jl, pt, tightness=profile)
+            for k_idx, k in enumerate(k_levels):
+                for i in range(num_per_combo):
+                    # [FIX] Use a fixed seed for validation instances, independent of training seed.
+                    # This ensures the validation suite is identical across all experiments.
+                    vali_seed = 1000 + n_j * 100 + k_idx * 10 + i
+                    jl, pt, _ = SD2_instance_generator(configs, seed=vali_seed)
+                    dd = generate_due_dates(jl, pt, tightness=k)
                     size_jl.append(jl)
                     size_pt.append(pt)
                     size_dd.append(dd)
             
-            # Split 40 instances of this size into 2 batches of 20
-            for i in range(0, 40, 20):
-                vali_batches.append({
-                    'n_j': n_j,
-                    'jl': size_jl[i:i+20],
-                    'pt': size_pt[i:i+20],
-                    'dd': size_dd[i:i+20]
-                })
+            # One batch per size (50 instances)
+            vali_batches.append({
+                'n_j': n_j,
+                'jl': size_jl,
+                'pt': size_pt,
+                'dd': size_dd
+            })
         
         configs.n_j = old_n_j # Restore global config
-        print(f"Validation Suite Ready: {len(vali_batches)} batches of 20 instances.")
+        print(f"Validation Suite Ready: {len(vali_batches)} batches (one per size).")
         return vali_batches
 
     def train(self):
@@ -121,6 +164,7 @@ class Trainer:
         """
         setup_seed(self.config.seed_train)
         self.log = []
+        self.detailed_log = [] # [ADDED] [ep, r, mk_mean, mk_std, td_mean, td_std]
         self.validation_log = []
         self.validation_tardiness_log = []
         self.loss_log = []
@@ -136,40 +180,122 @@ class Trainer:
         self.train_st = time.time()
         
         # --- Curriculum Learning Initial Setup ---
-        current_n_j = self.initial_n_j
         fixed_n_m = self.fixed_n_m
-        configs.n_j = current_n_j 
         
-        tqdm.write(f"Starting curriculum training with {current_n_j} jobs and {fixed_n_m} machines.")
+        # --- Curriculum Learning Initial Setup ---
+        fixed_n_m = self.fixed_n_m
+        
+        # Stage-based Curriculum Schedules
+        # Each stage lasts for 'cycle_len' updates
+        cycle_len = configs.curriculum_cycle
+        
+        # Difficulty Distributions (Unified for all stages)
+        # 20x1.0 (Very Tight), 50x1.2 (Tight), 30x1.5 (Moderate) = 100 total
+        # k_dist_unified = [1.0]*20 + [1.2]*50 + [1.5]*30
+        k_dist_unified = [1.2]*20 + [1.5]*60 + [1.8]*20
+        k_dist_unified2 = [0.9]*20 + [1.2]* 60 + [1.5]* 20
+        k08 = [0.8] * 100
+        k1 = [1.0] *100 
+        k12 = [1.2] *100 
+        k15 = [1.5] * 100 
+        k18 = [1.8] *100
+        k20 = [2.0] *100
+        if configs.schedule_type == 'deep_dive':
+            curriculum_schedule = [
+                {"n_j": 10, "reset_step": 50, "k_dist": k15},
+                {"n_j": 10, "reset_step": 50, "k_dist": k12},
+                {"n_j": 10, "reset_step": 50, "k_dist": k1},
+                {"n_j": 10, "reset_step": 50, "k_dist": k08},
+            ]
+        elif configs.schedule_type == 'standard':
+            curriculum_schedule = [
+                {"n_j": 10, "reset_step": 50, "k_dist": k12},
+                {"n_j": 15, "reset_step": 125, "k_dist": k15},
+                {"n_j": 20, "reset_step": 250, "k_dist": k20},
+                {"n_j": 20, "reset_step": 250, "k_dist": k20}
+            ]
+        elif configs.schedule_type == 'alt':
+            cycle_len = 500 # Custom cycle for alt
+            curriculum_schedule = [
+                {"n_j": 10, "reset_step": 50, "k_dist": k_dist_unified},
+                {"n_j": 20, "reset_step": 250, "k_dist": k_dist_unified}
+            ]
+        elif configs.schedule_type == 'same1':
+            cycle_len = 1000 # Custom cycle for same
+            curriculum_schedule = [
+                {"n_j": 10, "reset_step": 50, "k_dist": k1},
+            ]
+        elif configs.schedule_type == 'same2':
+            cycle_len = 1000 # Custom cycle for same
+            curriculum_schedule = [
+                {"n_j": 10, "reset_step": 50, "k_dist": k12},
+            ]
+        elif configs.schedule_type == 'same3':
+            cycle_len = 1000 # Custom cycle for same
+            curriculum_schedule = [
+                {"n_j": 10, "reset_step": 50, "k_dist": k15},
+            ]
+        elif configs.schedule_type == 'same4':
+            cycle_len = 1000 # Custom cycle for same
+            curriculum_schedule = [
+                {"n_j": 10, "reset_step": 50, "k_dist": k08},
+            ]        
+        else:
+            # Default fallback
+            curriculum_schedule = [{"n_j": 10, "reset_step": 50, "k_dist": k_dist_unified}]
+        
+        # Initialize
+        current_stage_idx = 0
+        current_cfg = curriculum_schedule[0]
+        configs.n_j = current_cfg["n_j"]
+        current_reset_step = current_cfg["reset_step"]
+        current_k_dist = current_cfg["k_dist"]
+        
+        tqdm.write(f"Starting curriculum training ({configs.schedule_type}) with {configs.n_j} jobs. Reset every {current_reset_step} steps.")
         self.env = FJSPEnvForVariousOpNums(n_j=configs.n_j, n_m=configs.n_m)
 
         for i_update in tqdm(range(self.max_updates), file=sys.stdout, desc="progress", colour='blue'):
             ep_st = time.time()
 
-            if (i_update + 1) % 100 == 0:
-                current_n_j = random.randint(10, 20)
-                configs.n_j = current_n_j 
-                tqdm.write(f"\nCURRICULUM UPDATE: Job count for next instances set to {current_n_j}. (Update @ ep {i_update+1})")
+            # 1. Check for Curriculum Stage Update
+            new_stage_idx = i_update // cycle_len
+            if new_stage_idx != current_stage_idx and new_stage_idx < len(curriculum_schedule):
+                current_stage_idx = new_stage_idx
+                current_cfg = curriculum_schedule[current_stage_idx]
+                configs.n_j = current_cfg["n_j"]
+                current_reset_step = current_cfg["reset_step"]
+                current_k_dist = current_cfg["k_dist"]
+                
+                tqdm.write(f"\nCURRICULUM UPDATE: Stage {current_stage_idx+1}. Job Size={configs.n_j}, Reset Rate={current_reset_step}")
 
-            if i_update % self.reset_env_timestep == 0:
-                dataset_job_length, dataset_op_pt, dataset_due_date = self.sample_training_instances(i_update)
+            # 2. Check for Environment Reset (Modulo Logic)
+            if i_update % current_reset_step == 0:
+                dataset_job_length, dataset_op_pt, dataset_due_date = self.sample_training_instances(i_update, current_k_dist)
                 self.env = FJSPEnvForVariousOpNums(n_j=configs.n_j, n_m=configs.n_m)
                 state = self.env.set_initial_data(dataset_job_length, dataset_op_pt, dataset_due_date, true_due_date_list=dataset_due_date)
             else:
                 state = self.env.reset()
-            
-            # # --- Entropy Decay Logic ---
-            # ent_start = 0.05
-            # ent_end = 0.005
-            # # Linear decay from ent_start to ent_end over max_updates
-            # current_ent_coef = ent_start - (ent_start - ent_end) * (i_update / max(1, self.max_updates - 1))
-            # current_ent_coef = max(ent_end, current_ent_coef) 
-            current_ent_coef = 0.01
+
+            # --- Entropy Decay Logic ---
+            ent_start = 0.05
+            ent_end = configs.entloss_coef # Defaults to 0.01
+            # Linear decay from ent_start to ent_end over max_updates
+            decay_ratio = i_update / max(1, self.max_updates - 1)
+            current_ent_coef = ent_start - (ent_start - ent_end) * decay_ratio
+            current_ent_coef = max(ent_end, current_ent_coef) 
             
             self.ppo.entloss_coef = current_ent_coef
             # ----------------------------------------------------------------
             
-            ep_rewards = - deepcopy(self.env.init_quality)
+            # [FIXED] Initialize rewards to zero to maximize signal-to-noise ratio
+            # This makes PPO focus on learning marginal gains rather than constant baseline.
+            ep_rewards = np.zeros(self.num_envs)
+            ep_mk_gain = 0.0
+            ep_td_penalty = 0.0
+            
+            # [ADDED] Lists to collect all step rewards for Std calculation
+            all_mk_rewards = []
+            all_td_rewards = []
 
             while True:
                 self.memory.push(state)
@@ -184,7 +310,16 @@ class Trainer:
                                                              fea_pairs=state.fea_pairs_tensor)
 
                 action_envs, action_logprob_envs = sample_action(pi_envs)
-                state, reward, done, _ = self.env.step(actions=action_envs.cpu().numpy())
+                state, reward, done, info = self.env.step(actions=action_envs.cpu().numpy())
+                
+                # Accumulate Mean
+                ep_mk_gain += np.mean(info['reward_mk'])
+                ep_td_penalty += np.mean(info['reward_td'])
+                
+                # Collect for Std
+                all_mk_rewards.extend(info['reward_mk'].flatten())
+                all_td_rewards.extend(info['reward_td'].flatten())
+                
                 ep_rewards += reward
                 reward = torch.from_numpy(reward).to(device)
 
@@ -203,17 +338,28 @@ class Trainer:
             mean_rewards_all_env = np.mean(ep_rewards)
             mean_makespan_all_env = np.mean(self.env.current_makespan)
             mean_tardiness_all_env = np.mean(self.env.accumulated_tardiness)
+            
+            # [ADDED] Calculate Std
+            mk_std = np.std(all_mk_rewards)
+            td_std = np.std(all_td_rewards)
 
             self.log.append([i_update, mean_rewards_all_env])
+            
+            # [CHANGED] Append raw metrics to detailed log (8 columns)
+            self.detailed_log.append([i_update, mean_rewards_all_env, 
+                                      ep_mk_gain, mk_std, 
+                                      ep_td_penalty, td_std,
+                                      mean_makespan_all_env, mean_tardiness_all_env])
+                                      
             self.loss_log.append([i_update, loss, v_loss, p_loss])
 
             if (i_update + 1) % self.validate_timestep == 0:
+                # 1. Standard Validation (Fixed Benchmark)
                 vali_makespan, vali_tardiness = self.validate_envs_with_various_op_nums()
                 vali_result = vali_makespan.mean()
                 vali_tardiness_mean = vali_tardiness.mean()
                 
                 # Calculate weighted objective score for saving best model
-                # Using 0.5/0.5 weight as the evaluation standard
                 current_score = 0.5 * vali_result + 0.5 * vali_tardiness_mean
 
                 if current_score < self.record:
@@ -222,13 +368,17 @@ class Trainer:
 
                 self.validation_log.append(vali_result)
                 self.validation_tardiness_log.append(vali_tardiness_mean)
+                
+                # 2. In-Distribution Validation (Current vs Other Sizes)
+                self.run_indist_validation()
+                
                 self.save_validation_log()
                 tqdm.write(f'Vali Quality: {vali_result:.2f} | Tardiness: {vali_tardiness_mean:.2f} | Score: {current_score:.2f} (Best: {self.record:.2f})')
 
             ep_et = time.time()
             tqdm.write(
-                'Episode {}\t reward: {:.2f}\t makespan: {:.2f}\t tardiness: {:.2f}\t Total_loss: {:.4f}\t P_loss: {:.4f}\t ent: {:.3f}\t training time: {:.2f}'.format(
-                    i_update + 1, mean_rewards_all_env, mean_makespan_all_env, mean_tardiness_all_env, loss, p_loss, current_ent_coef, ep_et - ep_st))
+                'Episode {}\t R: {:.4f} (Mk: {:.4f}±{:.4f}, Td: {:.4f}±{:.4f})\t makespan: {:.2f}\t tardiness: {:.2f}\t Total_loss: {:.4f}\t P_loss: {:.4f}'.format(
+                    i_update + 1, mean_rewards_all_env, ep_mk_gain, mk_std, ep_td_penalty, td_std, mean_makespan_all_env, mean_tardiness_all_env, loss, p_loss))
 
         self.train_et = time.time()
         self.save_training_log()
@@ -237,6 +387,10 @@ class Trainer:
         log_model_name = f'{self.model_name}_{self.initial_n_j}x{self.fixed_n_m}{strToSuffix(self.config.data_suffix)}'
         file_writing_obj = open(f'./train_log/{self.data_source}/' + 'reward_' + log_model_name + '.txt', 'w')
         file_writing_obj.write(str(self.log))
+        
+        # [ADDED] Save detailed log
+        file_writing_obj_d = open(f'./train_log/{self.data_source}/' + 'detailed_reward_' + log_model_name + '.txt', 'w')
+        file_writing_obj_d.write(str(self.detailed_log))
 
         file_writing_obj1 = open(f'./train_log/{self.data_source}/' + 'valiquality_' + log_model_name + '.txt', 'w')
         file_writing_obj1.write(str(self.validation_log))
@@ -259,18 +413,69 @@ class Trainer:
         
         file_writing_obj2 = open(f'./train_log/{self.data_source}/' + 'valitardiness_' + log_model_name + '.txt', 'w')
         file_writing_obj2.write(str(self.validation_tardiness_log))
+        
+        # [ADDED] Save In-Dist logs for each group
+        for name, logs in self.vali_indist_logs.items():
+            f_path = f'./train_log/{self.data_source}/vali_indist_{name}_{log_model_name}.txt'
+            with open(f_path, 'w') as f:
+                f.write(str(logs))
 
-    def sample_training_instances(self, i_update):
+    def run_indist_validation(self):
+        """
+        Runs the model against all fixed in-distribution batches and stores raw [MK, TD].
+        """
+        self.ppo.policy.eval()
+        for name, batch in self.vali_indist_batches.items():
+            temp_env = FJSPEnvForVariousOpNums(n_j=batch['n_j'], n_m=self.fixed_n_m)
+            # Use normalize_due_date=True for static validation
+            state = temp_env.set_initial_data(batch['jl'], batch['pt'], batch['dd'], 
+                                              normalize_due_date=True, true_due_date_list=batch['dd'])
+
+            while True:
+                with torch.no_grad():
+                    batch_idx = ~torch.from_numpy(temp_env.done_flag)
+                    if batch_idx.any():
+                        pi, _ = self.ppo.policy(fea_j=state.fea_j_tensor[batch_idx],
+                                                op_mask=state.op_mask_tensor[batch_idx],
+                                                candidate=state.candidate_tensor[batch_idx],
+                                                fea_m=state.fea_m_tensor[batch_idx],
+                                                mch_mask=state.mch_mask_tensor[batch_idx],
+                                                comp_idx=state.comp_idx_tensor[batch_idx],
+                                                dynamic_pair_mask=state.dynamic_pair_mask_tensor[batch_idx],
+                                                fea_pairs=state.fea_pairs_tensor[batch_idx])
+                        action = greedy_select_action(pi)
+                        state, _, done, _ = temp_env.step(action.cpu().numpy())
+                    else:
+                        break
+                if done.all():
+                    break
+            
+            # Record mean raw metrics for this group
+            avg_ms = np.mean(temp_env.current_makespan)
+            avg_td = np.mean(temp_env.accumulated_tardiness)
+            self.vali_indist_logs[name].append([avg_ms, avg_td])
+            
+        self.ppo.policy.train()
+
+    def sample_training_instances(self, i_update, k_list=None):
         dataset_JobLength = []
         dataset_OpPT = []
         dataset_DueDate = []
+        
+        # [FIX] Use the k_list passed from curriculum_schedule. 
+        # Fallback to a default if None.
+        if k_list is None:
+            k_list = [1.2] * self.num_envs
+        
         for i in range(self.num_envs):
             # Deterministic seed for each instance in each update
             instance_seed = self.config.seed_train + i_update * self.num_envs + i
             
             JobLength, OpPT, _ = SD2_instance_generator(config=self.config, seed=instance_seed)
-            # --- Ablation Study: Fixed tightness at 1.2 ---
-            DueDate = generate_due_dates(JobLength, OpPT, tightness='random_mix')
+            
+            # Use the specific k-value for all jobs in this instance
+            k_val = k_list[i] if i < len(k_list) else 1.2
+            DueDate = generate_due_dates(JobLength, OpPT, tightness=k_val)
             
             dataset_JobLength.append(JobLength)
             dataset_OpPT.append(OpPT)
@@ -331,7 +536,6 @@ def main():
     configs.n_m = 5 
     configs.data_source = 'SD2'
     configs.data_suffix = 'mix'
-    configs.max_updates = 1000 
 
     trainer = Trainer(configs)
     trainer.train()
