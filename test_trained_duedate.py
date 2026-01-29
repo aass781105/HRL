@@ -161,21 +161,33 @@ def main():
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         
         # --- Pivot to Wide Format ---
-        # Pivot table: Index=Instance_ID, Columns=Tightness_Factor, Values=[Makespan, Tardiness]
-        df_pivot = df_results.pivot(index='Instance_ID', columns='Tightness_Factor', values=['Makespan', 'Tardiness'])
+        # Pivot table: Index=Instance_ID, Columns=Tightness_Factor, Values=[Makespan, Tardiness, Objective]
+        df_pivot = df_results.pivot(index='Instance_ID', columns='Tightness_Factor', values=['Makespan', 'Tardiness', 'Objective'])
         
         # Flatten MultiIndex columns
         # e.g., ('Makespan', 0.9) -> 'Makespan_0.9'
         df_pivot.columns = [f'{col[0]}_{col[1]}' for col in df_pivot.columns]
         
-        # Reorder columns to group by Factor (MS_0.9, TD_0.9, MS_1.2, TD_1.2 ...)
+        # Reorder columns to group by Factor (MS_0.9, TD_0.9, OBJ_0.9, MS_1.2 ...)
         factors = sorted(df_results['Tightness_Factor'].unique())
         ordered_cols = []
         for f in factors:
             ordered_cols.append(f'Makespan_{f}')
             ordered_cols.append(f'Tardiness_{f}')
+            ordered_cols.append(f'Objective_{f}')
             
         df_final = df_pivot[ordered_cols].reset_index()
+        
+        # [ADDED] Append Average Row
+        # Calculate mean for numeric columns
+        avg_series = df_final.iloc[:, 1:].mean() # Skip Instance_ID
+        
+        # Create a new row DataFrame
+        avg_row = pd.DataFrame(avg_series).transpose()
+        avg_row.insert(0, 'Instance_ID', 'Average') # Add label
+        
+        # Concatenate
+        df_final = pd.concat([df_final, avg_row], ignore_index=True)
         
         csv_path = os.path.join(output_dir, f'TestResult_{clean_model_name}_{timestamp}_wide.csv')
         df_final.to_csv(csv_path, index=False)

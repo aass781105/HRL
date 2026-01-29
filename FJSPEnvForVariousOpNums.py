@@ -89,7 +89,7 @@ class FJSPEnvForVariousOpNums:
 
         self.flag_exist_dummy_node = ~(self.env_number_of_ops == self.max_number_of_ops).all()
 
-    def set_initial_data(self, job_length_list, op_pt_list, due_date_list=None, normalize_due_date=True, true_due_date_list=None):
+    def set_initial_data(self, job_length_list, op_pt_list, due_date_list=None, normalize_due_date=True, true_due_date_list=None, tightness=None):
         """
         Args:
             job_length_list: List[np.ndarray]
@@ -97,6 +97,7 @@ class FJSPEnvForVariousOpNums:
             due_date_list:   Normalized or raw due dates used for state features.
             normalize_due_date: If True, due_date_list will be normalized internally.
             true_due_date_list: Absolute due dates used for Tardiness/Reward calculation.
+            tightness:       Optional array/list of tightness factors (k) for reward normalization.
         """
         self.number_of_envs = len(job_length_list)
         self.job_length = np.array(job_length_list)
@@ -108,6 +109,12 @@ class FJSPEnvForVariousOpNums:
             self.due_date = np.zeros((self.number_of_envs, self.number_of_jobs))
         else:
             self.due_date = np.array(due_date_list)
+            
+        # [ADDED] Store tightness for reward calculation
+        if tightness is not None:
+            self.tightness = np.array(tightness)
+        else:
+            self.tightness = None
 
         # Handle True Due Date for Rewards (Absolute time)
         if true_due_date_list is None:
@@ -490,7 +497,11 @@ class FJSPEnvForVariousOpNums:
         alpha = float(getattr(configs, "tardiness_alpha", 1.0))
         dilution_power = float(getattr(configs, "tardiness_dilution_power", 1.0))
         
-        base_scale = self.mean_op_pt * (self.number_of_jobs ** dilution_power) + 1e-8
+        # base_scale = self.mean_op_pt * (self.number_of_jobs ** dilution_power) + 1e-8
+        
+        # [MODIFIED] Normalization using estimated makespan (mean_op_pt * n_j)
+        base_scale = self.mean_op_pt * self.number_of_jobs
+        base_scale = np.maximum(base_scale, 1e-8) # Avoid division by zero or negative
         
         # Linear Scaling
         reward_td = - alpha * (tardiness / base_scale)
@@ -596,14 +607,22 @@ class FJSPEnvForVariousOpNums:
 
         num_left_nodes = np.maximum(num_left_nodes, 1e-8)
 
-        mean_fea_j = np.sum(self.fea_j, axis=1) / num_left_nodes
+        # [MODIFIED] Split features: Normalize first 12, keep last 2 (CR, Is_Tardy) raw
+        fea_to_norm = self.fea_j[:, :, :12]
+        fea_keep_raw = self.fea_j[:, :, 12:]
+        delete_mask_to_norm = self.delete_mask_fea_j[:, :, :12]
 
-        temp = np.where(self.delete_mask_fea_j, mean_fea_j[:, np.newaxis, :], self.fea_j)
+        mean_fea_j = np.sum(fea_to_norm, axis=1) / num_left_nodes
+
+        temp = np.where(delete_mask_to_norm, mean_fea_j[:, np.newaxis, :], fea_to_norm)
         var_fea_j = np.var(temp, axis=1)
 
         std_fea_j = np.sqrt(var_fea_j * self.max_number_of_ops / num_left_nodes)
 
-        self.fea_j = ((temp - mean_fea_j[:, np.newaxis, :]) / (std_fea_j[:, np.newaxis, :] + 1e-8))
+        fea_normalized = ((temp - mean_fea_j[:, np.newaxis, :]) / (std_fea_j[:, np.newaxis, :] + 1e-8))
+        
+        # Concatenate back
+        self.fea_j = np.concatenate((fea_normalized, fea_keep_raw), axis=2)
 
     def construct_mch_features(self):
 

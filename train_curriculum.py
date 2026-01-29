@@ -67,10 +67,10 @@ class Trainer:
         # [NEW] In-Distribution Validation Suite (Manually Defined Groups)
         # These 4 groups run throughout the entire training to monitor cross-size performance.
         self.indist_schedule = [
-            {"name": "G1", "n_j": 10, "k": 1.0, "num": 20},
-            {"name": "G2", "n_j": 10, "k": 1.2, "num": 20},
-            {"name": "G3", "n_j": 10, "k": 1.5, "num": 20},
-            {"name": "G4", "n_j": 20, "k": 1.2, "num": 20},
+            {"name": "G1", "n_j": 10, "k": 0.8, "num": 100},
+            {"name": "G2", "n_j": 10, "k": 1.2, "num": 100},
+            {"name": "G3", "n_j": 20, "k": 1.2, "num": 100},
+            {"name": "G4", "n_j": 20, "k": 2.4, "num": 100},
         ]
         
         self.vali_indist_batches = self.generate_indist_validation_data(self.indist_schedule)
@@ -198,8 +198,14 @@ class Trainer:
         k1 = [1.0] *100 
         k12 = [1.2] *100 
         k15 = [1.5] * 100 
-        k18 = [1.8] *100
+        k24 = [2.4] *100
         k20 = [2.0] *100
+        k166 = [1.66] *100
+        k147 = [1.47] *100
+        k170 = [1.7] * 100
+        k195 = [1.95] * 100
+        k209 = [2.09] *100
+        k224 = [2.24] *100
         if configs.schedule_type == 'deep_dive':
             curriculum_schedule = [
                 {"n_j": 10, "reset_step": 50, "k_dist": k15},
@@ -220,26 +226,51 @@ class Trainer:
                 {"n_j": 10, "reset_step": 50, "k_dist": k_dist_unified},
                 {"n_j": 20, "reset_step": 250, "k_dist": k_dist_unified}
             ]
-        elif configs.schedule_type == 'same1':
+        elif configs.schedule_type == 'same_10_5_12':
             cycle_len = 1000 # Custom cycle for same
             curriculum_schedule = [
-                {"n_j": 10, "reset_step": 50, "k_dist": k1},
+                {"n_j": 10, "reset_step": 100, "k_dist": k12},
             ]
-        elif configs.schedule_type == 'same2':
+        elif configs.schedule_type == 'same_15_5_166':
             cycle_len = 1000 # Custom cycle for same
             curriculum_schedule = [
-                {"n_j": 10, "reset_step": 50, "k_dist": k12},
+                {"n_j": 15, "reset_step": 100, "k_dist": k166},
             ]
-        elif configs.schedule_type == 'same3':
+        elif configs.schedule_type == 'same_15_5_147':
             cycle_len = 1000 # Custom cycle for same
             curriculum_schedule = [
-                {"n_j": 10, "reset_step": 50, "k_dist": k15},
+                {"n_j": 15, "reset_step": 100, "k_dist": k147},
             ]
-        elif configs.schedule_type == 'same4':
+        elif configs.schedule_type == 'same_20_5_12':
             cycle_len = 1000 # Custom cycle for same
             curriculum_schedule = [
-                {"n_j": 10, "reset_step": 50, "k_dist": k08},
-            ]        
+                {"n_j": 20, "reset_step": 100, "k_dist": k12},
+            ] 
+        elif configs.schedule_type == 'same_20_5_170':
+            cycle_len = 1000 # Custom cycle for same
+            curriculum_schedule = [
+                {"n_j": 20, "reset_step": 100, "k_dist": k170},
+            ]
+        elif configs.schedule_type == 'same_20_5_195':
+            cycle_len = 1000 # Custom cycle for same
+            curriculum_schedule = [
+                {"n_j": 20, "reset_step": 100, "k_dist": k195},
+            ]            
+        elif configs.schedule_type == 'same_20_5_209':
+            cycle_len = 1000 # Custom cycle for same
+            curriculum_schedule = [
+                {"n_j": 20, "reset_step": 100, "k_dist": k209},
+            ]     
+        elif configs.schedule_type == 'same_20_5_224':
+            cycle_len = 1000 # Custom cycle for same
+            curriculum_schedule = [
+                {"n_j": 20, "reset_step": 100, "k_dist": k224},
+            ] 
+        elif configs.schedule_type == 'same_20_5_24':
+            cycle_len = 1000 # Custom cycle for same
+            curriculum_schedule = [
+                {"n_j": 20, "reset_step": 100, "k_dist": k24},
+            ]                 
         else:
             # Default fallback
             curriculum_schedule = [{"n_j": 10, "reset_step": 50, "k_dist": k_dist_unified}]
@@ -271,8 +302,13 @@ class Trainer:
             # 2. Check for Environment Reset (Modulo Logic)
             if i_update % current_reset_step == 0:
                 dataset_job_length, dataset_op_pt, dataset_due_date = self.sample_training_instances(i_update, current_k_dist)
+                
+                # [ADDED] Reconstruct the k-values used for this batch to pass to environment
+                k_list_used = [current_k_dist[i] if i < len(current_k_dist) else 1.2 for i in range(self.num_envs)]
+                
                 self.env = FJSPEnvForVariousOpNums(n_j=configs.n_j, n_m=configs.n_m)
-                state = self.env.set_initial_data(dataset_job_length, dataset_op_pt, dataset_due_date, true_due_date_list=dataset_due_date)
+                state = self.env.set_initial_data(dataset_job_length, dataset_op_pt, dataset_due_date, 
+                                                  true_due_date_list=dataset_due_date, tightness=k_list_used)
             else:
                 state = self.env.reset()
 
@@ -414,9 +450,13 @@ class Trainer:
         file_writing_obj2 = open(f'./train_log/{self.data_source}/' + 'valitardiness_' + log_model_name + '.txt', 'w')
         file_writing_obj2.write(str(self.validation_tardiness_log))
         
-        # [ADDED] Save In-Dist logs for each group
+        # [ADDED] Save In-Dist logs for each group with full metadata in filename
         for name, logs in self.vali_indist_logs.items():
-            f_path = f'./train_log/{self.data_source}/vali_indist_{name}_{log_model_name}.txt'
+            # Find original group info
+            g = next(x for x in self.indist_schedule if x['name'] == name)
+            # Format metadata tag
+            meta_tag = f"{name}_nj{g['n_j']}_k{g['k']}_num{g['num']}"
+            f_path = f'./train_log/{self.data_source}/vali_indist_{meta_tag}_{log_model_name}.txt'
             with open(f_path, 'w') as f:
                 f.write(str(logs))
 

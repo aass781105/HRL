@@ -123,25 +123,27 @@ def plot_reward_components(detailed_path: Path, output_path: Path, core_name: st
 
 def plot_indist_validation(log_dir: Path, output_path: Path, log_file_suffix: str, core_name: str):
     """
-    Scans for vali_indist_G*_{suffix}.txt files.
+    Scans for vali_indist_*_{suffix}.txt files.
     Plots one subplot per group: Solid Obj line, translucent MK and TD lines in the same plot.
     """
     # 1. Scan for files
-    files = list(log_dir.glob(f"vali_indist_G*_{log_file_suffix}.txt"))
+    files = list(log_dir.glob(f"vali_indist_*_{log_file_suffix}.txt"))
     if not files:
         print("No in-distribution validation logs found.")
         return
 
     # Extract group names and sort
-    name_to_file = {}
+    name_to_info = {}
     for f in files:
-        # Match "vali_indist_G1_..."
-        match = re.search(r"vali_indist_(G\d+)_", f.name)
+        # Match "vali_indist_G1_nj10_k1.2_num20_..."
+        match = re.search(r"vali_indist_(G\d+)_nj(\d+)_k([\d.]+)_num(\d+)_", f.name)
         if match:
-            name_to_file[match.group(1)] = f
+            g_name, nj, k, num = match.groups()
+            title_str = f'{{"name": "{g_name}", "n_j": {nj}, "k": {k}, "num": {num}}}'
+            name_to_info[g_name] = (f, title_str)
     
     # Sort by group number (G1, G2...)
-    sorted_names = sorted(name_to_file.keys(), key=lambda x: int(x[1:]))
+    sorted_names = sorted(name_to_info.keys(), key=lambda x: int(x[1:]))
     n_subplots = len(sorted_names)
     
     # 2. Setup Figure Grid
@@ -155,7 +157,7 @@ def plot_indist_validation(log_dir: Path, output_path: Path, log_file_suffix: st
     # 3. Plot each group
     for i, name in enumerate(sorted_names):
         ax = axes_flat[i]
-        f_path = name_to_file[name]
+        f_path, title_str = name_to_info[name]
         text = f_path.read_text(encoding="utf-8")
         try:
             data = ast.literal_eval(text)
@@ -169,31 +171,27 @@ def plot_indist_validation(log_dir: Path, output_path: Path, log_file_suffix: st
         td_vals = np.array([x[1] for x in data])
         obj_vals = 0.5 * mk_vals + 0.5 * td_vals
         
-        # Correctly map steps (assuming validate_timestep=10 from params default, or read from config if possible)
-        # Here we just use index * 10
         steps = np.arange(len(obj_vals)) * 10
         
-        # Plot translucent components
         ax.plot(steps, mk_vals, color='green', alpha=0.3, label='Raw Makespan')
         ax.plot(steps, td_vals, color='red', alpha=0.3, label='Raw Tardiness')
-        
-        # Plot solid objective
         ax.plot(steps, obj_vals, color='black', linewidth=2, label='Objective (0.5/0.5)')
         
-        ax.set_title(f"Validation Group: {name}")
+        ax.set_title(title_str, fontsize=10) # Set title as dictionary string
         ax.set_ylabel("Absolute Time / Score")
         ax.set_xlabel("Update Step")
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.2)
 
-    # Hide unused axes
+    # 4. Cleanup and Save
+    # Hide unused subplots
     for j in range(i + 1, len(axes_flat)):
         axes_flat[j].axis('off')
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.96])
-    fig.savefig(output_path, dpi=200)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fig.savefig(output_path, dpi=150)
     plt.close(fig)
-    print(f"✅ In-Dist 驗證趨勢圖已輸出：{output_path}")
+    print(f"✅ In-Distribution 驗證分析圖已輸出：{output_path}")
 
 def main():
     # 1. Construct dynamic log name
