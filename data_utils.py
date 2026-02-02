@@ -15,11 +15,12 @@ import numpy as np
 
 
 # [CHANGED] 支援注入 rng，移除對全域 np.random 的依賴
-def SD2_instance_generator(config, seed=None, rng=None):
+def SD2_instance_generator(config, seed=None, rng=None, mode='uniform'):
     """
     :param config: 超參數
     :param seed:   整數種子碼（可選）
     :param rng:    numpy.random.Generator 物件（可選）。未提供則根據 seed 建立。
+    :param mode:   生成模式 'uniform' (預設) 或 'realistic' (仿 vdata)
     :return:
         job_length : 每個 job 的工序數 (shape [J])
         op_pt      : 處理時間矩陣 (shape [N, M])；不相容機台為 0
@@ -38,41 +39,84 @@ def SD2_instance_generator(config, seed=None, rng=None):
 
     low  = int(config.low)
     high = int(config.high)
-    data_suffix = getattr(config, "data_suffix", "mix")
-
-    # 相容機台數範圍
-    op_per_mch_min = 1
-    if data_suffix == "nf":
-        op_per_mch_max = 1
-    elif data_suffix == "mix":
-        op_per_mch_max = n_m
-    else:
-        op_per_mch_min = int(config.op_per_mch_min)
-        op_per_mch_max = int(config.op_per_mch_max)
-
-    if op_per_mch_min < 1 or op_per_mch_max > n_m:
-        print(f'Error from Instance Generation: [{op_per_mch_min},{op_per_mch_max}] with num_mch: {n_m}')
-        sys.exit(1)
-
     n_op = int(n_j * op_per_job)
     job_length = np.full(shape=(n_j,), fill_value=op_per_job, dtype=int)
+    
+    if mode == 'realistic':
+        # --- Realistic Generation (Mimic vdata) ---
+        # 1. Flexibility Distribution (Mixed: Dedicated, Partial, Flexible)
+        # Dedicated (1 mch): 20%, Partial (2~M/2): 50%, Flexible (M/2~M): 30%
+        op_use_mch = np.zeros(n_op, dtype=int)
+        
+        for i in range(n_op):
+            r = rng.random()
+            if r < 0.2: # Dedicated (Tight Bottleneck)
+                op_use_mch[i] = 1
+            elif r < 0.7: # Partial (Standard)
+                upper = max(2, int(n_m / 2))
+                if upper < 2: upper = 2 
+                op_use_mch[i] = rng.integers(2, upper + 1) if n_m >= 2 else 1
+            else: # Flexible (Easy)
+                lower = int(n_m / 2)
+                if lower < 1: lower = 1
+                op_use_mch[i] = rng.integers(lower, n_m + 1)
 
-    # [CHANGED] 用 rng.integers（上界不含，所以 +1）
-    op_use_mch = rng.integers(low=op_per_mch_min, high=op_per_mch_max + 1, size=n_op)
+        # 2. Processing Time Distribution (Two-Stage: Op-Base -> Machine-Specific)
+        # Using ONLY config.low and config.high for bounds
+        base_pt = rng.uniform(low, high, size=n_op)
+        
+        # Initialize PT matrix
+        op_pt = np.zeros((n_op, n_m), dtype=int)
+        
+        for i in range(n_op):
+            compat_mchs = rng.choice(np.arange(n_m), size=op_use_mch[i], replace=False)
+            
+            # Sigma = 10% ~ 20% of base_pt
+            sigma = base_pt[i] * rng.uniform(0.1, 0.2)
+            
+            for m_idx in compat_mchs:
+                raw_pt = rng.normal(base_pt[i], sigma)
+                # Clip value within [low, high]
+                final_pt = int(max(low, min(high, round(raw_pt))))
+                op_pt[i, m_idx] = final_pt
 
-    op_per_mch = float(np.mean(op_use_mch))
+        op_per_mch = float(np.mean(op_use_mch))
+        return job_length, op_pt, op_per_mch
 
-    # [CHANGED] 用 rng.integers 產生處理時間（high+1 使其含上界）
-    op_pt = rng.integers(low=low, high=high + 1, size=(n_op, n_m))
+    else:
+        # --- Original Uniform Generation ---
+        data_suffix = getattr(config, "data_suffix", "mix")
 
-    # 將不相容機台設為 0
-    for row in range(op_pt.shape[0]):
-        mch_num = int(op_use_mch[row])
-        if mch_num < n_m:
-            inf_pos = rng.choice(np.arange(0, n_m), n_m - mch_num, replace=False)
-            op_pt[row][inf_pos] = 0
+        # 相容機台數範圍
+        op_per_mch_min = 1
+        if data_suffix == "nf":
+            op_per_mch_max = 1
+        elif data_suffix == "mix":
+            op_per_mch_max = n_m
+        else:
+            op_per_mch_min = int(config.op_per_mch_min)
+            op_per_mch_max = int(config.op_per_mch_max)
 
-    return job_length, op_pt, op_per_mch
+        if op_per_mch_min < 1 or op_per_mch_max > n_m:
+            print(f'Error from Instance Generation: [{op_per_mch_min},{op_per_mch_max}] with num_mch: {n_m}')
+            sys.exit(1)
+
+        # [CHANGED] 用 rng.integers（上界不含，所以 +1）
+        op_use_mch = rng.integers(low=op_per_mch_min, high=op_per_mch_max + 1, size=n_op)
+
+        op_per_mch = float(np.mean(op_use_mch))
+
+        # [CHANGED] 用 rng.integers 產生處理時間（high+1 使其含上界）
+        op_pt = rng.integers(low=low, high=high + 1, size=(n_op, n_m))
+
+        # 將不相容機台設為 0
+        for row in range(op_pt.shape[0]):
+            mch_num = int(op_use_mch[row])
+            if mch_num < n_m:
+                inf_pos = rng.choice(np.arange(0, n_m), n_m - mch_num, replace=False)
+                op_pt[row][inf_pos] = 0
+
+        return job_length, op_pt, op_per_mch
 
 
 def matrix_to_text(job_length, op_pt, op_per_mch):

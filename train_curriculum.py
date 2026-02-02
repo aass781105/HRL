@@ -67,10 +67,10 @@ class Trainer:
         # [NEW] In-Distribution Validation Suite (Manually Defined Groups)
         # These 4 groups run throughout the entire training to monitor cross-size performance.
         self.indist_schedule = [
-            {"name": "G1", "n_j": 10, "k": 0.8, "num": 100},
+            # {"name": "G1", "n_j": 10, "k": 0.8, "num": 100},
             {"name": "G2", "n_j": 10, "k": 1.2, "num": 100},
             {"name": "G3", "n_j": 20, "k": 1.2, "num": 100},
-            {"name": "G4", "n_j": 20, "k": 2.4, "num": 100},
+            # {"name": "G4", "n_j": 20, "k": 2.4, "num": 100},
         ]
         
         self.vali_indist_batches = self.generate_indist_validation_data(self.indist_schedule)
@@ -190,10 +190,16 @@ class Trainer:
         cycle_len = configs.curriculum_cycle
         
         # Difficulty Distributions (Unified for all stages)
-        # 20x1.0 (Very Tight), 50x1.2 (Tight), 30x1.5 (Moderate) = 100 total
-        # k_dist_unified = [1.0]*20 + [1.2]*50 + [1.5]*30
-        k_dist_unified = [1.2]*20 + [1.5]*60 + [1.8]*20
-        k_dist_unified2 = [0.9]*20 + [1.2]* 60 + [1.5]* 20
+        # 20x1.0 (Very Tight), 60x1.2 (Tight), 20x1.5 (Moderate) = 100 total
+        k_s1 = [1]*20 + [1.2]*60 + [1.5]*20
+        k_s2 = [0.6] * 20 + [0.8] *20 + [1.0] *20 + [1.2] * 20 + [1.5] * 20
+        # [NEW] Helper function for automatic k scaling
+        def scale_k_distribution(base_dist, base_n, target_n, power):
+            ratio = (target_n / base_n) ** power
+            return [round(k * ratio, 2) for k in base_dist]
+
+        # Automatic generation for s2 (power=0.5) and s3 (power=0.8) with Dual Loop & Dynamic Duration
+        
         k08 = [0.8] * 100
         k1 = [1.0] *100 
         k12 = [1.2] *100 
@@ -206,98 +212,141 @@ class Trainer:
         k195 = [1.95] * 100
         k209 = [2.09] *100
         k224 = [2.24] *100
-        if configs.schedule_type == 'deep_dive':
-            curriculum_schedule = [
-                {"n_j": 10, "reset_step": 50, "k_dist": k15},
-                {"n_j": 10, "reset_step": 50, "k_dist": k12},
-                {"n_j": 10, "reset_step": 50, "k_dist": k1},
-                {"n_j": 10, "reset_step": 50, "k_dist": k08},
-            ]
-        elif configs.schedule_type == 'standard':
-            curriculum_schedule = [
-                {"n_j": 10, "reset_step": 50, "k_dist": k12},
-                {"n_j": 15, "reset_step": 125, "k_dist": k15},
-                {"n_j": 20, "reset_step": 250, "k_dist": k20},
-                {"n_j": 20, "reset_step": 250, "k_dist": k20}
-            ]
-        elif configs.schedule_type == 'alt':
-            cycle_len = 500 # Custom cycle for alt
-            curriculum_schedule = [
-                {"n_j": 10, "reset_step": 50, "k_dist": k_dist_unified},
-                {"n_j": 20, "reset_step": 250, "k_dist": k_dist_unified}
-            ]
-        elif configs.schedule_type == 'same_10_5_12':
-            cycle_len = 1000 # Custom cycle for same
-            curriculum_schedule = [
-                {"n_j": 10, "reset_step": 100, "k_dist": k12},
-            ]
-        elif configs.schedule_type == 'same_15_5_166':
-            cycle_len = 1000 # Custom cycle for same
-            curriculum_schedule = [
-                {"n_j": 15, "reset_step": 100, "k_dist": k166},
-            ]
-        elif configs.schedule_type == 'same_15_5_147':
-            cycle_len = 1000 # Custom cycle for same
-            curriculum_schedule = [
-                {"n_j": 15, "reset_step": 100, "k_dist": k147},
-            ]
-        elif configs.schedule_type == 'same_20_5_12':
-            cycle_len = 1000 # Custom cycle for same
-            curriculum_schedule = [
-                {"n_j": 20, "reset_step": 100, "k_dist": k12},
-            ] 
-        elif configs.schedule_type == 'same_20_5_170':
-            cycle_len = 1000 # Custom cycle for same
-            curriculum_schedule = [
-                {"n_j": 20, "reset_step": 100, "k_dist": k170},
-            ]
-        elif configs.schedule_type == 'same_20_5_195':
-            cycle_len = 1000 # Custom cycle for same
-            curriculum_schedule = [
-                {"n_j": 20, "reset_step": 100, "k_dist": k195},
-            ]            
-        elif configs.schedule_type == 'same_20_5_209':
-            cycle_len = 1000 # Custom cycle for same
-            curriculum_schedule = [
-                {"n_j": 20, "reset_step": 100, "k_dist": k209},
-            ]     
-        elif configs.schedule_type == 'same_20_5_224':
-            cycle_len = 1000 # Custom cycle for same
-            curriculum_schedule = [
-                {"n_j": 20, "reset_step": 100, "k_dist": k224},
-            ] 
-        elif configs.schedule_type == 'same_20_5_24':
-            cycle_len = 1000 # Custom cycle for same
-            curriculum_schedule = [
-                {"n_j": 20, "reset_step": 100, "k_dist": k24},
-            ]                 
-        else:
-            # Default fallback
-            curriculum_schedule = [{"n_j": 10, "reset_step": 50, "k_dist": k_dist_unified}]
         
+        # [NEW] Helper for Dual Loop Schedule Generation with Hybrid Mixing
+        def generate_dual_loop_schedule(job_sizes, k_mix_stages, power, duration_multiplier=3):
+            """
+            job_sizes: list of n_j (e.g., [10, 15, 20])
+            k_mix_stages: list of dicts specifying mix, e.g. [{"name": "EasyStart", "mix": {1.5: 0.5, 1.2: 0.5}}]
+            power: scaling exponent
+            duration_multiplier: how many reset_steps per sub-stage
+            """
+            schedule = []
+            for n_j in job_sizes:
+                # Dynamic Reset Step: Scales with job size (10->50, 20->100)
+                reset_step = int(50 * (n_j / 10))
+                # Dynamic Duration based on multiplier
+                duration = reset_step * duration_multiplier
+                
+                for stage_cfg in k_mix_stages:
+                    mix_def = stage_cfg["mix"]
+                    
+                    # Construct the final 100-element distribution list
+                    current_k_dist = []
+                    for base_k, weight in mix_def.items():
+                        # Scale the base k
+                        scaled_k = round(base_k * ((n_j / 10) ** power), 2)
+                        # Add to list based on weight (assuming weight * 100 is int)
+                        count = int(weight * 100)
+                        current_k_dist.extend([scaled_k] * count)
+                    
+                    # Ensure it's exactly 100 (handle rounding)
+                    if len(current_k_dist) < 100:
+                        current_k_dist.extend([current_k_dist[-1]] * (100 - len(current_k_dist)))
+                    
+                    schedule.append({
+                        "n_j": n_j,
+                        "reset_step": reset_step,
+                        "duration": duration,
+                        "k_dist": current_k_dist,
+                        "stage_label": stage_cfg.get("name", "unnamed")
+                    })
+            return schedule
+
+        # --- Define your Due Date Stages here ---
+        # Proportions must sum to 1.0
+        my_k_mix_stages2 = [
+            # {"name": "StartMixed", "mix": {1.5: 0.5, 1.2: 0.5}}, # 50% Easy, 50% Medium
+            {"name": "MidHard",    "mix": {1.5: 0.2, 1.2: 0.6, 1.0: 0.2}}, # 20% Easy, 60% Medium, 20% Hard
+            {"name": "FocusHard",  "mix": {1.2: 0.3, 1.0: 0.5, 0.8: 0.2}}  # 30% Medium, 70% Hard
+        ]
+        my_k_mix_stages3 = [
+            {"name": "StartMixed", "mix": {1.5: 0.5, 1.2: 0.5}}, # 50% Easy, 50% Medium
+            {"name": "MidHard",    "mix": {1.5: 0.2, 1.2: 0.6, 1.0: 0.2}}, # 20% Easy, 60% Medium, 20% Hard
+            {"name": "FocusHard",  "mix": {1.2: 0.3, 1.0: 0.5, 0.8: 0.2}}  # 30% Medium, 70% Hard
+        ]
+    
+        my_k_mix_stages4 = [
+            {"name": "MidHard",    "mix": {1.5: 0.2, 1.2: 0.6, 1.0: 0.2}}, # 20% Easy, 60% Medium, 20% Hard
+            {"name": "FocusHard",  "mix": {1.2: 0.3, 1.0: 0.5, 0.8: 0.2}},  # 30% Medium, 70% Hard
+            {"name": "FocusHard",  "mix": {1.0: 0.3, 0.8: 0.5, 0.6: 0.2}}  # 30% Medium, 70% Hard
+        ]
+
+        if configs.schedule_type == 's1':
+            # Classic s1 (Fixed duration based on cycle_len)
+            cycle = configs.curriculum_cycle
+            curriculum_schedule = [
+                {"n_j": 10, "reset_step": 50, "duration": cycle, "k_dist": k_s1},
+                {"n_j": 15, "reset_step": 125, "duration": cycle, "k_dist": k_s1},
+                {"n_j": 20, "reset_step": 125, "duration": cycle, "k_dist": k_s1},
+                {"n_j": 25, "reset_step": 250, "duration": cycle, "k_dist": k_s1},
+            ]
+        elif configs.schedule_type == 's2_2':
+            # Advanced Hybrid Mode: Job [10,15,20,25] x K-Mix (Decaying)
+            # Power 0.5 (Sqrt)
+            job_sizes = [10, 15, 20]
+            curriculum_schedule = generate_dual_loop_schedule(job_sizes, my_k_mix_stages2, power=0.5, duration_multiplier=2)
+            
+        elif configs.schedule_type == 's2_3':
+            # Power 0.8
+            job_sizes = [10, 15, 20]
+            curriculum_schedule = generate_dual_loop_schedule(job_sizes, my_k_mix_stages3, power=0.5, duration_multiplier=3)
+
+        elif configs.schedule_type == 's2_4':
+            # Power 0.8
+            job_sizes = [10, 15, 20]
+            curriculum_schedule = generate_dual_loop_schedule(job_sizes, my_k_mix_stages4, power=0.5, duration_multiplier=3)
+
+        elif configs.schedule_type.startswith('same'):
+            # Legacy single stage mode
+            # Extract params if possible or fallback to specific logic
+            cycle = 1000
+            if configs.schedule_type == 'same_10_5_12':
+                 curriculum_schedule = [{"n_j": 10, "reset_step": 100, "duration": cycle, "k_dist": k12}]
+            else:
+                 # Default fallback for same_*
+                 curriculum_schedule = [{"n_j": 10, "reset_step": 50, "duration": cycle, "k_dist": k12}]
+        else:
+            # Fallback
+            curriculum_schedule = [{"n_j": 10, "reset_step": 50, "duration": 250, "k_dist": k12}]
+        
+        # [NEW] Auto-calculate Max Updates
+        total_duration = sum(stage['duration'] for stage in curriculum_schedule)
+        self.max_updates = total_duration
+        tqdm.write(f"Auto-configured Max Updates: {self.max_updates} based on schedule duration.")
+
         # Initialize
         current_stage_idx = 0
         current_cfg = curriculum_schedule[0]
         configs.n_j = current_cfg["n_j"]
         current_reset_step = current_cfg["reset_step"]
         current_k_dist = current_cfg["k_dist"]
+        current_stage_end_step = current_cfg["duration"] # Cumulative step when this stage ends
+        current_stage_duration = current_cfg["duration"] # Duration of current stage for LR calculation
+        stage_start_step = 0 # When did this stage start
         
+        import math # Ensure math is available
         tqdm.write(f"Starting curriculum training ({configs.schedule_type}) with {configs.n_j} jobs. Reset every {current_reset_step} steps.")
         self.env = FJSPEnvForVariousOpNums(n_j=configs.n_j, n_m=configs.n_m)
 
         for i_update in tqdm(range(self.max_updates), file=sys.stdout, desc="progress", colour='blue'):
             ep_st = time.time()
 
-            # 1. Check for Curriculum Stage Update
-            new_stage_idx = i_update // cycle_len
-            if new_stage_idx != current_stage_idx and new_stage_idx < len(curriculum_schedule):
-                current_stage_idx = new_stage_idx
+            # 1. Check for Curriculum Stage Update (Dynamic Duration Logic)
+            if i_update >= current_stage_end_step and current_stage_idx < len(curriculum_schedule) - 1:
+                current_stage_idx += 1
                 current_cfg = curriculum_schedule[current_stage_idx]
+                
                 configs.n_j = current_cfg["n_j"]
                 current_reset_step = current_cfg["reset_step"]
                 current_k_dist = current_cfg["k_dist"]
                 
-                tqdm.write(f"\nCURRICULUM UPDATE: Stage {current_stage_idx+1}. Job Size={configs.n_j}, Reset Rate={current_reset_step}")
+                # Update timing markers
+                stage_start_step = current_stage_end_step
+                current_stage_duration = current_cfg["duration"]
+                current_stage_end_step += current_stage_duration
+                
+                tqdm.write(f"\nCURRICULUM UPDATE: Stage {current_stage_idx+1}. Job Size={configs.n_j}, K~{current_k_dist[0]:.2f}, Reset={current_reset_step}, Duration={current_stage_duration}")
 
             # 2. Check for Environment Reset (Modulo Logic)
             if i_update % current_reset_step == 0:
@@ -312,15 +361,31 @@ class Trainer:
             else:
                 state = self.env.reset()
 
-            # --- Entropy Decay Logic ---
-            ent_start = 0.05
-            ent_end = configs.entloss_coef # Defaults to 0.01
-            # Linear decay from ent_start to ent_end over max_updates
-            decay_ratio = i_update / max(1, self.max_updates - 1)
-            current_ent_coef = ent_start - (ent_start - ent_end) * decay_ratio
-            current_ent_coef = max(ent_end, current_ent_coef) 
+            # --- [NEW] Sawtooth Learning Rate Scheduler (Adapted for Dynamic Duration) ---
+            # Global Trend: Peak LR decays by 0.95 every stage
+            peak_lr = configs.lr * (0.95 ** current_stage_idx)
             
-            self.ppo.entloss_coef = current_ent_coef
+            # Intra-Cycle: Cosine Annealing (1.0 -> 0.1) based on stage progress
+            # Calculate progress within current stage (0.0 -> 1.0)
+            steps_in_stage = i_update - stage_start_step
+            # Avoid division by zero if duration is 0 (unlikely)
+            cycle_progress = min(1.0, steps_in_stage / max(1, current_stage_duration))
+            
+            cosine_decay = 0.5 * (1 + math.cos(math.pi * cycle_progress)) # 1.0 -> 0.0
+            # Remap to 1.0 -> 0.1 range
+            current_decay = 0.1 + 0.9 * cosine_decay
+            
+            # Final LR calculation with floor clamp
+            current_lr = peak_lr * current_decay
+            current_lr = max(current_lr, 5e-5) # Global minimum floor
+            
+            # Update Optimizer
+            for param_group in self.ppo.optimizer.param_groups:
+                param_group['lr'] = current_lr
+                
+            # --- [NEW] Fixed Small Entropy Coefficient ---
+            # Set to a value provided by configs (default 0.01) for easier adjustment
+            self.ppo.entloss_coef = configs.entloss_coef
             # ----------------------------------------------------------------
             
             # [FIXED] Initialize rewards to zero to maximize signal-to-noise ratio
@@ -507,11 +572,20 @@ class Trainer:
         if k_list is None:
             k_list = [1.2] * self.num_envs
         
+        # [NEW] Data Augmentation Strategy
+        # 50% Uniform (Base stability)
+        # 50% Realistic (Vdata-like: Mixed flexibility + Op-dependent PT)
+        generation_modes = ['uniform'] * 50 + ['realistic'] * 50
+        
         for i in range(self.num_envs):
             # Deterministic seed for each instance in each update
             instance_seed = self.config.seed_train + i_update * self.num_envs + i
             
-            JobLength, OpPT, _ = SD2_instance_generator(config=self.config, seed=instance_seed)
+            # Randomly select a generation mode for this specific instance
+            # Use deterministic choice based on seed to ensure reproducibility if needed
+            mode = generation_modes[instance_seed % 100]
+            
+            JobLength, OpPT, _ = SD2_instance_generator(config=self.config, seed=instance_seed, mode=mode)
             
             # Use the specific k-value for all jobs in this instance
             k_val = k_list[i] if i < len(k_list) else 1.2

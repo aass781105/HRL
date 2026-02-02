@@ -1,0 +1,7 @@
+# Curriculum PPO Configuration: Deep Dive (Alpha 1.5)
+eval_model_name: "s1_a9"
+curriculum_cycle: 250
+schedule_type: "s1"
+tardiness_alpha: 9
+seed_train: 2
+max_updates: 1000

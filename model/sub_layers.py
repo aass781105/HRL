@@ -3,46 +3,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class MLP(nn.Module):
-    def __init__(self, num_layers, input_dim, hidden_dim, output_dim):
+    def __init__(self, input_dim, hidden_dims):
         """
-            the implementation of multi layer perceptrons (refer to L2D)
-        :param num_layers: number of layers in the neural networks (EXCLUDING the input layer).
-                            If num_layers=1, this reduces to linear model.
-        :param input_dim: dimensionality of input features
-        :param hidden_dim: dimensionality of hidden units at ALL layers
-        :param output_dim:  number of classes for prediction
+        Flexible MLP that constructs layers based on a list of dimensions.
+        :param input_dim: int, dimensionality of input features
+        :param hidden_dims: list of int, dimensions of hidden layers and output layer.
+                            e.g., [128, 64] means Input -> 128 -> 64.
         """
-
         super(MLP, self).__init__()
-
-        self.linear_or_not = True  # default is linear model
-        self.num_layers = num_layers
-
-        if num_layers < 1:
-            raise ValueError("number of layers should be positive!")
-        elif num_layers == 1:
-            # Linear model
-            self.linear = nn.Linear(input_dim, output_dim)
-        else:
-            # Multi-layer model
-            self.linear_or_not = False
-            self.linears = torch.nn.ModuleList()
-
-            self.linears.append(nn.Linear(input_dim, hidden_dim))
-            for layer in range(num_layers - 2):
-                self.linears.append(nn.Linear(hidden_dim, hidden_dim))
-            self.linears.append(nn.Linear(hidden_dim, output_dim))
+        self.layers = nn.ModuleList()
+        
+        current_dim = input_dim
+        for h_dim in hidden_dims:
+            self.layers.append(nn.Linear(current_dim, h_dim))
+            current_dim = h_dim
 
     def forward(self, x):
-        if self.linear_or_not:
-            # If linear model
-            return self.linear(x)
-        else:
-            # If MLP
-            h = x
-            for layer in range(self.num_layers - 1):
-                h = F.relu(self.linears[layer](h))
-            return self.linears[self.num_layers - 1](h)
+        h = x
+        for i, layer in enumerate(self.layers):
+            h = layer(h)
+            if i < len(self.layers) - 1:
+                # Apply ReLU to all layers except the last one
+                h = F.relu(h)
+        return h
 
 
 class Actor(nn.Module):

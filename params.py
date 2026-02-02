@@ -73,9 +73,7 @@ parser.add_argument('--data_type', type=str, default="test", help='Generated dat
 parser.add_argument('--fea_j_input_dim', type=int, default=14, help='Dimension of operation raw feature vectors')
 parser.add_argument('--fea_m_input_dim', type=int, default=8, help='Dimension of machine raw feature vectors')
 parser.add_argument('--dropout_prob', type=float, default=0.0, help='Dropout rate (1 - keep probability).')
-parser.add_argument('--num_heads_OAB', nargs='+', type=int, default=[4, 4], help='Number of attention head of operation message attention block')
-parser.add_argument('--num_heads_MAB', nargs='+', type=int, default=[4, 4], help='Number of attention head of machine message attention block')
-parser.add_argument('--layer_fea_output_dim', nargs='+', type=int, default=[32, 8], help='Output dimension of the DAN layers')
+parser.add_argument('--layer_fea_output_dim', nargs='+', type=int, default=[8, 8, 8], help='List of output dimensions for each layer of the Feature Encoder (e.g., [8, 8, 8] matches legacy effective width)')
 
 # Actor-Critic Details
 parser.add_argument('--num_mlp_layers_actor', type=int, default=3, help='Number of layers in Actor network')

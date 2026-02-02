@@ -12,13 +12,10 @@ class DualAttentionNetwork(nn.Module):
         """
         MLP 版 DAN：不使用 GNN/注意力，只用 MLP 對 fea_j / fea_m 做逐節點編碼，並輸出全域聚合特徵。
         需要的 config 欄位：
-          - fea_j_input_dim: int   (例如 8)
-          - fea_m_input_dim: int   (例如 6)
-          - layer_fea_output_dim: List[int]，取最後一個當輸出維度（例如 [64, 64, 64] → out_dim=64）
+          - fea_j_input_dim: int   (例如 14)
+          - fea_m_input_dim: int   (例如 8)
+          - layer_fea_output_dim: List[int]，定義每一層的輸出維度（例如 [128, 128, 64]）
           - dropout_prob: float    (可選，用於輸出後 dropout)
-          - mlp_hidden_dim: int    (新增加，MLP 的隱藏層寬度；若未提供，就用 output_dim)
-          - j_mlp_layers: int      (可選，工序特徵 MLP 的層數；預設 3)
-          - m_mlp_layers: int      (可選，機台特徵 MLP 的層數；預設 3)
         """
         super(DualAttentionNetwork, self).__init__()
 
@@ -27,27 +24,23 @@ class DualAttentionNetwork(nn.Module):
         self.fea_m_input_dim = config.fea_m_input_dim
         self.dropout_prob = getattr(config, "dropout_prob", 0.0)
 
-        # 取原本列表的最後一個作為輸出維度，保持與舊版一致
-        assert len(config.layer_fea_output_dim) >= 1
-        self.output_dim = int(config.layer_fea_output_dim[-1])
-
-        # 新增/預設的 MLP 超參
-        self.j_mlp_layers = int(getattr(config, "j_mlp_layers", 3))
-        self.m_mlp_layers = int(getattr(config, "m_mlp_layers", 3))
-        self.mlp_hidden_dim = int(getattr(config, "mlp_hidden_dim", self.output_dim))
+        # 讀取特徵提取層的維度列表 (例如 [128, 64])
+        # 這列表現在完整定義了 MLP 的每一層輸出
+        self.layer_dims = config.layer_fea_output_dim
+        assert len(self.layer_dims) >= 1, "layer_fea_output_dim must have at least one element"
+        
+        # 最終輸出維度取列表最後一個值
+        self.output_dim = int(self.layer_dims[-1])
 
         # --- 建兩個 MLP：各自給 job/operation 與 machine 特徵 ---
+        # 使用新的 flexible MLP，直接傳入維度列表
         self.j_encoder = MLP(
-            num_layers=self.j_mlp_layers,
             input_dim=self.fea_j_input_dim,
-            hidden_dim=self.mlp_hidden_dim,
-            output_dim=self.output_dim
+            hidden_dims=self.layer_dims
         )
         self.m_encoder = MLP(
-            num_layers=self.m_mlp_layers,
             input_dim=self.fea_m_input_dim,
-            hidden_dim=self.mlp_hidden_dim,
-            output_dim=self.output_dim
+            hidden_dims=self.layer_dims
         )
 
         # 輕量正規化與 Dropout（可有可無）

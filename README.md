@@ -2,6 +2,19 @@
 
 This repository is the official implementation of the paper “[Flexible Job Shop Scheduling via Dual Attention Network Based Reinforcement Learning](https://doi.org/10.1109/TNNLS.2023.3306421)”. *IEEE Transactions on Neural Networks and Learning Systems*, 2023.
 
+## Latest Improvements (2026-01-28)
+
+### 1. Tardiness Reward Normalization
+The `base_scale` used for normalizing Tardiness reward in `FJSPEnvForVariousOpNums.py` has been updated:
+- **Old**: Dynamic based on current makespan and tightness `k`.
+- **New**: `base_scale = mean_op_pt * number_of_jobs`.
+- **Reason**: Provides a stable, objective reference scale that only depends on the problem size, preventing reward fluctuations during training and avoiding division-by-zero or negative scales in small-scale instances.
+
+### 2. Feature Normalization (State Representation)
+In `norm_operation_features`, the normalization strategy has been refined:
+- **Changes**: The **Critical Ratio (CR)** and **Is Tardy (0/1)** features are now **excluded** from Z-score normalization.
+- **Reason**: Preserves the absolute physical meaning of these features. `Is Tardy` remains a strict 0/1 boundary signal, and `CR` remains a raw urgency ratio, allowing the model to distinguish between absolute "Easy" and "Hard" environment settings (which Z-score normalization would otherwise obscure by centering everything around zero).
+
 ## Quick Start
 
 ### requirements

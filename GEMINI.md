@@ -22,48 +22,65 @@
 -   `model/PPO.py`: PPO 演算法實作，包含 Actor-Critic 網絡。
 -   `model/sub_layers.py`: DAN (Dynamic Attention Network) 的注意力機制層。
 -   `model/ddqn_model.py`: Gate Policy 的 DDQN 網絡。
+-   **MLP Encoder**: 當前架構使用純 MLP 作為 Encoder (14 -> 128 -> 128 -> 64)。
 
 ### Training & Execution (訓練與執行)
 -   **`train_curriculum.py` (主要訓練)**: 實作課程學習 (Curriculum Learning)，動態調整工單數量 ($N_j$) 與交期緊湊度 ($k$)。
+    -   **資料增強 (Data Augmentation)**: 為了提升泛化能力 (對抗 Hurink vdata 等)，採樣時現在採用混合模式：
+        -   **50% Uniform**: 傳統均勻分佈 ($U(1, 20)$ PT, 隨機靈活度)。
+        -   **50% Realistic**: 仿 `vdata` 分佈。
+            -   **PT**: 雙層生成 ($\mu_{op}$ 隨工序變動，$\sigma_{mch}$ 隨機台波動)。
+            -   **Flexibility**: 混合靈活度 (20% 專用機, 50% 部分靈活, 30% 高靈活)。
 -   `train_ddqn.py`: 訓練 DDQN Gate Policy。
 -   `main.py`: 整合測試與推論入口。
 
 ### Utilities (工具)
 -   `params.py`: 全域參數配置 (使用 `argparse`)。
--   `data_utils.py`: SD2 / BenchData 實例生成器。
+-   `data_utils.py`: SD2 / BenchData 實例生成器。已更新支援 `mode='realistic'`。
 -   `plot_train.py`: 訓練曲線繪製與驗證分析 (含 In-Distribution G1-G4 分析)。
 
 ## 3. Critical Logic & Formulas (關鍵邏輯與公式)
 
 ### Tardiness Reward Normalization (更新於 2026-01-28)
-在 `FJSPEnvForVariousOpNums.py` 的 `step` 函數中，Tardiness 的 Reward 計算方式如下：
+在 `FJSPEnvForVariousOpNums.py` 的 `step` 函數中，Tardiness 的 Reward 計算方式已簡化：
 
 ```python
-# k_val 來自外部傳入的 tightness (例如: 1.2, 1.5)，預設為 1.5
-base_scale = mk - (mean_op_pt * 5 * k_val)
+# 使用預估完工時間作為穩定分母
+base_scale = self.mean_op_pt * self.number_of_jobs
 base_scale = max(base_scale, 1e-8)
 reward_td = - alpha * (tardiness / base_scale)
 ```
-*   **目的**: 動態調整懲罰力度，使其隨 Makespan ($mk$) 縮短而保持相對穩定，並考量交期設定 ($k$)。
-*   **實作細節**: `set_initial_data` 現已接受 `tightness` 參數並傳遞給環境。
-
-### Due Date Tightness (k-value) Scaling Rule
-當工單數量 ($N_j$) 增加時，交期係數 $k$ 採用 **0.8 次方縮放準則**，而非線性縮放：
-*   **公式**: $k_{new} = k_{base} \times (N_{new} / N_{base})^{0.8}$
-*   **範例 ($10 \to 20$ jobs)**: $1.2 \times (2)^{0.8} \approx 2.1$ (傳統線性縮放為 2.4)
-*   **設計動機**: 線性縮放會導致大規模問題下的交期過於寬鬆（因為並行處理紅利使得 Makespan 增長慢於工單數增長）。採用 0.8 次方能維持更穩定的訓練壓力。
 
 ### Feature Engineering
--   **Operation Features (14 dim)**: 包含狀態位元 (Scheduled/Completed)、時間資訊 (LB, Wait, Remain)、交期資訊 (Due Date, Slack, CR, Is_Tardy)。
--   **Machine Features (8 dim)**: 包含負載資訊 (Available Ops/Jobs, Wait Time, Remain Work)。
+-   **Operation Features (14 dim)**: 包含狀態位元、時間資訊、交期資訊。
+-   **Normalization (更新於 2026-01-28)**: 
+    *   前 12 維特徵執行 **Instance-wise Z-Score Normalization**。
+    *   **第 13-14 維 (CR, Is_Tardy)**: **保留原始數值 (Raw Values)**，不參與標準化。
 
-## 4. Development Conventions (開發規範)
+#### 詳細特徵列表與處理
+| Index | 特徵名稱 | 描述 | 正規化 |
+| :--- | :--- | :--- | :--- |
+| 0 | Scheduled Flag | 是否已排程 (0/1) | Z-Score |
+| 1 | CT Lower Bound | 預估完工時間下界 | Z-Score |
+| 2 | Min Process Time | 最短加工時間 (歸一化至 [0,1]) | Z-Score |
+| 3 | PT Span | 加工時間跨度 (Max - Min) | Z-Score |
+| 4 | Mean Process Time | 平均加工時間 | Z-Score |
+| 5 | Waiting Time | 相對於 Next Schedule Time 的等待時間 | Z-Score |
+| 6 | Remain Work | 工序剩餘加工時間 | Z-Score |
+| 7 | Job Left Ops | 工單剩餘工序數 | Z-Score |
+| 8 | Job Remain Work | 工單剩餘總工時 | Z-Score |
+| 9 | Avail Mch Nums | 可用機器數比例 (`count / n_m`) | Z-Score |
+| 10 | Remain Time (Due) | 距離交期剩餘時間 (`Due - CurrentTime`) | Z-Score |
+| 11 | Slack | 寬裕時間 (`RemainTime - JobRemainWork`) | Z-Score |
+| 12 | CR (Log) | 臨界比率 (`Log(1 + |RemainTime / JobRemainWork|)`) | **RAW** |
+| 13 | Is Tardy | 是否已遲交 (0/1) | **RAW** |
 
--   **State Management**: 環境狀態使用 `EnvState` dataclass 管理，並大量使用 PyTorch Tensor 進行批次運算。修改特徵時需同步更新 `EnvState.update` 和 `config.fea_j_input_dim`。
--   **Config Management**: 優先修改 `configs/*.yml`，或透過 `params.py` 的 CLI 參數覆蓋。
--   **Logging**: 訓練日誌存於 `train_log/SD2/`，格式包含 `reward_*.txt`, `detailed_reward_*.txt`, `vali_indist_*.txt`。
+-   **Machine Features (8 dim)**: 全部 8 維執行 **Z-Score Normalization**。
+    - 包含：Avail Job/Op Nums, Min/Mean PT, Waiting/Remain Work, Free Time, Working Flag。
 
-## 5. Common Commands (常用指令)
+-   **Pair Features (8 dim)**: 加工時間比率與配對等待時間，不進行額外 Z-Score。
+
+### 5. Common Commands (常用指令)
 
 ### 啟動課程學習訓練 (Curriculum Training)
 ```bash
@@ -75,13 +92,11 @@ python train_curriculum.py --schedule_type deep_dive --device cuda:0
 ```bash
 python plot_train.py --eval_model_name <MODEL_NAME>
 ```
-*   輸出目錄: `train_log_plot/`
-*   包含：Reward 曲線、Loss 曲線、G1-G4 分組驗證趨勢圖。
 
 ## 6. Current Context (當前狀態)
--   **最近修改**:
-    1.  修復 `plot_train.py` 無法輸出 In-Distribution 驗證圖的問題。
-    2.  更新 `FJSPEnvForVariousOpNums.py` 與 `train_curriculum.py`，支援傳入 `tightness` (k) 並用於 Tardiness Reward 正規化。
+-   **最近修改 (2026-02-01)**:
+    1.  **資料增強實作**: `data_utils.py` 新增 `realistic` 模式，模擬 `vdata` 的加工時間變異與靈活度分佈。
+    2.  **訓練混合**: `train_curriculum.py` 現在以 50/50 比例混合 Uniform/Realistic 實例進行訓練，以解決泛化能力不足的問題。
 -   **待辦事項**:
-    -   觀察新 Reward 公式對 Tardiness 收斂的影響。
-    -   (選用) 檢查 `event_gate_env.py` 是否需要同步類似的正規化邏輯。
+    -   觀察新的資料分佈對訓練收斂速度的影響 (可能變慢，但 Test Score 應提升)。
+    -   (下一步) 考慮擴充 Machine Features，加入預估完工時間 (Estimated Finish Time) 以強化對 Tardiness 的感知。
