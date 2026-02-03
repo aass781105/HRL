@@ -1,8 +1,8 @@
 
-eval_model_name: "s2_3_a10_dim128_mix_train_dur3"
-schedule_type: "s2_3"
+eval_model_name: "s1_a10_dim128_mix_train_dur2_new_state_seed1"
+schedule_type: "s1"
 tardiness_alpha: 10
-seed_train: 2
+seed_train: 1
 entloss_coef: 0.03
 num_mlp_layers_actor: 3
 num_mlp_layers_critic: 3

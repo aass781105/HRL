@@ -193,6 +193,139 @@ def plot_indist_validation(log_dir: Path, output_path: Path, log_file_suffix: st
     plt.close(fig)
     print(f"✅ In-Distribution 驗證分析圖已輸出：{output_path}")
 
+def plot_comparison_analysis(log_dir: Path, output_path: Path, log_file_suffix: str, core_name: str):
+    """
+    Plots comparison of 3 validation sets: Mixed (Main), Uniform, and Test (Benchmark).
+    3 Subplots: Makespan, Tardiness, Objective.
+    """
+    # 1. Define file paths
+    # Mixed (Main)
+    path_mix_mk = log_dir / f"valiquality_{log_file_suffix}.txt"
+    path_mix_td = log_dir / f"valitardiness_{log_file_suffix}.txt"
+    
+    # Uniform
+    path_uni_mk = log_dir / f"valiquality_uniform_{log_file_suffix}.txt"
+    path_uni_td = log_dir / f"valitardiness_uniform_{log_file_suffix}.txt"
+    
+    # Test
+    path_test_mk = log_dir / f"valiquality_test_{log_file_suffix}.txt"
+    path_test_td = log_dir / f"valitardiness_test_{log_file_suffix}.txt"
+
+    # 2. Load Data
+    def load_metric(p):
+        data = load_xy(p)
+        if not data: return [], []
+        return zip(*data) # Returns (x_list, y_list)
+
+    # Mixed
+    mx_x, mx_mk = load_metric(path_mix_mk)
+    _, mx_td = load_metric(path_mix_td)
+    
+    # Uniform
+    ux_x, ux_mk = load_metric(path_uni_mk)
+    _, ux_td = load_metric(path_uni_td)
+    
+    # Test
+    tx_x, tx_mk = load_metric(path_test_mk)
+    _, tx_td = load_metric(path_test_td)
+
+    # Check if we have data
+    if not mx_x:
+        print("No validation data found for comparison plot.")
+        return
+
+    # 3. Plotting
+    fig, axes = plt.subplots(3, 1, figsize=(12, 18), sharex=True)
+    fig.suptitle(f"Validation Comparison: {core_name}", fontsize=16)
+    
+    # Helper to safe get objective
+    def get_obj(mk, td):
+        if len(mk) != len(td): return []
+        return [0.5 * m + 0.5 * t for m, t in zip(mk, td)]
+
+    mx_obj = get_obj(mx_mk, mx_td)
+    ux_obj = get_obj(ux_mk, ux_td)
+    tx_obj = get_obj(tx_mk, tx_td)
+
+    # Subplot 1: Makespan
+    ax1 = axes[0]
+    ax1.set_title("Makespan Comparison")
+    ax1.plot(mx_x, mx_mk, label='Mixed (Main)', color='blue', linewidth=2)
+    if ux_mk: ax1.plot(ux_x, ux_mk, label='Uniform', color='green', linestyle='--')
+    
+    # For Test, use dual axis if range is very different, else same
+    # Simple heuristic: if test mean is > 2x mixed mean, use dual
+    use_dual_test = False
+    if tx_mk and mx_mk and (np.mean(tx_mk) > 2 * np.mean(mx_mk) or np.mean(tx_mk) < 0.5 * np.mean(mx_mk)):
+        use_dual_test = True
+        
+    if tx_mk:
+        if use_dual_test:
+            ax1_r = ax1.twinx()
+            ax1_r.plot(tx_x, tx_mk, label='Test (Benchmark) [Right Axis]', color='red', linestyle=':')
+            ax1_r.set_ylabel("Test Makespan", color='red')
+            ax1_r.legend(loc='upper right')
+        else:
+            ax1.plot(tx_x, tx_mk, label='Test (Benchmark)', color='red', linestyle=':')
+    
+    ax1.set_ylabel("Makespan")
+    ax1.legend(loc='upper left')
+    ax1.grid(True, alpha=0.3)
+
+    # Subplot 2: Tardiness
+    ax2 = axes[1]
+    ax2.set_title("Tardiness Comparison")
+    ax2.plot(mx_x, mx_td, label='Mixed (Main)', color='blue', linewidth=2)
+    if ux_td: ax2.plot(ux_x, ux_td, label='Uniform', color='green', linestyle='--')
+    
+    # Check dual for TD
+    use_dual_test_td = False
+    if tx_td and mx_td and (np.mean(tx_td) > 2 * np.mean(mx_td) + 10 or np.mean(tx_td) < 0.5 * np.mean(mx_td)):
+        use_dual_test_td = True
+
+    if tx_td:
+        if use_dual_test_td:
+            ax2_r = ax2.twinx()
+            ax2_r.plot(tx_x, tx_td, label='Test (Benchmark) [Right Axis]', color='red', linestyle=':')
+            ax2_r.set_ylabel("Test Tardiness", color='red')
+            ax2_r.legend(loc='upper right')
+        else:
+            ax2.plot(tx_x, tx_td, label='Test (Benchmark)', color='red', linestyle=':')
+
+    ax2.set_ylabel("Tardiness")
+    ax2.legend(loc='upper left')
+    ax2.grid(True, alpha=0.3)
+
+    # Subplot 3: Objective
+    ax3 = axes[2]
+    ax3.set_title("Objective (0.5*MS + 0.5*TD)")
+    if mx_obj: ax3.plot(mx_x, mx_obj, label='Mixed (Main)', color='blue', linewidth=2)
+    if ux_obj: ax3.plot(ux_x, ux_obj, label='Uniform', color='green', linestyle='--')
+    
+    # Check dual for Obj
+    use_dual_test_obj = False
+    if tx_obj and mx_obj and (np.mean(tx_obj) > 2 * np.mean(mx_obj) or np.mean(tx_obj) < 0.5 * np.mean(mx_obj)):
+        use_dual_test_obj = True
+
+    if tx_obj:
+        if use_dual_test_obj:
+            ax3_r = ax3.twinx()
+            ax3_r.plot(tx_x, tx_obj, label='Test (Benchmark) [Right Axis]', color='red', linestyle=':')
+            ax3_r.set_ylabel("Test Objective", color='red')
+            ax3_r.legend(loc='upper right')
+        else:
+            ax3.plot(tx_x, tx_obj, label='Test (Benchmark)', color='red', linestyle=':')
+            
+    ax3.set_ylabel("Weighted Score")
+    ax3.set_xlabel("Update Step")
+    ax3.legend(loc='upper left')
+    ax3.grid(True, alpha=0.3)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"✅ 比較分析圖已輸出：{output_path}")
+
 def main():
     # 1. Construct dynamic log name
     model_name = configs.eval_model_name
@@ -224,6 +357,10 @@ def main():
     CORE_NAME = model_name # For plot title
     out_dir = Path(OUTPUT_PLOT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # [ADDED] Plot Comparison Analysis (New 3-Subplot Chart)
+    comp_analysis_path = out_dir / f"comparison_{CORE_NAME}.png"
+    plot_comparison_analysis(log_dir, comp_analysis_path, log_file_suffix, CORE_NAME)
 
     # [ADDED] Plot Detailed Reward Components
     if detailed_path.exists():

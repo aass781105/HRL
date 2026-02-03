@@ -1,6 +1,6 @@
 
-eval_model_name: "s2_4_a10_dim128_mix_train_dur3"
-schedule_type: "s2_4"
+eval_model_name: "same_dim128_mix_train_1000_new_state"
+schedule_type: "same_10_5_12"
 tardiness_alpha: 10
 seed_train: 2
 entloss_coef: 0.03

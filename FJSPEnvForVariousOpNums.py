@@ -63,7 +63,7 @@ class FJSPEnvForVariousOpNums:
         # feature dims (keep your original settings)
         # Increment to 14 to include is_tardy flag
         self.op_fea_dim = 14
-        self.mch_fea_dim = 8
+        self.mch_fea_dim = 9
 
     # -------------------- static properties & init --------------------
 
@@ -89,7 +89,7 @@ class FJSPEnvForVariousOpNums:
 
         self.flag_exist_dummy_node = ~(self.env_number_of_ops == self.max_number_of_ops).all()
 
-    def set_initial_data(self, job_length_list, op_pt_list, due_date_list=None, normalize_due_date=True, true_due_date_list=None, tightness=None):
+    def set_initial_data(self, job_length_list, op_pt_list, due_date_list=None, normalize_due_date=True, true_due_date_list=None, tightness=None, release_time_list=None):
         """
         Args:
             job_length_list: List[np.ndarray]
@@ -98,6 +98,7 @@ class FJSPEnvForVariousOpNums:
             normalize_due_date: If True, due_date_list will be normalized internally.
             true_due_date_list: Absolute due dates used for Tardiness/Reward calculation.
             tightness:       Optional array/list of tightness factors (k) for reward normalization.
+            release_time_list: Optional list of release times for each job (for dynamic scenarios).
         """
         self.number_of_envs = len(job_length_list)
         self.job_length = np.array(job_length_list)
@@ -159,6 +160,20 @@ class FJSPEnvForVariousOpNums:
         # Apply internal normalization to feature due_date if requested
         if due_date_list is not None and normalize_due_date:
             self.due_date = self.due_date / scale
+            
+        # [NEW] Handle Release Times (Dynamic Support)
+        if release_time_list is None:
+            self.release_time = np.zeros((self.number_of_envs, self.number_of_jobs))
+            self.true_release_time = np.zeros((self.number_of_envs, self.number_of_jobs))
+        else:
+            self.true_release_time = np.array(release_time_list)
+            # Normalize release time using the same scale
+            self.release_time = self.true_release_time / scale
+        
+        # Ensure release_time is 2D
+        if self.true_release_time.ndim == 1:
+            self.true_release_time = self.true_release_time[np.newaxis, :]
+            self.release_time = self.release_time[np.newaxis, :]
 
         self.process_relation = (self.op_pt != 0)              # True where feasible
         self.reverse_process_relation = ~self.process_relation  # True where infeasible (or dummy)
@@ -372,8 +387,12 @@ class FJSPEnvForVariousOpNums:
         self.mch_queue_len[self.incomplete_env_idx, chosen_mch] += 1
 
         # [E] (normalized time)
-        chosen_op_st = np.maximum(self.candidate_free_time[self.incomplete_env_idx, chosen_job],
-                                  self.mch_free_time[self.incomplete_env_idx, chosen_mch])
+        # [MODIFIED] Include release_time constraint (normalized)
+        chosen_op_st = np.maximum(
+            np.maximum(self.candidate_free_time[self.incomplete_env_idx, chosen_job],
+                       self.mch_free_time[self.incomplete_env_idx, chosen_mch]),
+            self.release_time[self.incomplete_env_idx, chosen_job]
+        )
 
         self.op_ct[self.incomplete_env_idx, chosen_op] = chosen_op_st + self.op_pt[
             self.incomplete_env_idx, chosen_op, chosen_mch]
@@ -381,8 +400,12 @@ class FJSPEnvForVariousOpNums:
         self.mch_free_time[self.incomplete_env_idx, chosen_mch] = self.op_ct[self.incomplete_env_idx, chosen_op]
 
         # absolute time counterparts
-        true_chosen_op_st = np.maximum(self.true_candidate_free_time[self.incomplete_env_idx, chosen_job],
-                                       self.true_mch_free_time[self.incomplete_env_idx, chosen_mch])
+        # [MODIFIED] Include true_release_time constraint
+        true_chosen_op_st = np.maximum(
+            np.maximum(self.true_candidate_free_time[self.incomplete_env_idx, chosen_job],
+                       self.true_mch_free_time[self.incomplete_env_idx, chosen_mch]),
+            self.true_release_time[self.incomplete_env_idx, chosen_job]
+        )
         self.true_op_ct[self.incomplete_env_idx, chosen_op] = true_chosen_op_st + self.true_op_pt[
             self.incomplete_env_idx, chosen_op, chosen_mch]
         self.true_candidate_free_time[self.incomplete_env_idx, chosen_job] = self.true_op_ct[
@@ -625,6 +648,21 @@ class FJSPEnvForVariousOpNums:
         self.fea_j = np.concatenate((fea_normalized, fea_keep_raw), axis=2)
 
     def construct_mch_features(self):
+        # [NEW] Calculate Machine Tardiness Pressure
+        # Slack for candidate operations: [E, J]
+        # Using same logic as feat_slack in construct_op_features
+        cand_rem_time = (self.due_date - self.next_schedule_time[:, np.newaxis])
+        cand_slack = cand_rem_time - self.op_match_job_remain_work[self.env_job_idx, self.candidate]
+        is_tardy_cand = (cand_slack < 0).astype(float) # [E, J]
+        
+        # Mask for valid (op, mch) pairs: [E, J, M]
+        valid_mask = ~self.dynamic_pair_mask
+        
+        # Count tardy ops per machine
+        tardy_counts = np.sum(is_tardy_cand[:, :, np.newaxis] * valid_mask, axis=1) # [E, M]
+        total_counts = np.sum(valid_mask, axis=1) # [E, M]
+        
+        mch_tardiness_pressure = tardy_counts / (total_counts + 1e-8)
 
         self.fea_m = np.stack((self.mch_current_available_jc_nums,
                                self.mch_current_available_op_nums,
@@ -633,7 +671,8 @@ class FJSPEnvForVariousOpNums:
                                self.mch_waiting_time,
                                self.mch_remain_work,
                                self.mch_free_time,
-                               self.mch_working_flag), axis=2)
+                               self.mch_working_flag,
+                               mch_tardiness_pressure), axis=2)
 
         self.norm_machine_features()
 
@@ -674,6 +713,11 @@ class FJSPEnvForVariousOpNums:
         chosen_job_remain_work = np.expand_dims(self.op_match_job_remain_work[self.env_job_idx, self.candidate],
                                                 axis=-1) + 1e-8
 
+        # [NEW] Estimated Lateness if Assigned
+        # pair_free_time: [E, J, M], candidate_pt: [E, J, M], due_date: [E, J]
+        # All are already normalized by scale
+        pair_est_lateness = np.maximum(0, self.pair_free_time + self.candidate_pt - self.due_date[:, :, np.newaxis])
+
         self.fea_pairs = np.stack((self.candidate_pt,
                                    self.candidate_pt / chosen_op_max_pt,
                                    self.candidate_pt / mch_max_candidate_pt,
@@ -681,7 +725,8 @@ class FJSPEnvForVariousOpNums:
                                    self.candidate_pt / mch_max_remain_op_pt,
                                    self.candidate_pt / pair_max_pt,
                                    self.candidate_pt / chosen_job_remain_work,
-                                   pair_wait_time), axis=-1)
+                                   pair_wait_time,
+                                   pair_est_lateness), axis=-1)
 
     # -------------------- masks / logic --------------------
 

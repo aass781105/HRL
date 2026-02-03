@@ -121,7 +121,7 @@ class DANIEL(nn.Module):
         device = torch.device(config.device)
 
         # pair features input dim with fixed value
-        self.pair_input_dim = 8
+        self.pair_input_dim = 9
 
         self.embedding_output_dim = config.layer_fea_output_dim[-1]
 

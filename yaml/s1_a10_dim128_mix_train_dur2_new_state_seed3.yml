@@ -1,0 +1,11 @@
+
+eval_model_name: "s1_a10_dim128_mix_train_dur2_new_state_seed3"
+schedule_type: "s1"
+tardiness_alpha: 10
+seed_train: 3
+entloss_coef: 0.03
+num_mlp_layers_actor: 3
+num_mlp_layers_critic: 3
+hidden_dim_actor: 128
+hidden_dim_critic: 128
+layer_fea_output_dim: [64, 64, 64]
