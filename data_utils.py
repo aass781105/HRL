@@ -186,17 +186,28 @@ def text_to_matrix(text):
     return job_length, op_pt
 
 
-def generate_due_dates(job_length, op_pt, tightness='random_mix'):
+def generate_due_dates(job_length, op_pt, tightness='random_mix', due_date_mode='k', seed=None, noise_level=0.0):
     """
-    Generate due dates for jobs based on various difficulty profiles.
-    D_j = Total_Work_j * k
+    Generate due dates for jobs.
+    
+    due_date_mode options:
+    - 'k' (Default): Individual Due Dates. D_j = JobWork_j * tightness
+    - 'M': Common Due Date. D_common = (TotalWork / M) * tightness
+    
+    noise_level: Multiplicative noise factor (e.g., 0.1 for +/- 10%). Only applies to 'M' mode.
     
     tightness options:
-    - 'random_mix': Randomly selects one of the predefined profiles.
-    - float/int: Uses this specific k for all jobs in the instance.
-    - Specific profiles: 'easy', 'moderate', 'hard', 'crisis'
+    - 'random_mix': Randomly selects one of the predefined profiles (only for mode 'k').
+    - float/int: Uses this specific factor.
     """
     n_j = job_length.shape[0]
+    n_m = op_pt.shape[1]
+    
+    # [NEW] Initialize RNG for deterministic noise
+    if seed is not None:
+        rng = np.random.default_rng(seed)
+    else:
+        rng = np.random # Fallback to global state
     
     # Calculate total work per job (using mean processing time of compatible machines)
     job_work = np.zeros(n_j)
@@ -209,7 +220,47 @@ def generate_due_dates(job_length, op_pt, tightness='random_mix'):
                 job_work[j] += np.mean(compat_pt)
             op_idx += 1
 
-    # [NEW] Handle specific numerical k value
+    # New 'M' Mode (Common Due Date based on Machine Load Average)
+    if due_date_mode == 'M':
+        if not isinstance(tightness, (float, int, np.float64, np.int64)):
+            tightness = 0.6 # Default M value as requested
+        
+        total_work = np.sum(job_work)
+        base = total_work / n_m
+        
+        # [MODIFIED] Dual-mode Noise Logic
+        # noise_level > 0: Random Noise (Per-job random fluctuation)
+        # noise_level < 0: Compensatory Noise (Structural fluctuation based on job length)
+        # noise_level = 0: No Noise
+        
+        if noise_level > 0:
+            # Mode A: Random Noise (+/- noise_level)
+            noise = rng.uniform(-noise_level, noise_level, size=n_j)
+            d_common = base * float(tightness) * (1 + noise)
+            return d_common
+            
+        elif noise_level < 0:
+            # Mode B: Compensatory/Structural Noise
+            # Longer jobs get longer due dates, shorter jobs get shorter
+            level = abs(noise_level)
+            mean_work = np.mean(job_work)
+            
+            # Normalized difference: (Work - Mean) / Mean
+            # This centers the noise around 0
+            if mean_work > 0:
+                norm_diff = (job_work - mean_work) / mean_work
+            else:
+                norm_diff = np.zeros(n_j)
+                
+            # Apply structural noise
+            d_common = base * float(tightness) * (1 + norm_diff * level)
+            return d_common
+            
+        else:
+            # Mode C: Pure Common Due Date
+            d_common = base * float(tightness)
+            return np.full(n_j, d_common)
+    # Original 'k' Mode (Individual Due Date)
     if isinstance(tightness, (float, int, np.float64, np.int64)):
         k = np.full(n_j, float(tightness))
         due_dates = job_work * k
@@ -226,7 +277,11 @@ def generate_due_dates(job_length, op_pt, tightness='random_mix'):
 
     if tightness == 'random_mix':
         # Randomly choose a profile for this batch/instance
-        profile_name = np.random.choice(['easy', 'moderate', 'hard', 'crisis'], p=[0.1, 0.3, 0.4, 0.2])
+        # [NEW] use rng if provided
+        if hasattr(rng, 'choice'):
+            profile_name = rng.choice(['easy', 'moderate', 'hard', 'crisis'], p=[0.1, 0.3, 0.4, 0.2])
+        else:
+            profile_name = np.random.choice(['easy', 'moderate', 'hard', 'crisis'], p=[0.1, 0.3, 0.4, 0.2])
     elif tightness == 'ablation_1.2':
         # Temporary mode for ablation study: all jobs fixed at 1.2
         k = np.full(n_j, 1.2)
@@ -240,22 +295,29 @@ def generate_due_dates(job_length, op_pt, tightness='random_mix'):
     weights = profiles[profile_name]
     
     # Assign mode to each job based on profile weights
-    modes = np.random.choice(
-        ['loose', 'medium', 'tight', 'extreme'], 
-        size=n_j, 
-        p=[weights['loose'], weights['medium'], weights['tight'], weights['extreme']]
-    )
+    if hasattr(rng, 'choice'):
+        modes = rng.choice(
+            ['loose', 'medium', 'tight', 'extreme'], 
+            size=n_j, 
+            p=[weights['loose'], weights['medium'], weights['tight'], weights['extreme']]
+        )
+    else:
+        modes = np.random.choice(
+            ['loose', 'medium', 'tight', 'extreme'], 
+            size=n_j, 
+            p=[weights['loose'], weights['medium'], weights['tight'], weights['extreme']]
+        )
 
     k = np.zeros(n_j)
     for i, mode in enumerate(modes):
         if mode == 'loose':
-            k[i] = np.random.uniform(1.6, 2.0)
+            k[i] = rng.uniform(1.6, 2.0)
         elif mode == 'medium':
-            k[i] = np.random.uniform(1.3, 1.6)
+            k[i] = rng.uniform(1.3, 1.6)
         elif mode == 'tight':
-            k[i] = np.random.uniform(1.0, 1.3)
+            k[i] = rng.uniform(1.0, 1.3)
         elif mode == 'extreme':
-            k[i] = np.random.uniform(0.8, 1.0)
+            k[i] = rng.uniform(0.8, 1.0)
             
     due_dates = job_work * k
     return due_dates
