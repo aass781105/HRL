@@ -136,21 +136,18 @@ parser.add_argument('--episode_seed_base', type=int, default=12345, help='episod
 parser.add_argument('--curriculum_cycle', type=int, default=250, help='Updates per curriculum stage')
 parser.add_argument('--tardiness_dilution_power', type=float, default=1, help='Beta factor for tardiness dilution')
 parser.add_argument('--schedule_type', type=str, default='deep_dive', choices=['standard', 'deep_dive', 'alt', 'same'], help='Type of curriculum schedule to use')
-parser.add_argument('--due_date_mode', type=str, default='M', choices=['k', 'M'], help='Due date generation mode: k (Individual) or M (Common)')
-parser.add_argument('--m_value', type=float, default=0.6, help='Fixed M-value for sensitivity analysis (used in s1)')
-parser.add_argument('--due_date_noise', type=float, default=0.0, help='Multiplicative noise level for M mode (+/- percentage)')
-
-# Cadence Sampling
-parser.add_argument('--cadence_min', type=int, default=8, help='固定事件次數（cadence）抽樣下限（含）')
-parser.add_argument('--cadence_max', type=int, default=12, help='固定事件次數（cadence）抽樣上限（含）')
-parser.add_argument('--cadence_choices', type=int, nargs='*', default=None, help='固定事件次數（cadence）的離散候選集合（例如：--cadence_choices 1 2 4 8）')
-
+parser.add_argument('--due_date_mode', type=str, default='k', choices=['k', 'M'], help='Due date generation mode: k (Individual) or M (Common). Note: M is used primarily in static curriculum.')
+parser.add_argument('--m_value', type=float, default=0.6, help='M-value used for Common Due Date (Static Curriculum Only)')
+parser.add_argument('--due_date_tightness', type=float, default=1.2, help='Tightness base factor (k). Current logic uses U[1.2, 2.0] for individual due dates.')
+parser.add_argument('--due_date_noise', type=float, default=0.0, help='Multiplicative noise level for due dates')
 
 # ============================
-# PPO Orchestrator Integration
+# Unified Scheduling Controller
 # ============================
-parser.add_argument('--use_ppo', type=str2bool, default=True, help='是否改用 PPO 進行靜態批次的一次排到底')
-parser.add_argument('--ppo_model_path', type=str, default=r'trained_network\due_date\curriculum_train_fix1_2_03.pth', help='PPO 權重檔 .pth 路徑（use_ppo=True 時必填）')
+parser.add_argument('--scheduler_type', type=str, default='PPO', 
+                    choices=['PPO', 'SPT', 'MWKR', 'FIFO', 'OR-Tools'],
+                    help='Unified scheduling method used across all stages (Init, Dynamic, Flush)')
+parser.add_argument('--ppo_model_path', type=str, default=r'trained_network\SD2\curriculum.pth', help='PPO 權重檔 .pth 路徑')
 parser.add_argument('--ppo_sample', type=str2bool, default=False, help='PPO 推論是否採用抽樣；False=貪婪/取最大機率')
 
 
@@ -158,31 +155,23 @@ parser.add_argument('--ppo_sample', type=str2bool, default=False, help='PPO 推�
 # DDQN Gate Policy & Training
 # ============================
 parser.add_argument('--gate_policy', type=str, default='ddqn',
-                    choices=['ddqn', 'always', 'threshold', 'time'],
-                    help='Gate 策略：ddqn=用模型；always=每次到達都放行；threshold=緩衝超門檻才放；time=事件間隔累積超過門檻才放')
+                    choices=['ddqn', 'cadence'],
+                    help='Gate 策略：ddqn=用模型；cadence=按固定事件步長釋放 (cadence=1 等同於 Always)')
+parser.add_argument('--gate_cadence', type=int, default=1, help='當 gate_policy=cadence 時，每隔幾個到達事件釋放一次緩衝區')
 parser.add_argument('--eval_action_selection', type=str, default='greedy',
                     choices=['sample', 'greedy'],
                     help='sample or greedy')
-parser.add_argument('--ddqn_model_path', type=str, default=r"yaml\55_100_30.yml", help='DDQN 推論權重路徑（.pth）')
-
-# Gate Thresholds & Obs Params
-parser.add_argument('--gate_time_threshold', type=float, default=250.0, help='當 gate_policy=time 時，兩次釋放之間所需的最小事件間隔（可累加）')
-parser.add_argument('--gate_buffer_threshold', type=int, default=0, help='當 gate_policy=threshold 時的緩衝門檻（>=此值才 release）')
-parser.add_argument('--gate_obs_buffer_cap', type=int, default=0, help='Gate 狀態中 buffer 正規化的分母（0=自動估計）')
-parser.add_argument('--gate_time_scale', type=float, default=0.0, help='Gate 狀態中時間正規化尺度（0=以 interarrival_mean 近似）')
+parser.add_argument('--ddqn_model_path', type=str, default=r"ddqn_ckpt\ddqn_gate_latest3.pth", help='DDQN 推論權重路徑（.pth）')
+parser.add_argument('--ddqn_name', type=str, default='stab_01', help='DDQN 訓練存檔名稱 (不含 .pth)')
 
 # DDQN Training Hyperparameters
-parser.add_argument('--ddqn_train', type=str2bool, default=False, help='是否執行 DDQN 訓練流程（否則僅推論）')
-parser.add_argument('--ddqn_reward_mode', type=str, default='original',
-                    choices=['original', 'stability'],
-                    help='Reward mode: original (idle + makespan) or stability (original + action penalty)')
 parser.add_argument('--ddqn_episodes', type=int, default=100, help='DDQN 訓練集 episode 數')
 parser.add_argument('--ddqn_lr', type=float, default=5e-5, help='DDQN 學習率')
 parser.add_argument('--ddqn_gamma', type=float, default=0.995, help='DDQN 折扣因子 γ')
-parser.add_argument('--ddqn_eps_start', type=float, default=0.6, help='ε-greedy 初始 ε')
-parser.add_argument('--ddqn_eps_end', type=float, default=0.05, help='ε-greedy 最小 ε')
+parser.add_argument('--ddqn_eps_start', type=float, default=1.0, help='ε-greedy 初始 ε')
+parser.add_argument('--ddqn_eps_end', type=float, default=0.1, help='ε-greedy 最小 ε')
 parser.add_argument('--ddqn_eps_decay_episodes', type=int, default=90, help='ε 從起始到終值的衰減 episode 數')
-parser.add_argument('--ddqn_batch_size', type=int, default=128, help='DDQN 更新時的 minibatch 大小')
+parser.add_argument('--ddqn_batch_size', type=int, default=512, help='DDQN 更新時的 minibatch 大小')
 parser.add_argument('--ddqn_buffer_capacity', type=int, default=100_000, help='Replay buffer 容量')
 parser.add_argument('--ddqn_target_tau', type=float, default=0.005, help='目標網路軟更新係數 τ')
 parser.add_argument('--ddqn_seed', type=int, default=42, help='DDQN 訓練隨機種子（與事件種子獨立）')
@@ -192,18 +181,15 @@ parser.add_argument('--ddqn_out_dir', type=str, default='ddqn_ckpt', help='DDQN 
 
 
 # ============================
-# Reward, Penalty & Scales
+# Reward, Penalty & Weights
 # ============================
-parser.add_argument('--norm_scale', type=float, default=100, help='norm /scale')
-parser.add_argument('--reward_scale', type=float, default=50.0, help='Scale factor for reward normalization')
 parser.add_argument('--reward_alpha', type=float, default=0.3, help='Weight for Makespan in reward (alpha). Idle weight will be (1-alpha). Default 0.3 matches previous 0.3/0.7 split.')
 parser.add_argument('--tardiness_alpha', type=float, default=10.0, help='Weight for Tardiness in PPO reward calculation.')
-parser.add_argument('--stability_scale', type=float, default=0.1, help='Scale factor for stability penalty in reward calculation')
-parser.add_argument('--buffer_penalty_coef', type=float, default=0.0005, help='Coefficient for buffer tardiness penalty')
-parser.add_argument('--release_penalty_coef', type=float, default=0.005, help='Coefficient for release tardiness penalty')
-parser.add_argument('--enable_full_idle_penalty', type=str2bool, default=False, help='If True, penalize HOLD when all machines idle but buffer has jobs')
-parser.add_argument('--full_idle_penalty', type=float, default=100.0, help='Penalty value when full-idle HOLD happens')
-parser.add_argument('--enable_final_flush_penalty', type=str2bool, default=True, help='If True, add final penalty when episode ends with leftover buffer')
+parser.add_argument('--stability_scale', type=float, default=0.1, help='決策穩定性懲罰 (Action 1 的額外扣分)。設為 0 代表純效能模式。')
+parser.add_argument('--buffer_penalty_coef', type=float, default=0.01, help='Coefficient for buffer tardiness penalty')
+parser.add_argument('--release_penalty_coef', type=float, default=0.1, help='Coefficient for release tardiness penalty')
+parser.add_argument('--idle_penalty_coef', type=float, default=0.2, help='Weight for machine idle time penalty')
+parser.add_argument('--flush_penalty_coef', type=float, default=0.1, help='Weight for final makespan reward at simulation end')
 
 
 # ============================

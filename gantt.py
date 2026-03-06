@@ -1,6 +1,10 @@
 # plotters.py
 import os
 from typing import List, Dict, Optional
+import matplotlib
+mpl_backend = matplotlib.get_backend()
+# 強制使用 Agg 後端以避免 Windows 上的 Tkinter 執行緒衝突
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 

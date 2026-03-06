@@ -151,15 +151,17 @@ class FJSPEnvForVariousOpNums:
         self.true_op_pt = np.copy(self.op_pt)
         
         # Calculate scale for normalization
-        scale = self.pt_upper_bound - self.pt_lower_bound + 1e-8
-        self.pt_scale = scale # [ADDED] Store for restoring absolute time
+        # [UNIFIED SCALE] Use theoretical mean_pt for time-based features (Due Date, Release Time)
+        # to ensure consistency with the High-level Agent.
+        self.pt_scale = (float(configs.low) + float(configs.high)) / 2.0
+        
+        # op_pt feature scale (remain 0~1 for MLP stability)
+        op_feat_scale = self.pt_upper_bound - self.pt_lower_bound + 1e-8
+        self.op_pt = (self.op_pt - self.pt_lower_bound) / op_feat_scale
 
-        # normalize to [0,1] (zeros remain zeros = incompatible)
-        self.op_pt = (self.op_pt - self.pt_lower_bound) / scale
-
-        # Apply internal normalization to feature due_date if requested
+        # Apply internal normalization to feature due_date using unified pt_scale
         if due_date_list is not None and normalize_due_date:
-            self.due_date = self.due_date / scale
+            self.due_date = self.due_date / self.pt_scale
             
         # [NEW] Handle Release Times (Dynamic Support)
         if release_time_list is None:
@@ -167,8 +169,8 @@ class FJSPEnvForVariousOpNums:
             self.true_release_time = np.zeros((self.number_of_envs, self.number_of_jobs))
         else:
             self.true_release_time = np.array(release_time_list)
-            # Normalize release time using the same scale
-            self.release_time = self.true_release_time / scale
+            # Normalize release time using the unified pt_scale
+            self.release_time = self.true_release_time / self.pt_scale
         
         # Ensure release_time is 2D
         if self.true_release_time.ndim == 1:

@@ -1,0 +1,119 @@
+<mxfile host="app.diagrams.net" agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0" version="29.5.4" pages="3">
+  <diagram id="hrl-framework-v2" name="FJSP HRL Full Framework">
+    <mxGraphModel dx="539757" dy="246448" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="box-a" parent="1" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;spacingLeft=10;dashed=1;" value="&lt;b&gt;Module A: Initialization&lt;/b&gt;&lt;br&gt;• Size (10x5 - 40x10)&lt;br&gt;• PT Dist (Uniform/Realistic)&lt;br&gt;• Due Date (Individual/Common M)&lt;br&gt;• Dynamic: λ, Burst Size" vertex="1">
+          <mxGeometry height="90" width="220" x="110" y="20" as="geometry" />
+        </mxCell>
+        <mxCell id="start" parent="1" style="ellipse;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" value="&lt;b&gt;START&lt;/b&gt;&lt;br&gt;Initial Schedule (t=0)" vertex="1">
+          <mxGeometry height="70" width="140" x="340" y="30" as="geometry" />
+        </mxCell>
+        <mxCell id="arrival" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" value="&lt;b&gt;Event Trigger:&lt;/b&gt;&lt;br&gt;Job Arrival (t_a)" vertex="1">
+          <mxGeometry height="60" width="140" x="340" y="150" as="geometry" />
+        </mxCell>
+        <mxCell id="gate-decision" parent="1" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" value="&lt;b&gt;High-Level Gate&lt;br&gt;Decision?&lt;/b&gt;" vertex="1">
+          <mxGeometry height="100" width="180" x="320" y="260" as="geometry" />
+        </mxCell>
+        <mxCell id="box-b" parent="1" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;spacingLeft=10;dashed=1;" value="&lt;b&gt;Module B: Gate Strategy&lt;/b&gt;&lt;br&gt;• RL: DDQN&lt;br&gt;• Rules: Always, interval" vertex="1">
+          <mxGeometry height="90" width="200" x="310" y="370" as="geometry" />
+        </mxCell>
+        <mxCell id="batch" parent="1" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="Build Static Batch" vertex="1">
+          <mxGeometry height="50" width="120" x="160" y="400" as="geometry" />
+        </mxCell>
+        <mxCell id="schedule" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;" value="&lt;b&gt;Execute Scheduling&lt;/b&gt;&lt;br&gt;(Assignment)" vertex="1">
+          <mxGeometry height="60" width="120" x="160" y="490" as="geometry" />
+        </mxCell>
+        <mxCell id="box-c" parent="1" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;spacingLeft=10;dashed=1;" value="&lt;b&gt;Module C: Scheduler&lt;/b&gt;&lt;br&gt;• PPO (課程的不同、狀態獎勵調整)&lt;br&gt;• 派工法則&lt;br&gt;• OR-Tools" vertex="1">
+          <mxGeometry height="90" width="210" x="-150" y="475" as="geometry" />
+        </mxCell>
+        <mxCell id="coupling" parent="1" style="shape=parallelogram;perimeter=parallelogramPerimeter;whiteSpace=wrap;html=1;fixedSize=1;fillColor=#ffe6cc;strokeColor=#d79b00;" value="&lt;b&gt;Time/State Coupling&lt;/b&gt;&lt;br&gt;Sync t_now / MFT" vertex="1">
+          <mxGeometry height="50" width="170" x="135" y="590" as="geometry" />
+        </mxCell>
+        <mxCell id="tick" parent="1" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" value="Tick Time&lt;br&gt;(Env Step)" vertex="1">
+          <mxGeometry height="50" width="120" x="540" y="400" as="geometry" />
+        </mxCell>
+        <mxCell id="check-left" parent="1" style="rhombus;whiteSpace=wrap;html=1;fillColor=#f5f5f5;" value="End?" vertex="1">
+          <mxGeometry height="80" width="80" x="180" y="680" as="geometry" />
+        </mxCell>
+        <mxCell id="check-right" parent="1" style="rhombus;whiteSpace=wrap;html=1;fillColor=#f5f5f5;" value="End?" vertex="1">
+          <mxGeometry height="80" width="80" x="560" y="490" as="geometry" />
+        </mxCell>
+        <mxCell id="flush" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffcc99;strokeWidth=2;" value="&lt;b&gt;Final Flush&lt;/b&gt;&lt;br&gt;(Force Schedule)" vertex="1">
+          <mxGeometry height="60" width="120" x="540" y="610" as="geometry" />
+        </mxCell>
+        <mxCell id="end" parent="1" style="ellipse;whiteSpace=wrap;html=1;fillColor=#000000;fontColor=#ffffff;" value="&lt;b&gt;END&lt;/b&gt;" vertex="1">
+          <mxGeometry height="50" width="100" x="360" y="780" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" edge="1" parent="1" source="start" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="arrival">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="arrival" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="gate-decision">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="gate-decision" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0;exitY=0.5;entryX=0.5;entryY=0;strokeColor=#FF0000;strokeWidth=2;" target="batch" value="RELEASE (1)">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="batch" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="schedule">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" edge="1" parent="1" source="schedule" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="coupling">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" edge="1" parent="1" source="coupling" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="check-left">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" edge="1" parent="1" source="gate-decision" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=1;exitY=0.5;entryX=0.5;entryY=0;" target="tick" value="HOLD (0)">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" edge="1" parent="1" source="tick" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="check-right">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9" edge="1" parent="1" source="check-left" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0;exitY=0.5;entryX=0;entryY=0.5;" target="arrival" value="No">
+          <mxGeometry relative="1" x="-0.85" as="geometry">
+            <Array as="points">
+              <mxPoint x="80" y="720" />
+              <mxPoint x="80" y="180" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e10" edge="1" parent="1" source="check-right" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=1;exitY=0.5;entryX=1;entryY=0.5;" target="arrival" value="No">
+          <mxGeometry relative="1" x="-0.85" as="geometry">
+            <Array as="points">
+              <mxPoint x="740" y="530" />
+              <mxPoint x="740" y="180" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e11" edge="1" parent="1" source="check-left" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;entryX=0;entryY=0.5;" target="end" value="Yes">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12" edge="1" parent="1" source="check-right" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="flush" value="Yes">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e13" edge="1" parent="1" source="flush" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;entryX=1;entryY=0.5;" target="end">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a1" edge="1" parent="1" source="gate-decision" style="endArrow=none;dashed=1;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="box-b" />
+        <mxCell id="a2" edge="1" parent="1" source="schedule" style="endArrow=none;dashed=1;html=1;exitX=0;exitY=0.5;entryX=1;entryY=0.5;" target="box-c" />
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="ajb2QaLBdLmsnn8S0-7N" name="第 2 页">
+    <mxGraphModel dx="1876" dy="814" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="13-RhXTG5W3hoGLC6M8_" name="第 3 页">
+    <mxGraphModel dx="1876" dy="814" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
