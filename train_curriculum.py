@@ -589,7 +589,7 @@ class Trainer:
     def load_model(self):
         load_model_name = f'{self.model_name}_{self.initial_n_j}x{self.fixed_n_m}{strToSuffix(self.config.data_suffix)}'
         model_path = f'./trained_network/{self.data_source}/{load_model_name}.pth'
-        self.ppo.policy.load_state_dict(torch.load(model_path, map_location='cuda'))
+        self.ppo.policy.load_state_dict(torch.load(model_path, map_location='cuda', weights_only=True))
 
 
 def main():

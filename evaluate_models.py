@@ -257,7 +257,7 @@ def main():
             gate_policy = 'always'
         else:
             ddqn_model = QNet(obs_dim=4, hidden=128, n_actions=2).to(device)
-            ddqn_model.load_state_dict(torch.load(ddqn_model_path, map_location=device))
+            ddqn_model.load_state_dict(torch.load(ddqn_model_path, map_location=device, weights_only=True))
             ddqn_model.eval()
             tqdm.write(f"Successfully loaded DDQN gate model from: {ddqn_model_path}")
 
@@ -286,7 +286,7 @@ def main():
         return
         
     ppo_policy = PPO(configs).policy
-    ppo_policy.load_state_dict(torch.load(ppo_model_path, map_location=device))
+    ppo_policy.load_state_dict(torch.load(ppo_model_path, map_location=device, weights_only=True))
     ppo_policy.to(device)
     ppo_policy.eval()
 

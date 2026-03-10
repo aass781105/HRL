@@ -36,7 +36,7 @@ def run_matrix_tracing_simulation():
     ddqn_model = None; ddqn_device = torch.device(getattr(configs, "device", "cpu"))
     if gate_policy == "ddqn":
         ddqn_model = QNet(obs_dim=18, hidden=128, n_actions=2).to(ddqn_device) # UPGRADED TO 18
-        ddqn_model.load_state_dict(torch.load(configs.ddqn_model_path, map_location=ddqn_device)); ddqn_model.eval()
+        ddqn_model.load_state_dict(torch.load(configs.ddqn_model_path, map_location=ddqn_device, weights_only=True)); ddqn_model.eval()
 
     job_matrix_data = {}
     all_job_due_dates = {}

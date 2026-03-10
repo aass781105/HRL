@@ -1,2 +1,3 @@
 ﻿ddqn_name: stab_05
 stability_scale: 0.5
+ddqn_model_path: ddqn_ckpt\stab_05.pth

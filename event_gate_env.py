@@ -58,8 +58,23 @@ class EventGateEnv(gym.Env):
         return {"tardiness_ratio": neg_count / len(self.orch.buffer), "min_slack": min(slacks), "avg_slack": sum(slacks) / len(slacks), "slack_std": float(np.std(slacks))}
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
-        if seed is None: seed = getattr(configs, "event_seed", 42)
-        rng = np.random.default_rng(int(seed))
+        # 1. Handle initial seeding and counter initialization
+        if seed is not None:
+            self.master_seed = seed
+            self.internal_episode_counter = 0
+        elif not hasattr(self, 'master_seed'):
+            self.master_seed = getattr(configs, "event_seed", 42)
+            self.internal_episode_counter = 0
+            
+        # 2. Determine the instance seed: Change every 10 resets (episodes)
+        # instance_seed will stay the same for 10 resets, then increment.
+        instance_seed = self.master_seed + (self.internal_episode_counter // 10)
+        self.internal_episode_counter += 1
+        
+        # Call super().reset for Gymnasium compliance (manages self.np_random)
+        super().reset(seed=seed)
+        
+        rng = np.random.default_rng(int(instance_seed))
         self.all_job_due_dates, self.episode_tardiness, self.t_now, self.events_done, self.release_count = {}, 0.0, 0.0, 0, 0
         self.gen = EventBurstGenerator(SD2_instance_generator, copy.deepcopy(configs), self.M, self.interarrival_mean, lambda _r: int(self.burst_K), rng)
         self.orch = GlobalTimelineOrchestrator(self.M, self.gen, t0=0.0)
@@ -72,7 +87,7 @@ class EventGateEnv(gym.Env):
         
         # [NEW] Initialize shadow simulator as a clone of actual
         self.shadow_orch = self.orch.clone()
-        return self._observe(), {"t_now": 0.0}
+        return self._observe(), {"t_now": 0.0, "instance_seed": instance_seed}
 
     def step(self, action: int):
         t_event = float(self.t_now)
@@ -100,7 +115,9 @@ class EventGateEnv(gym.Env):
             shadow_td = self.shadow_orch.get_total_tardiness_estimate()
             
             # Reward = -(Actual - Shadow) * Coef
-            r_rel_component = -((actual_td - shadow_td) * float(configs.release_penalty_coef)) / self.time_scale
+            r_rel_raw = -((actual_td - shadow_td) * float(configs.release_penalty_coef)) / self.time_scale
+            # [LOG COMPRESSION] Reduce variance while keeping the signal direction
+            r_rel_component = float(np.sign(r_rel_raw) * np.log1p(np.abs(r_rel_raw)))
             
             # [SYNC] Reset shadow to current actual state for the next cycle
             self.shadow_orch = self.orch.clone()
@@ -122,12 +139,32 @@ class EventGateEnv(gym.Env):
         self.t_now = t_next; self.events_done += 1; done = bool(self.events_done >= self.event_horizon)
         
         r_flush = 0.0
+        ep_mk = 0.0
         if done:
             while len(self.orch.buffer) > 0: self.orch.event_release_and_reschedule(self.t_now); self.release_count += 1
+            # [MOD] Also flush the shadow world to get a fair comparison
+            while len(self.shadow_orch.buffer) > 0: self.shadow_orch.event_release_and_reschedule(self.t_now)
+            
             final = self.orch.get_final_kpi_stats(self.all_job_due_dates)
+            shadow_final = self.shadow_orch.get_final_kpi_stats(self.all_job_due_dates)
+            
             self.episode_tardiness = final["tardiness"]
-            r_flush = (-final["makespan"] / scale * float(configs.flush_penalty_coef))
+            ep_mk = final["makespan"]
+            shadow_mk = shadow_final["makespan"]
+            
+            # [MOD] Relative Makespan Penalty: Compares actual decision against 'Always Release' benchmark
+            mk_diff = ep_mk - shadow_mk
+            r_flush = (-mk_diff / scale * float(configs.flush_penalty_coef))
             reward += r_flush
 
-        info = {"episode_tardiness": self.episode_tardiness, "release_count": self.release_count, "reward_idle_cost": r_idle, "reward_buffer_penalty": r_buf, "reward_release_penalty": r_rel_component, "reward_stability_penalty": r_stab, "reward_final_flush_penalty": r_flush}
+        info = {
+            "episode_tardiness": self.episode_tardiness, 
+            "episode_makespan": ep_mk,
+            "release_count": self.release_count, 
+            "reward_idle_cost": r_idle, 
+            "reward_buffer_penalty": r_buf, 
+            "reward_release_penalty": r_rel_component, 
+            "reward_stability_penalty": r_stab, 
+            "reward_final_flush_penalty": r_flush
+        }
         return self._observe(), float(reward), done, False, info

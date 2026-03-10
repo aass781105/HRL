@@ -3,17 +3,17 @@ import torch
 import torch.nn as nn
 
 class QNet(nn.Module):
-    def __init__(self, obs_dim: int, hidden: int = 128, n_actions: int = 2):
+    def __init__(self, obs_dim: int, n_actions: int = 2, hidden: int = 128, num_layers: int = 3):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
-            nn.ReLU(inplace=True),
-            nn.LayerNorm(hidden),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(inplace=True),
-            nn.LayerNorm(hidden),
-            nn.Linear(hidden, n_actions),
-        )
+        layers = []
+        last_dim = obs_dim
+        for i in range(num_layers - 1):
+            layers.append(nn.Linear(last_dim, hidden))
+            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.LayerNorm(hidden))
+            last_dim = hidden
+        layers.append(nn.Linear(last_dim, n_actions))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.net(x)
@@ -57,9 +57,13 @@ def calculate_ddqn_state(
         
     if wip_stats:
         w_min, w_avg, w_rat = float(wip_stats.get("wip_min_slack", 0.0))/time_scale, float(wip_stats.get("wip_avg_slack", 0.0))/time_scale, float(wip_stats.get("wip_tardy_ratio", 0.0))
-        p_td, t_td = float(wip_stats.get("planned_td", 0.0)), float(wip_stats.get("theoretical_td", 0.0))
-        ratio = (p_td + 1.0) / (t_td + 1.0)
-        c_log = np.log1p(ratio - 1.0) if ratio >= 1.0 else 0.0
+        p_td = float(wip_stats.get("planned_td", 0.0))
+        total_rem_work = float(wip_stats.get("total_rem_work", 0.0))
+        
+        # [MOD] o11: Tardiness Density Ratio (Planned TD / Total Processing Work)
+        # This provides a stable indicator of how 'overdue' the pending work is.
+        c_log = p_td / (total_rem_work + 1.0)
+        
         w_std, w_cnt = float(wip_stats.get("wip_slack_std", 0.0))/time_scale, float(wip_stats.get("wip_count", 0.0))
         s_den = w_avg / (w_cnt + 1.0)
 

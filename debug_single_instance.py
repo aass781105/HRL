@@ -55,7 +55,7 @@ def main():
     
     if os.path.exists(model_path):
         try:
-            ppo.policy.load_state_dict(torch.load(model_path, map_location=device))
+            ppo.policy.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
             print(f"Loaded model from {model_path}")
         except Exception as e:
             print(f"Failed to load model: {e}. Using random weights.")

@@ -1,2 +1,3 @@
 ﻿ddqn_name: stab_0
 stability_scale: 0
+ddqn_model_path: ddqn_ckpt\stab_0.pth

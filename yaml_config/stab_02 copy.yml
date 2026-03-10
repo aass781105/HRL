@@ -1,0 +1,7 @@
+﻿ddqn_name: stab_03_log_256_4_4_100
+stability_scale: 0.3
+ddqn_num_envs: 4
+ddqn_num_layers: 4
+ddqn_episodes: 100
+ddqn_eps_decay_episodes: 70
+ddqn_model_path: ddqn_ckpt\stab_03_log_256_4_4_100.pth
