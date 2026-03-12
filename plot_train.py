@@ -36,11 +36,17 @@ def parse_content(text: str) -> Union[List[Tuple[float,float]], List[float]]:
     return []
 
 def load_xy(txt_path: Path) -> List[Tuple[float,float]]:
-    # ... (Keep existing load logic) ...
+    """
+    Loads XY data from a text file, handling numpy string pollution.
+    """
     if not txt_path.exists():
         return []
     text = txt_path.read_text(encoding="utf-8")
-    parsed = parse_content(text)
+    
+    # [FIXED] Global cleaning for all txt log loads
+    clean_text = re.sub(r"np\.float\d+\(([^)]+)\)", r"\1", text)
+    
+    parsed = parse_content(clean_text)
     if not parsed: return []
     if isinstance(parsed[0], tuple):
         return parsed
@@ -49,18 +55,18 @@ def load_xy(txt_path: Path) -> List[Tuple[float,float]]:
 
 def plot_reward_components(detailed_path: Path, output_path: Path, core_name: str):
     """
-    Reads detailed_reward_*.txt which contains: [ep, r, mk_mean, mk_std, td_mean, td_std]
-    Plots Total Reward, Makespan Gain (with std), Tardiness Penalty (with std).
+    Reads detailed_reward_*.txt which contains: [ep, r, mk_mean, mk_std, td_mean, td_std, raw_mk, raw_td]
+    [FIXED] Uses cleaned text and Dual Y-axes.
     """
     if not detailed_path.exists():
         print(f"Detailed reward log not found: {detailed_path}")
         return
 
     text = detailed_path.read_text(encoding="utf-8")
+    clean_text = re.sub(r"np\.float\d+\(([^)]+)\)", r"\1", text)
     
-    # [FIX] Use ast.literal_eval directly as parse_content is designed for 2D plots
     try:
-        data = ast.literal_eval(text)
+        data = ast.literal_eval(clean_text)
     except Exception as e:
         print(f"Error parsing detailed log: {e}")
         return
@@ -70,7 +76,6 @@ def plot_reward_components(detailed_path: Path, output_path: Path, core_name: st
         return
 
     ep = [x[0] for x in data]
-    r = [x[1] for x in data]
     mk_mean = [x[2] for x in data]
     mk_std = [x[3] for x in data]
     td_mean = [x[4] for x in data]
@@ -93,28 +98,47 @@ def plot_reward_components(detailed_path: Path, output_path: Path, core_name: st
     ax0_r.set_ylabel('Tardiness', color='orange')
     ax0_r.tick_params(axis='y', labelcolor='orange')
     
-    lns = ln1 + ln2
-    labs = [l.get_label() for l in lns]
-    axes[0].legend(lns, labs, loc='upper center')
+    lns0 = ln1 + ln2
+    labs0 = [l.get_label() for l in lns0]
+    axes[0].legend(lns0, labs0, loc='upper center')
 
-    # 2. Normalized Components (Single Axis, No Band)
-    axes[1].plot(ep, mk_mean, color='green', label='Mk Gain (Norm)')
-    axes[1].plot(ep, td_mean, color='red', label='Td Penalty (Norm)')
-    axes[1].set_ylabel('Normalized Reward')
-    axes[1].set_title('Reward Components (Learning Signal)')
-    axes[1].legend(loc='best')
+    # 2. Normalized Components (Dual Axis - FIXED SCALE)
+    axes[1].set_title('Reward Components (Learning Signal Breakdown)')
+    ln3 = axes[1].plot(ep, mk_mean, color='green', label='Mk Gain (Norm)')
+    axes[1].set_ylabel('Mk Gain Reward', color='green')
+    axes[1].tick_params(axis='y', labelcolor='green')
     axes[1].grid(True, alpha=0.3)
-    # Add zero line for reference
-    axes[1].axhline(0, color='black', linewidth=0.5, linestyle='--')
+    
+    ax1_r = axes[1].twinx()
+    ln4 = ax1_r.plot(ep, td_mean, color='red', label='Td Penalty (Norm)')
+    ax1_r.set_ylabel('Td Penalty Reward', color='red')
+    ax1_r.tick_params(axis='y', labelcolor='red')
+    
+    lns1 = ln3 + ln4
+    labs1 = [l.get_label() for l in lns1]
+    axes[1].legend(lns1, labs1, loc='upper center')
 
-    # 3. Components Std (Stability)
-    axes[2].plot(ep, mk_std, color='green', linestyle='--', label='Mk Std')
-    axes[2].plot(ep, td_std, color='red', linestyle='--', label='Td Std')
-    axes[2].set_ylabel('Standard Deviation')
-    axes[2].set_xlabel('Episodes')
+    # 3. Components Std (Dual Axis)
     axes[2].set_title('Reward Stability (Std Dev)')
-    axes[2].legend()
+    ln5 = axes[2].plot(ep, mk_std, color='green', linestyle='--', label='Mk Std')
+    axes[2].set_ylabel('Mk Std', color='green')
+    axes[2].tick_params(axis='y', labelcolor='green')
     axes[2].grid(True, alpha=0.3)
+    
+    ax2_r = axes[2].twinx()
+    ln6 = ax2_r.plot(ep, td_std, color='red', linestyle='--', label='Td Std')
+    ax2_r.set_ylabel('Td Std', color='red')
+    ax2_r.tick_params(axis='y', labelcolor='red')
+    
+    lns2 = ln5 + ln6
+    labs2 = [l.get_label() for l in lns2]
+    axes[2].legend(lns2, labs2, loc='upper center')
+    axes[2].set_xlabel('Episodes/Updates')
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"✅ Reward 組成分析圖已輸出：{output_path}")
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     fig.savefig(output_path, dpi=150)
@@ -325,6 +349,52 @@ def plot_comparison_analysis(log_dir: Path, output_path: Path, log_file_suffix: 
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
     print(f"✅ 比較分析圖已輸出：{output_path}")
+
+def plot_validation_breakdown(csv_path: Path, output_path: Path, core_name: str):
+    """
+    Reads valibreakdown_*.csv and plots 3 subplots for 10J, 20J, 30J.
+    """
+    if not csv_path.exists():
+        print(f"Breakdown CSV not found: {csv_path}")
+        return
+
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as e:
+        print(f"Error reading breakdown CSV: {e}")
+        return
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle(f"Validation Breakdown by Scale: {core_name}", fontsize=16)
+    
+    sizes = [10, 20, 30]
+    for i, n_j in enumerate(sizes):
+        ax = axes[i]
+        ms_col = f'ms_{n_j}j'
+        td_col = f'td_{n_j}j'
+        
+        if ms_col not in df.columns or td_col not in df.columns:
+            ax.set_title(f"{n_j} Jobs (Data Missing)")
+            continue
+
+        # Plot TD
+        ax.plot(df['update'], df[td_col], color='red', label='Tardiness')
+        ax.set_title(f'Scale: {n_j} Jobs')
+        ax.set_xlabel('Updates')
+        ax.set_ylabel('Mean Total Tardiness', color='red')
+        ax.tick_params(axis='y', labelcolor='red')
+        ax.grid(True, alpha=0.3)
+        
+        # Plot MS
+        ax2 = ax.twinx()
+        ax2.plot(df['update'], df[ms_col], color='blue', linestyle='--', label='Makespan')
+        ax2.set_ylabel('Mean Makespan', color='blue')
+        ax2.tick_params(axis='y', labelcolor='blue')
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"✅ 驗證細分趨勢圖已輸出：{output_path}")
 
 def main():
     # 1. Construct dynamic log name

@@ -77,9 +77,9 @@ parser.add_argument('--layer_fea_output_dim', nargs='+', type=int, default=[64, 
 
 # Actor-Critic Details
 parser.add_argument('--num_mlp_layers_actor', type=int, default=3, help='Number of layers in Actor network')
-parser.add_argument('--hidden_dim_actor', type=int, default=128, help='Hidden dimension of Actor network')
+parser.add_argument('--hidden_dim_actor', type=int, default=512, help='Hidden dimension of Actor network')
 parser.add_argument('--num_mlp_layers_critic', type=int, default=3, help='Number of layers in Critic network')
-parser.add_argument('--hidden_dim_critic', type=int, default=128, help='Hidden dimension of Critic network')
+parser.add_argument('--hidden_dim_critic', type=int, default=256, help='Hidden dimension of Critic network')
 
 
 # ============================
@@ -117,7 +117,7 @@ parser.add_argument('--test_mode', type=str2bool, default=False, help='Whether u
 parser.add_argument('--sample_times', type=int, default=100, help='Sampling times for the sampling strategy')
 parser.add_argument('--test_model', nargs='+', default=['curriculum_train_10x5+mix','curriculum_train_40x5+mix'], help='List of model for testing')
 parser.add_argument('--test_method', nargs='+', default=["MWKR"], help='List of heuristic methods for testing')
-parser.add_argument('--eval_model_name', type=str, default="new_state_setnjob_1000_5122_log_beta", help='用於儲存檔案的檔名')
+parser.add_argument('--eval_model_name', type=str, default="range2", help='用於儲存檔案的檔名')
 
 
 # ============================
@@ -148,7 +148,7 @@ parser.add_argument('--due_date_noise', type=float, default=0.0, help='Multiplic
 parser.add_argument('--scheduler_type', type=str, default='PPO', 
                     choices=['PPO', 'SPT', 'MWKR', 'FIFO', 'OR-Tools'],
                     help='Unified scheduling method used across all stages (Init, Dynamic, Flush)')
-parser.add_argument('--ppo_model_path', type=str, default=r'trained_network\SD2\curriculum.pth', help='PPO 權重檔 .pth 路徑')
+parser.add_argument('--ppo_model_path', type=str, default=r'trained_network\SD2\range1.pth', help='PPO 權重檔 .pth 路徑')
 parser.add_argument('--ppo_sample', type=str2bool, default=False, help='PPO 推論是否採用抽樣；False=貪婪/取最大機率')
 
 

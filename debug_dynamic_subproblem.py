@@ -57,7 +57,7 @@ def simulate_dynamic_subproblem():
     orig_due_dates = np.random.uniform(-due_range, due_range, n_j)
     # [FIXED] 基於生成後的固定值做 (x/2)+200 的移動
     due_dates_abs = (orig_due_dates / 8.0) + 300.0
-
+    due_dates_abs[3] = due_dates_abs[3] -500
     # Machine Free Time (MFT): Uniform(0, 100)
     mft_abs = np.random.uniform(0, 100, n_m)
 

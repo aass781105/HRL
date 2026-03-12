@@ -211,6 +211,14 @@ def generate_due_dates(job_length, op_pt, tightness=1.2, due_date_mode='k', seed
                 job_work[j] += np.mean(compat_pt)
             op_idx += 1
 
+    if due_date_mode == 'range':
+        # [NEW] Custom Range Mode: Uniform(-n_j*mean_pt, n_j*mean_pt)
+        # We calculate mean_pt from the global configs to stay consistent
+        from params import configs
+        mean_pt = (float(configs.low) + float(configs.high)) / 2.0
+        due_range = n_j * mean_pt
+        return rng.uniform(-due_range, due_range, size=n_j)
+
     if due_date_mode == 'M':
         total_work = np.sum(job_work)
         base = total_work / n_m
