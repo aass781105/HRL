@@ -107,15 +107,23 @@ class Trainer:
                 "stage_label": f"J{n_j}_Uniform_Range"
             }
 
-        # [REFACTORED] Curriculum Schedule: 10 -> 20 -> 30
-        # Increased multiplier from 9 to 25 for more training episodes
-        curriculum_schedule = [
-            create_stage(10, 5), # Stage 1: 10 Jobs
-            create_stage(15, 5), # Stage 2: 20 Jobs
-            create_stage(20, 5)  # Stage 3: 30 Jobs
-        ]
+        # [REFACTORED] Curriculum Schedules (Total 1500 Updates each)
+        if configs.schedule_type == 'same':
+            curriculum_schedule = [create_stage(10, 30)] # 50 * 30 = 1500
+        elif configs.schedule_type == 's3':
+            curriculum_schedule = [
+                create_stage(10, 5), # 250
+                create_stage(20, 5), # 500
+                create_stage(30, 5)  # 750
+            ] # Total 1500
+        else: # Default: s2 (10 -> 15 -> 20)
+            curriculum_schedule = [
+                create_stage(10, 5), # 250
+                create_stage(15, 5), # 375
+                create_stage(20, 8.75) # 437.5 * 2 = 875
+            ] # Total 1500
         
-        self.max_updates = sum(stage['duration'] for stage in curriculum_schedule)
+        self.max_updates = int(sum(stage['duration'] for stage in curriculum_schedule))
         
         current_stage_idx = 0
         current_cfg = curriculum_schedule[0]

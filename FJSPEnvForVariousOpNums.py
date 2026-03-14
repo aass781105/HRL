@@ -19,11 +19,12 @@ class EnvState:
     comp_idx_tensor: torch.Tensor = None
     candidate_tensor: torch.Tensor = None
     fea_pairs_tensor: torch.Tensor = None
+    fea_glo_tensor: torch.Tensor = None # [NEW]
 
     device = torch.device(configs.device)
 
     def update(self, fea_j, op_mask, fea_m, mch_mask, dynamic_pair_mask,
-               comp_idx, candidate, fea_pairs):
+               comp_idx, candidate, fea_pairs, fea_glo=None):
         """
             update the state information
         """
@@ -31,6 +32,8 @@ class EnvState:
         self.fea_j_tensor = torch.from_numpy(np.copy(fea_j)).float().to(device)
         self.fea_m_tensor = torch.from_numpy(np.copy(fea_m)).float().to(device)
         self.fea_pairs_tensor = torch.from_numpy(np.copy(fea_pairs)).float().to(device)
+        if fea_glo is not None:
+            self.fea_glo_tensor = torch.from_numpy(np.copy(fea_glo)).float().to(device)
 
         self.op_mask_tensor = torch.from_numpy(np.copy(op_mask)).to(device)
         self.candidate_tensor = torch.from_numpy(np.copy(candidate)).to(device)
@@ -663,31 +666,51 @@ class FJSPEnvForVariousOpNums:
         ), axis=2)
 
     def construct_mch_features(self):
-        # [NEW] Calculate Machine Tardiness Pressure
-        # Slack for candidate operations: [E, J]
-        # Using same logic as feat_slack in construct_op_features
+        # [NEW] Option B: Global Pressure via Machine Features
+        # Calculate Global Stats first
+        raw_slacks = self.raw_fea_j[:, :, 11]
+        mask_unscheduled = (self.op_scheduled_flag == 0) # [FIXED] Use op_scheduled_flag
+        
+        avg_slacks = []
+        std_slacks = []
+        for e in range(self.number_of_envs):
+            valid_s = raw_slacks[e][mask_unscheduled[e]]
+            if valid_s.size > 0:
+                mu = np.mean(valid_s)
+                std = np.std(valid_s)
+                avg_slacks.append(np.sign(mu) * np.log1p(np.abs(mu)))
+                std_slacks.append(np.log1p(std))
+            else:
+                avg_slacks.append(0.0); std_slacks.append(0.0)
+        
+        # Congestion
+        rem_ops_count = np.sum(mask_unscheduled, axis=1)
+        congestion = np.log1p(rem_ops_count / self.number_of_machines)
+        
+        # Broadcast global signals to all machines [E, M]
+        g0 = np.tile(np.array(avg_slacks)[:, np.newaxis], (1, self.number_of_machines))
+        g1 = np.tile(np.array(std_slacks)[:, np.newaxis], (1, self.number_of_machines))
+        g2 = np.tile(congestion[:, np.newaxis], (1, self.number_of_machines))
+
+        # [NEW] Calculate Machine Tardiness Pressure (Local context)
         cand_rem_time = (self.due_date - self.next_schedule_time[:, np.newaxis])
         cand_slack = cand_rem_time - self.op_match_job_remain_work[self.env_job_idx, self.candidate]
-        is_tardy_cand = (cand_slack < 0).astype(float) # [E, J]
-        
-        # Mask for valid (op, mch) pairs: [E, J, M]
+        is_tardy_cand = (cand_slack < 0).astype(float)
         valid_mask = ~self.dynamic_pair_mask
-        
-        # Count tardy ops per machine
-        tardy_counts = np.sum(is_tardy_cand[:, :, np.newaxis] * valid_mask, axis=1) # [E, M]
-        total_counts = np.sum(valid_mask, axis=1) # [E, M]
-        
+        tardy_counts = np.sum(is_tardy_cand[:, :, np.newaxis] * valid_mask, axis=1)
+        total_counts = np.sum(valid_mask, axis=1)
         mch_tardiness_pressure = tardy_counts / (total_counts + 1e-8)
 
+        # Assemble fea_m [E, M, 9]
+        # Dim 0-5: Traditional Mch Stats
+        # Dim 6-8: Global Compressed Pressure (PROTECTED FROM NORM)
         self.fea_m = np.stack((self.mch_current_available_jc_nums,
                                self.mch_current_available_op_nums,
                                self.mch_min_pt,
                                self.mch_mean_pt,
                                self.mch_waiting_time,
-                               self.mch_remain_work,
-                               self.mch_free_time,
-                               self.mch_working_flag,
-                               mch_tardiness_pressure), axis=2)
+                               mch_tardiness_pressure, # Moved local pressure to dim 5
+                               g0, g1, g2), axis=2)
 
         self.norm_machine_features()
 
@@ -695,18 +718,22 @@ class FJSPEnvForVariousOpNums:
         self.fea_m[self.delete_mask_fea_m] = 0
         num_delete_mchs = np.count_nonzero(self.delete_mask_fea_m[:, :, 0], axis=1)
         num_delete_mchs = num_delete_mchs[:, np.newaxis]
-        num_left_mchs = self.number_of_machines - num_delete_mchs
+        num_left_mchs = np.maximum(self.number_of_machines - num_delete_mchs, 1e-8)
 
-        num_left_mchs = np.maximum(num_left_mchs, 1e-8)
+        # [UPDATED] Protect Global Signals (Index 6, 7, 8) from Z-Score
+        fea_to_norm = self.fea_m[:, :, 0:6]
+        fea_keep_raw = self.fea_m[:, :, 6:9]
 
-        mean_fea_m = np.sum(self.fea_m, axis=1) / num_left_mchs
-
-        temp = np.where(self.delete_mask_fea_m, mean_fea_m[:, np.newaxis, :], self.fea_m)
+        mean_fea_m = np.sum(fea_to_norm, axis=1) / num_left_mchs
+        temp = np.where(self.delete_mask_fea_m[:, :, 0:6], mean_fea_m[:, np.newaxis, :], fea_to_norm)
+        
         var_fea_m = np.var(temp, axis=1)
-
         std_fea_m = np.sqrt(var_fea_m * self.number_of_machines / num_left_mchs)
 
-        self.fea_m = ((temp - mean_fea_m[:, np.newaxis, :]) / (std_fea_m[:, np.newaxis, :] + 1e-8))
+        fea_normalized = ((temp - mean_fea_m[:, np.newaxis, :]) / (std_fea_m[:, np.newaxis, :] + 1e-8))
+        
+        # Concatenate back: [Normed(0-5), Raw(6-8)]
+        self.fea_m = np.concatenate((fea_normalized, fea_keep_raw), axis=2)
 
     def construct_pair_features(self):
 

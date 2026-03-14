@@ -1,0 +1,4 @@
+schedule_type: s3
+seed_train: 2
+eval_model_name: s3_seed2_1500
+ppo_model_path: trained_network/SD2/s3_seed2_1500.pth

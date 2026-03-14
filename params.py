@@ -117,7 +117,7 @@ parser.add_argument('--test_mode', type=str2bool, default=False, help='Whether u
 parser.add_argument('--sample_times', type=int, default=100, help='Sampling times for the sampling strategy')
 parser.add_argument('--test_model', nargs='+', default=['curriculum_train_10x5+mix','curriculum_train_40x5+mix'], help='List of model for testing')
 parser.add_argument('--test_method', nargs='+', default=["MWKR"], help='List of heuristic methods for testing')
-parser.add_argument('--eval_model_name', type=str, default="range2", help='用於儲存檔案的檔名')
+parser.add_argument('--eval_model_name', type=str, default="new", help='用於儲存檔案的檔名')
 
 
 # ============================
@@ -129,14 +129,14 @@ parser.add_argument('--init_jobs', type=int, default= 10, help='初始工單數'
 parser.add_argument('--burst_size', type=int, default=1, help='每次生成工單數')
 parser.add_argument('--event_seed', type=int, default=42, help='事件驅動到達過程的亂數種子（Exponential 間隔）')
 parser.add_argument('--episode_seed_base', type=int, default=12345, help='episode 級別的基種子；每個 episode 以此為基準派生子亂數流')
-parser.add_argument('--fast_mode', type=str2bool, default=True, help='是否開啟高速模式（跳過甘特圖與詳細 CSV 生成）')
+parser.add_argument('--fast_mode', type=str2bool, default=False, help='是否開啟高速模式（跳過甘特圖與詳細 CSV 生成）')
 
 # ============================
 # Curriculum Learning Specifics
 # ============================
 parser.add_argument('--curriculum_cycle', type=int, default=250, help='Updates per curriculum stage')
 parser.add_argument('--tardiness_dilution_power', type=float, default=1, help='Beta factor for tardiness dilution')
-parser.add_argument('--schedule_type', type=str, default='deep_dive', choices=['standard', 'deep_dive', 'alt', 'same'], help='Type of curriculum schedule to use')
+parser.add_argument('--schedule_type', type=str, default='s2', choices=['s2', 's3', 'same'], help='Type of curriculum schedule to use')
 parser.add_argument('--due_date_mode', type=str, default='k', choices=['k', 'M'], help='Due date generation mode: k (Individual) or M (Common). Note: M is used primarily in static curriculum.')
 parser.add_argument('--m_value', type=float, default=0.6, help='M-value used for Common Due Date (Static Curriculum Only)')
 parser.add_argument('--due_date_tightness', type=float, default=1.2, help='Tightness base factor (k). Current logic uses U[1.2, 2.0] for individual due dates.')
@@ -148,25 +148,25 @@ parser.add_argument('--due_date_noise', type=float, default=0.0, help='Multiplic
 parser.add_argument('--scheduler_type', type=str, default='PPO', 
                     choices=['PPO', 'SPT', 'MWKR', 'FIFO', 'OR-Tools'],
                     help='Unified scheduling method used across all stages (Init, Dynamic, Flush)')
-parser.add_argument('--ppo_model_path', type=str, default=r'trained_network\SD2\range1.pth', help='PPO 權重檔 .pth 路徑')
+parser.add_argument('--ppo_model_path', type=str, default=r'trained_network\SD2\same.pth', help='PPO 權重檔 .pth 路徑')
 parser.add_argument('--ppo_sample', type=str2bool, default=False, help='PPO 推論是否採用抽樣；False=貪婪/取最大機率')
 
 
 # ============================
 # DDQN Gate Policy & Training
 # ============================
-parser.add_argument('--gate_policy', type=str, default='cadence',
+parser.add_argument('--gate_policy', type=str, default='ddqn',
                     choices=['ddqn', 'cadence'],
                     help='Gate 策略：ddqn=用模型；cadence=按固定事件步長釋放 (cadence=1 等同於 Always)')
 parser.add_argument('--gate_cadence', type=int, default=1, help='當 gate_policy=cadence 時，每隔幾個到達事件釋放一次緩衝區')
 parser.add_argument('--eval_action_selection', type=str, default='greedy',
                     choices=['sample', 'greedy'],
                     help='sample or greedy')
-parser.add_argument('--ddqn_model_path', type=str, default=r"ddqn_ckpt\stab_05_256_4.pth", help='DDQN 推論權重路徑（.pth）')
-parser.add_argument('--ddqn_name', type=str, default='stab_05_256_4', help='DDQN 訓練存檔名稱 (不含 .pth)')
+parser.add_argument('--ddqn_model_path', type=str, default=r"ddqn_ckpt\stab_05_256_3.pth", help='DDQN 推論權重路徑（.pth）')
+parser.add_argument('--ddqn_name', type=str, default='stab_05_256_3', help='DDQN 訓練存檔名稱 (不含 .pth)')
 
 # DDQN Training Hyperparameters
-parser.add_argument('--ddqn_num_layers', type=int, default=4, help='Number of hidden layers in DDQN')
+parser.add_argument('--ddqn_num_layers', type=int, default=3, help='Number of hidden layers in DDQN')
 parser.add_argument('--ddqn_hidden_dim', type=int, default=256, help='Hidden dimension of DDQN network')
 parser.add_argument('--ddqn_episodes', type=int, default=100, help='DDQN 訓練集 episode 數')
 parser.add_argument('--ddqn_lr', type=float, default=5e-5, help='DDQN 學習率')
@@ -175,7 +175,7 @@ parser.add_argument('--ddqn_eps_start', type=float, default=0.8, help='ε-greedy
 parser.add_argument('--ddqn_eps_end', type=float, default=0.05, help='ε-greedy 最小 ε')
 parser.add_argument('--ddqn_eps_decay_episodes', type=int, default=70, help='ε 從起始到終值的衰減 episode 數')
 parser.add_argument('--ddqn_batch_size', type=int, default=1024, help='DDQN 更新時的 minibatch 大小')
-parser.add_argument('--ddqn_buffer_capacity', type=int, default=5_000, help='Replay buffer 容量')
+parser.add_argument('--ddqn_buffer_capacity', type=int, default=10_000, help='Replay buffer 容量')
 parser.add_argument('--ddqn_target_tau', type=float, default=0.005, help='目標網路軟更新係數 τ')
 parser.add_argument('--ddqn_seed', type=int, default=42, help='DDQN 訓練隨機種子（與事件種子獨立）')
 parser.add_argument('--ddqn_validate_every', type=int, default=10, help='每多少個 episodes 做一次驗證（greedy）')

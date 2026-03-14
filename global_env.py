@@ -340,7 +340,8 @@ class GlobalTimelineOrchestrator:
         due_dates_abs = [float(j.meta.get("due_date", 0.0)) for j in jobs_new]
         
         # [MOD] normalize_due_date=False to avoid double scaling!
-        state = env.set_initial_data(jl, pt, due_date_list=due_dates_ppo, normalize_due_date=False, true_due_date_list=due_dates_abs)
+        # [FIX] Ensure due_date_list is wrapped in a list to match [Env, Job] structure
+        state = env.set_initial_data(jl, pt, due_date_list=[due_dates_ppo], normalize_due_date=False, true_due_date_list=[due_dates_abs])
         
         env.true_mch_free_time[0,:] = self.machine_free_time; env.mch_free_time[0,:] = norm.f(self.machine_free_time)
         for i, js_b in enumerate(jobs_new):

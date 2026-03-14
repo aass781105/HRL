@@ -196,8 +196,8 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
 
     final_stats = orch.get_final_kpi_stats(all_job_due_dates); total_td, final_mk = final_stats["tardiness"], final_stats["makespan"]
     
-    # [STATS PLOT] Draw boxplots at the end
-    plot_simulation_summary_stats(all_sim_job_stats, csv_dir)
+    # [DISABLED] Skip summary boxplots
+    # plot_simulation_summary_stats(all_sim_job_stats, csv_dir)
 
     if is_ddqn:
         shadow_final = shadow_orch.get_final_kpi_stats(all_job_due_dates)

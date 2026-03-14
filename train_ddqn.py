@@ -39,19 +39,19 @@ class ReplayBuffer:
         return len(self.buf)
 
 def train_ddqn(
-    episodes: int = 200,
-    event_horizon: int = 200,
-    interarrival_mean: float = 0.1,
-    burst_K: int = 10,
-    lr: float = 1e-3,
-    gamma: float = 0.99,
-    eps_start: float = 0.2,
-    eps_end: float = 0.01,
-    eps_decay_episodes: int = 150,
-    batch_size: int = 128,
-    buffer_capacity: int = 100_000,
-    target_tau: float = 0.005,
-    seed: int = 42,
+    episodes: int = configs.ddqn_episodes,
+    event_horizon: int = int(configs.event_horizon),
+    interarrival_mean: float = configs.interarrival_mean,
+    burst_K: int = configs.burst_size,
+    lr: float = configs.ddqn_lr,
+    gamma: float = configs.ddqn_gamma,
+    eps_start: float = configs.ddqn_eps_start,
+    eps_end: float = configs.ddqn_eps_end,
+    eps_decay_episodes: int = configs.ddqn_eps_decay_episodes,
+    batch_size: int = configs.ddqn_batch_size,
+    buffer_capacity: int = configs.ddqn_buffer_capacity,
+    target_tau: float = configs.ddqn_target_tau,
+    seed: int = int(getattr(configs, "event_seed", 42)),
     num_envs: int = configs.ddqn_num_envs
 ):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
