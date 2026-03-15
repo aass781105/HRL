@@ -132,6 +132,49 @@ class DANIEL(nn.Module):
         self.critic = Critic(config.num_mlp_layers_critic, 2 * self.embedding_output_dim, config.hidden_dim_critic,
                              1).to(device)
 
+    def _compute_policy_features(self, fea_j, op_mask, candidate, fea_m, mch_mask, comp_idx, fea_pairs):
+        fea_j, fea_m, fea_j_global, fea_m_global = self.feature_exact(fea_j, op_mask, candidate, fea_m, mch_mask,
+                                                                      comp_idx)
+        sz_b = fea_j.size(0)
+        M = fea_m.size(1)
+        J = candidate.size(1)
+        d = fea_j.size(-1)
+
+        candidate_idx = candidate.unsqueeze(-1).repeat(1, 1, d)
+        candidate_idx = candidate_idx.type(torch.int64)
+
+        fea_j_jc = torch.gather(fea_j, 1, candidate_idx)
+
+        fea_j_jc_serialized = fea_j_jc.unsqueeze(2).repeat(1, 1, M, 1).reshape(sz_b, M * J, d)
+        fea_m_serialized = fea_m.unsqueeze(1).repeat(1, J, 1, 1).reshape(sz_b, M * J, d)
+
+        fea_gj_input = fea_j_global.unsqueeze(1).expand_as(fea_j_jc_serialized)
+        fea_gm_input = fea_m_global.unsqueeze(1).expand_as(fea_j_jc_serialized)
+
+        fea_pairs = fea_pairs.reshape(sz_b, -1, self.pair_input_dim)
+        candidate_feature = torch.cat((fea_j_jc_serialized, fea_m_serialized, fea_gj_input,
+                                       fea_gm_input, fea_pairs), dim=-1)
+        global_feature = torch.cat((fea_j_global, fea_m_global), dim=-1)
+        return candidate_feature, global_feature
+
+    def policy_only(self, fea_j, op_mask, candidate, fea_m, mch_mask, comp_idx, dynamic_pair_mask, fea_pairs):
+        candidate_feature, _ = self._compute_policy_features(
+            fea_j, op_mask, candidate, fea_m, mch_mask, comp_idx, fea_pairs
+        )
+        sz_b = candidate.size(0)
+        candidate_scores = self.actor(candidate_feature).squeeze(-1)
+        mask_flat = dynamic_pair_mask.reshape(sz_b, -1)
+        if mask_flat.all(dim=1).any():
+            bad_idx = torch.where(mask_flat.all(dim=1))[0][:8].detach().cpu().tolist()
+            raise RuntimeError(f"policy_only received all-masked action rows at batch indices {bad_idx}")
+        if torch.isnan(candidate_scores).any():
+            raise RuntimeError("policy_only produced NaN candidate_scores before masking")
+        candidate_scores = candidate_scores.masked_fill(mask_flat, float('-inf'))
+        pi = F.softmax(candidate_scores, dim=1)
+        if torch.isnan(pi).any():
+            raise RuntimeError("policy_only produced NaN probabilities after softmax")
+        return pi
+
     def forward(self, fea_j, op_mask, candidate, fea_m, mch_mask, comp_idx, dynamic_pair_mask, fea_pairs):
         """
         :param candidate: the index of candidate operations with shape [sz_b, J]
@@ -150,36 +193,22 @@ class DANIEL(nn.Module):
             pi: scheduling policy with shape [sz_b, J*M]
             v: the value of state with shape [sz_b, 1]
         """
-
-        fea_j, fea_m, fea_j_global, fea_m_global = self.feature_exact(fea_j, op_mask, candidate, fea_m, mch_mask,
-                                                                      comp_idx)
-        sz_b, M, _, J = comp_idx.size()
-        d = fea_j.size(-1)
-
-        # collect the input of decision-making network
-        candidate_idx = candidate.unsqueeze(-1).repeat(1, 1, d)
-        candidate_idx = candidate_idx.type(torch.int64)
-
-        Fea_j_JC = torch.gather(fea_j, 1, candidate_idx)
-
-        Fea_j_JC_serialized = Fea_j_JC.unsqueeze(2).repeat(1, 1, M, 1).reshape(sz_b, M * J, d)
-        Fea_m_serialized = fea_m.unsqueeze(1).repeat(1, J, 1, 1).reshape(sz_b, M * J, d)
-
-        Fea_Gj_input = fea_j_global.unsqueeze(1).expand_as(Fea_j_JC_serialized)
-        Fea_Gm_input = fea_m_global.unsqueeze(1).expand_as(Fea_j_JC_serialized)
-
-        fea_pairs = fea_pairs.reshape(sz_b, -1, self.pair_input_dim)
-        # candidate_feature.shape = [sz_b, J*M, 4*output_dim + 8]
-        candidate_feature = torch.cat((Fea_j_JC_serialized, Fea_m_serialized, Fea_Gj_input,
-                                       Fea_Gm_input, fea_pairs), dim=-1)
-
-        candidate_scores = self.actor(candidate_feature)
-        candidate_scores = candidate_scores.squeeze(-1)
-
-        # masking incompatible op-mch pairs
-        candidate_scores[dynamic_pair_mask.reshape(sz_b, -1)] = float('-inf')
+        candidate_feature, global_feature = self._compute_policy_features(
+            fea_j, op_mask, candidate, fea_m, mch_mask, comp_idx, fea_pairs
+        )
+        sz_b = candidate.size(0)
+        candidate_scores = self.actor(candidate_feature).squeeze(-1)
+        mask_flat = dynamic_pair_mask.reshape(sz_b, -1)
+        if mask_flat.all(dim=1).any():
+            bad_idx = torch.where(mask_flat.all(dim=1))[0][:8].detach().cpu().tolist()
+            raise RuntimeError(f"forward received all-masked action rows at batch indices {bad_idx}")
+        if torch.isnan(candidate_scores).any():
+            raise RuntimeError("forward produced NaN candidate_scores before masking")
+        candidate_scores = candidate_scores.masked_fill(mask_flat, float('-inf'))
         pi = F.softmax(candidate_scores, dim=1)
-
-        global_feature = torch.cat((fea_j_global, fea_m_global), dim=-1)
+        if torch.isnan(pi).any():
+            raise RuntimeError("forward produced NaN probabilities after softmax")
         v = self.critic(global_feature)
+        if torch.isnan(v).any():
+            raise RuntimeError("forward produced NaN critic values")
         return pi, v

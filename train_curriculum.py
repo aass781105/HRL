@@ -174,19 +174,42 @@ class Trainer:
             while True:
                 self.memory.push(state)
                 with torch.no_grad():
-                    pi_envs, vals_envs = self.ppo.policy_old(fea_j=state.fea_j_tensor, op_mask=state.op_mask_tensor, candidate=state.candidate_tensor,
-                                                             fea_m=state.fea_m_tensor, mch_mask=state.mch_mask_tensor, comp_idx=state.comp_idx_tensor,
-                                                             dynamic_pair_mask=state.dynamic_pair_mask_tensor, fea_pairs=state.fea_pairs_tensor)
-                action_envs, action_logprob_envs = sample_action(pi_envs)
-                state, reward, done, info = self.env.step(actions=action_envs.cpu().numpy())
+                    batch_idx = ~torch.from_numpy(self.env.done_flag).to(state.fea_j_tensor.device)
+                    valid_action_counts = (~state.dynamic_pair_mask_tensor.reshape(state.dynamic_pair_mask_tensor.size(0), -1)).sum(dim=1)
+                    if (valid_action_counts[batch_idx] == 0).any():
+                        bad_local = torch.where(valid_action_counts[batch_idx] == 0)[0]
+                        bad_global = torch.where(batch_idx)[0][bad_local].detach().cpu().tolist()
+                        raise RuntimeError(
+                            "rollout encountered all-masked rows before policy_old: "
+                            f"env_idx={bad_global}, "
+                            f"done_flag={self.env.done_flag[bad_global].tolist()}, "
+                            f"unscheduled_op_nums={self.env.unscheduled_op_nums[bad_global].tolist()}, "
+                            f"candidate={self.env.candidate[bad_global].tolist()}, "
+                            f"valid_action_counts={valid_action_counts[bad_global].detach().cpu().tolist()}"
+                        )
+                    pi_valid, vals_valid = self.ppo.policy_old(
+                        fea_j=state.fea_j_tensor[batch_idx], op_mask=state.op_mask_tensor[batch_idx], candidate=state.candidate_tensor[batch_idx],
+                        fea_m=state.fea_m_tensor[batch_idx], mch_mask=state.mch_mask_tensor[batch_idx], comp_idx=state.comp_idx_tensor[batch_idx],
+                        dynamic_pair_mask=state.dynamic_pair_mask_tensor[batch_idx], fea_pairs=state.fea_pairs_tensor[batch_idx]
+                    )
+                action_valid, action_logprob_valid = sample_action(pi_valid)
+
+                full_actions = torch.zeros((self.num_envs, 1), dtype=action_valid.dtype, device=action_valid.device)
+                full_logprobs = torch.zeros((self.num_envs, 1), dtype=action_logprob_valid.dtype, device=action_logprob_valid.device)
+                full_vals = torch.zeros((self.num_envs, 1), dtype=vals_valid.dtype, device=vals_valid.device)
+                full_actions[batch_idx] = action_valid
+                full_logprobs[batch_idx] = action_logprob_valid
+                full_vals[batch_idx] = vals_valid
+
+                state, reward, done, info = self.env.step(actions=full_actions.cpu().numpy())
                 ep_mk_gain += np.mean(info['reward_mk']); ep_td_penalty += np.mean(info['reward_td'])
                 all_mk_rewards.extend(info['reward_mk'].flatten()); all_td_rewards.extend(info['reward_td'].flatten())
                 ep_rewards += reward
                 self.memory.done_seq.append(torch.from_numpy(done).to(device))
                 self.memory.reward_seq.append(torch.from_numpy(reward).to(device))
-                self.memory.action_seq.append(action_envs.squeeze(-1))
-                self.memory.log_probs.append(action_logprob_envs.squeeze(-1))
-                self.memory.val_seq.append(vals_envs.squeeze(1))
+                self.memory.action_seq.append(full_actions.squeeze(-1))
+                self.memory.log_probs.append(full_logprobs.squeeze(-1))
+                self.memory.val_seq.append(full_vals.squeeze(1))
                 if done.all(): break
 
             loss, v_loss, p_loss = self.ppo.update(self.memory)

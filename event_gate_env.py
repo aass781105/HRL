@@ -30,7 +30,6 @@ class EventGateEnv(gym.Env):
         self.reward_base_scale = self.mean_pt
         self.gen = None
         self.orch = None
-        self.shadow_orch = None # [NEW] Counterfactual baseline
         self.t_now = 0.0
         self.events_done = 0
         self.episode_tardiness = 0.0
@@ -40,13 +39,13 @@ class EventGateEnv(gym.Env):
         self.action_space = spaces.Discrete(2)
 
     def _observe(self) -> np.ndarray:
-        mft_abs = np.asarray(self.orch.machine_free_time, dtype=float)
-        rem = np.maximum(0.0, mft_abs - float(self.t_now)); mx_l = np.max(rem)
-        w_idle = self.orch.compute_weighted_idle(float(self.t_now), mx_l)
-        u_idle = self.orch.compute_unweighted_idle(float(self.t_now), mx_l)
-        buf_stats = self._get_buffer_stats(float(self.t_now))
-        wip_stats = self.orch.get_wip_stats(float(self.t_now))
-        return calculate_ddqn_state(len(self.orch.buffer), self.orch.machine_free_time, float(self.t_now), self.M, 0, self.time_scale, w_idle, u_idle, buf_stats, wip_stats)
+        t_now = self.t_now
+        rem = np.maximum(0.0, self.orch.machine_free_time - t_now)
+        mx_l = np.max(rem)
+        w_idle, u_idle = self.orch.compute_idle_stats(t_now, mx_l)
+        buf_stats = self._get_buffer_stats(t_now)
+        wip_stats = self.orch.get_wip_stats(t_now)
+        return calculate_ddqn_state(len(self.orch.buffer), self.orch.machine_free_time, t_now, self.M, 0, self.time_scale, w_idle, u_idle, buf_stats, wip_stats)
 
     def _get_buffer_stats(self, t_now: float):
         if not self.orch.buffer: return {"tardiness_ratio": 0.0, "min_slack": 0.0, "avg_slack": 0.0, "slack_std": 0.0}
@@ -85,8 +84,6 @@ class EventGateEnv(gym.Env):
             for j in init_jobs: self.all_job_due_dates[j.job_id] = j.meta["due_date"]
             self.orch.buffer.extend(init_jobs); self.gen.bump_next_id(max((j.job_id for j in init_jobs)) + 1); self.orch.event_release_and_reschedule(0.0); self.release_count += 1
         
-        # [NEW] Initialize shadow simulator as a clone of actual
-        self.shadow_orch = self.orch.clone()
         return self._observe(), {"t_now": 0.0, "instance_seed": instance_seed}
 
     def step(self, action: int):
@@ -96,35 +93,28 @@ class EventGateEnv(gym.Env):
             for j in new_jobs: 
                 self.all_job_due_dates[j.job_id] = j.meta["due_date"]
             self.orch.buffer.extend(new_jobs)
-            self.shadow_orch.buffer.extend(copy.deepcopy(new_jobs)) # Shared arrival sequence
             
         t_next = float(self.gen.sample_next_time(t_event))
         dt = t_next - t_event
         
-        # [SHADOW ALWAYS RELEASES]
-        # In the shadow world, we always release whenever a burst arrives
-        self.shadow_orch.event_release_and_reschedule(t_event)
+        old_actual_td = self.orch.get_total_tardiness_estimate()
         
         r_rel_component = 0.0
         if int(action) == 1:
-            # [ACTION 1: DECISION POINT COMPARISON]
+            # [ACTION 1: RELEASE]
             self.orch.event_release_and_reschedule(t_event)
             self.release_count += 1
             
-            actual_td = self.orch.get_total_tardiness_estimate()
-            shadow_td = self.shadow_orch.get_total_tardiness_estimate()
+            new_actual_td = self.orch.get_total_tardiness_estimate()
             
-            # Reward = -(Actual - Shadow) * Coef
-            r_rel_raw = -((actual_td - shadow_td) * float(configs.release_penalty_coef)) / self.time_scale
+            # Incremental Reward = -(NewTD - OldTD) * Coef
+            r_rel_raw = -((new_actual_td - old_actual_td) * float(configs.release_penalty_coef)) / self.time_scale
             # [LOG COMPRESSION] Reduce variance while keeping the signal direction
             r_rel_component = float(np.sign(r_rel_raw) * np.log1p(np.abs(r_rel_raw)))
-            
-            # [SYNC] Reset shadow to current actual state for the next cycle
-            self.shadow_orch = self.orch.clone()
         else:
             # [ACTION 0: WAIT]
             self.orch.tick_without_release(t_event)
-            r_rel_component = 0.0 # No release reward during wait (Option A)
+            r_rel_component = 0.0
 
         # Common rewards (Idle, Buffer, Stability)
         met = self.orch.compute_interval_metrics(t_event, t_next); scale = self.time_scale
@@ -142,21 +132,19 @@ class EventGateEnv(gym.Env):
         ep_mk = 0.0
         if done:
             while len(self.orch.buffer) > 0: self.orch.event_release_and_reschedule(self.t_now); self.release_count += 1
-            # [MOD] Also flush the shadow world to get a fair comparison
-            while len(self.shadow_orch.buffer) > 0: self.shadow_orch.event_release_and_reschedule(self.t_now)
             
             final = self.orch.get_final_kpi_stats(self.all_job_due_dates)
-            shadow_final = self.shadow_orch.get_final_kpi_stats(self.all_job_due_dates)
-            
             self.episode_tardiness = final["tardiness"]
             ep_mk = final["makespan"]
-            shadow_mk = shadow_final["makespan"]
             
-            # [MOD] Relative Makespan Penalty: Compares actual decision against 'Always Release' benchmark
-            mk_diff = ep_mk - shadow_mk
-            r_flush = (-mk_diff / scale * float(configs.flush_penalty_coef))
+            # [MOD] Final Makespan Penalty (Simplified without shadow comparison)
+            r_flush = -(ep_mk / scale * float(configs.flush_penalty_coef)) * 0.1 # Heavily discounted
             reward += r_flush
 
+        # [TIMING] Collect aggregated timings from the orchestrator
+        # These were accumulated during solve_current_batch_static
+        bt = getattr(self.orch, "_last_batch_timings", {})
+        
         info = {
             "episode_tardiness": self.episode_tardiness, 
             "episode_makespan": ep_mk,
@@ -165,6 +153,17 @@ class EventGateEnv(gym.Env):
             "reward_buffer_penalty": r_buf, 
             "reward_release_penalty": r_rel_component, 
             "reward_stability_penalty": r_stab, 
-            "reward_final_flush_penalty": r_flush
+            "reward_final_flush_penalty": r_flush,
+            
+            # [PPO TIMING] Only relevant if a release happened (action == 1)
+            "t_ac_fwd": bt.get("t_fwd", 0.0) if action==1 else 0.0,
+            "t_ac_prep": bt.get("t_prep", 0.0) if action==1 else 0.0,
+            "t_ac_f_op": bt.get("t_f_op", 0.0) if action==1 else 0.0,
+            "t_ac_f_mch": bt.get("t_f_mch", 0.0) if action==1 else 0.0,
+            "t_ac_f_pair": bt.get("t_f_pair", 0.0) if action==1 else 0.0,
+            "t_ac_state_upd": bt.get("t_upd", 0.0) if action==1 else 0.0
         }
+        # Clear timings for the next step
+        if hasattr(self.orch, "_last_batch_timings"): self.orch._last_batch_timings = {}
+        
         return self._observe(), float(reward), done, False, info

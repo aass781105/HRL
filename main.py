@@ -47,7 +47,6 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
     
     gate_policy = str(getattr(configs, "gate_policy", "ddqn")).lower()
     is_ddqn = (gate_policy == "ddqn")
-    shadow_orch = None
 
     all_job_due_dates: Dict[int, float] = {}
     mean_pt = (float(configs.low) + float(configs.high)) / 2.0
@@ -84,7 +83,7 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
     csv_file = open(os.path.join(csv_dir, f"log_{suffix}.csv"), "w", newline="", encoding="utf-8")
     csv_writer = csv.writer(csv_file)
     
-    csv_headers = ["Event_ID", "Time", "Inter_Arrival", "Action", "Action_Str", "Buffer_Count", "Avg_Load", "Min_Load", "Max_Load", "Load_Std", "Weighted_Idle", "Unweighted_Idle", "Buf_NegSlack_Ratio", "Buf_Min_Slack", "Buf_Avg_Slack", "Buf_Slack_Std", "WIP_Job_Count", "WIP_Tardy_Ratio", "WIP_Min_Slack", "WIP_Avg_Slack", "WIP_Slack_Std", "WIP_Planned_TD", "WIP_Theoretical_TD", "Batch_Jobs", "Batch_Ops", "Actual_TD", "Shadow_TD", "History_Tardiness", "Reward_Total", "Reward_Idle", "Reward_Stab", "Reward_Buffer", "Reward_Release", "Reward_Flush", "Final_Makespan", "Final_Tardiness", "Release_Count"]
+    csv_headers = ["Event_ID", "Time", "Inter_Arrival", "Action", "Action_Str", "Buffer_Count", "Avg_Load", "Min_Load", "Max_Load", "Load_Std", "Weighted_Idle", "Unweighted_Idle", "Buf_NegSlack_Ratio", "Buf_Min_Slack", "Buf_Avg_Slack", "Buf_Slack_Std", "WIP_Job_Count", "WIP_Tardy_Ratio", "WIP_Min_Slack", "WIP_Avg_Slack", "WIP_Slack_Std", "WIP_Planned_TD", "WIP_Theoretical_TD", "Batch_Jobs", "Batch_Ops", "Actual_TD", "History_Tardiness", "Reward_Total", "Reward_Idle", "Reward_Stab", "Reward_Buffer", "Reward_Release", "Reward_Flush", "Final_Makespan", "Final_Tardiness", "Release_Count"]
     csv_writer.writerow(csv_headers)
 
     release_count, t_prev_reward, last_act, last_advantage_td, plot_seq = 0, 0.0, None, 0.0, 0
@@ -125,7 +124,6 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
         for j in init_jobs: all_job_due_dates[j.job_id] = j.meta["due_date"]
         orch.buffer.extend(init_jobs); gen.bump_next_id(max((j.job_id for j in init_jobs)) + 1); orch.event_release_and_reschedule(0.0); release_count += 1
         collect_subproblem_stats(orch._committed_jobs, 0.0) # [STATS: INITIAL SUBPROBLEM]
-        if is_ddqn: shadow_orch = orch.clone()
         raw_s0 = get_raw_state_info(orch, 0.0); last_act = 1
         pending_row_base = [0, "0.00", "0.00", 1, "RELEASE"] + raw_s0 + [len(set(r['job'] for r in orch._last_full_rows)), len(orch._last_full_rows), "0.00", "0.00", "0.00"]
         if not FAST_MODE:
@@ -137,16 +135,16 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
     while stats["arrive"] < int(max_events):
         t_now = float(t_next); inter_arrival = t_now - t_prev
         if last_act is not None and pending_row_base:
-            if is_ddqn:
-                metrics = orch.compute_interval_metrics(t_prev_reward, t_now); scale = reward_scale
-                r_idle = -(metrics["total_idle"] * float(configs.idle_penalty_coef)) / scale
-                r_stab = -float(last_act) * stability_scale; dt = t_now - t_prev_reward
-                r_buf = -(len(orch.buffer) * dt * buffer_penalty_coef) / scale
-                r_rel_raw = -(last_advantage_td * release_penalty_coef) / scale
-                r_rel_treated = float(np.sign(r_rel_raw) * np.log1p(np.abs(r_rel_raw)))
-                if r_rel_treated > 0: r_rel_treated *= 0.5
-                step_reward = r_idle + r_stab + r_buf + r_rel_treated
-            else: r_idle = r_stab = r_buf = r_rel_treated = step_reward = 0.0
+            metrics = orch.compute_interval_metrics(t_prev_reward, t_now); scale = reward_scale
+            r_idle = -(metrics["total_idle"] * float(configs.idle_penalty_coef)) / scale
+            r_stab = -float(last_act) * stability_scale
+            dt = t_now - t_prev_reward
+            r_buf = -(len(orch.buffer) * dt * buffer_penalty_coef) / scale
+            r_rel_raw = -(last_advantage_td * release_penalty_coef) / scale
+            r_rel_treated = float(np.sign(r_rel_raw) * np.log1p(np.abs(r_rel_raw)))
+            if r_rel_treated > 0:
+                r_rel_treated *= 0.5
+            step_reward = r_idle + r_stab + r_buf + r_rel_treated
             total_cumulative_reward += step_reward
             csv_writer.writerow(pending_row_base + [f"{step_reward:.4f}", f"{r_idle:.4f}", f"{r_stab:.4f}", f"{r_buf:.4f}", f"{r_rel_treated:.4f}", "0.0000", release_count])
             t_prev_reward = t_now
@@ -155,10 +153,8 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
         if new_jobs:
             for j in new_jobs: all_job_due_dates[j.job_id] = j.meta["due_date"]
             orch.buffer.extend(new_jobs)
-            if is_ddqn: shadow_orch.buffer.extend(copy.deepcopy(new_jobs))
             stats["arrive"] += 1
         
-        if is_ddqn: shadow_orch.event_release_and_reschedule(t_now)
         raw_s = get_raw_state_info(orch, t_now); b_dict = {"tardiness_ratio": raw_s[7], "min_slack": raw_s[8], "avg_slack": raw_s[9], "slack_std": raw_s[10]}; w_dict = {"wip_count": raw_s[11], "wip_tardy_ratio": raw_s[12], "wip_min_slack": raw_s[13], "wip_avg_slack": raw_s[14], "wip_slack_std": raw_s[15], "planned_td": raw_s[16], "theoretical_td": raw_s[17]}
         if is_ddqn:
             obs = calculate_ddqn_state(len(orch.buffer), orch.machine_free_time, t_now, configs.n_m, 0, reward_scale, raw_s[5], raw_s[6], b_dict, w_dict)
@@ -166,29 +162,26 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
         else: act = 1 if (stats["arrive"] % configs.gate_cadence == 0) else 0
 
         old_td_est = orch.get_total_tardiness_estimate()
-        shadow_td_est = shadow_orch.get_total_tardiness_estimate() if is_ddqn else 0.0
-        pending_row_base = [stats["arrive"], f"{t_now:.2f}", f"{inter_arrival:.2f}", act, "RELEASE" if act==1 else "HOLD"] + raw_s + [0, 0, f"{old_td_est:.2f}", f"{shadow_td_est:.2f}", "0.00"]
+        pending_row_base = [stats["arrive"], f"{t_now:.2f}", f"{inter_arrival:.2f}", act, "RELEASE" if act==1 else "HOLD"] + raw_s + [0, 0, f"{old_td_est:.2f}", "0.00", "0.00"]
         
         if act == 1:
             orch.event_release_and_reschedule(t_now); release_count += 1
             collect_subproblem_stats(orch._committed_jobs, t_now) # [STATS: DYNAMIC SUBPROBLEM]
             actual_td_after = orch.get_total_tardiness_estimate()
-            if is_ddqn: last_advantage_td = actual_td_after - shadow_td_est; shadow_orch = orch.clone()
-            else: last_advantage_td = 0.0
-            pending_row_base[23], pending_row_base[24], pending_row_base[25], pending_row_base[26] = len(set(r['job'] for r in orch._last_full_rows)), len(orch._last_full_rows), f"{actual_td_after:.2f}", f"{shadow_td_est:.2f}"
+            last_advantage_td = actual_td_after - old_td_est
+            pending_row_base[23], pending_row_base[24], pending_row_base[25], pending_row_base[26] = len(set(r['job'] for r in orch._last_full_rows)), len(orch._last_full_rows), f"{actual_td_after:.2f}", "0.00"
             if not FAST_MODE:
                 save_details(orch, plot_seq+1, t_now)
                 plot_global_gantt([dict(r, phase="history" if r["start"] < t_now else "newplan") for r in (orch._global_rows + orch._last_full_rows)], os.path.join(csv_dir, f"global_r{plot_seq:03d}_t{int(t_now):05d}.png"), t_now=t_now, title=f"Event #{stats['arrive']}")
             plot_seq += 1
         else:
             orch.tick_without_release(t_now); actual_td_now = orch.get_total_tardiness_estimate(); last_advantage_td = 0.0
-            pending_row_base[25], pending_row_base[26] = f"{actual_td_now:.2f}", f"{shadow_td_est:.2f}"
+            pending_row_base[25], pending_row_base[26] = f"{actual_td_now:.2f}", "0.00"
         last_act = act; t_prev = t_now; t_next = gen.sample_next_time(t_now)
 
     while len(orch.buffer) > 0:
         orch.event_release_and_reschedule(t_now); release_count += 1
         collect_subproblem_stats(orch._committed_jobs, t_now) # [STATS: FLUSH SUBPROBLEM]
-        if is_ddqn and len(shadow_orch.buffer) > 0: shadow_orch.event_release_and_reschedule(t_now)
         if not FAST_MODE:
             save_details(orch, plot_seq+1, t_now, "_FLUSH")
             plot_global_gantt([dict(r, phase="history" if r["start"] < t_now else "newplan") for r in (orch._global_rows + orch._last_full_rows)], os.path.join(csv_dir, f"global_r{plot_seq:03d}_FLUSH.png"), t_now=t_now, title="FLUSH")
@@ -199,11 +192,7 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
     # [DISABLED] Skip summary boxplots
     # plot_simulation_summary_stats(all_sim_job_stats, csv_dir)
 
-    if is_ddqn:
-        shadow_final = shadow_orch.get_final_kpi_stats(all_job_due_dates)
-        mk_diff = final_mk - shadow_final["makespan"]
-        r_flush = (-mk_diff / reward_scale) * float(configs.flush_penalty_coef)
-    else: r_flush = (-final_mk / reward_scale) * float(configs.flush_penalty_coef)
+    r_flush = (-final_mk / reward_scale) * float(configs.flush_penalty_coef)
     total_cumulative_reward += r_flush
     summary_line = ["END", f"{t_now:.2f}", "", "", "SUMMARY"] + [""]*18 + ["", "", "", "", f"{total_td:.2f}", f"{total_cumulative_reward:.4f}", "", "", "", "", f"{r_flush:.4f}", f"{final_mk:.2f}", f"{total_td:.2f}", release_count]
     csv_writer.writerow(summary_line); csv_file.close(); return final_mk, {"release_count": release_count, "total_tardiness": total_td}

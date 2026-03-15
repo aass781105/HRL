@@ -20,10 +20,16 @@ from params import configs
 from common_utils import heuristic_select_action, greedy_select_action, sample_action
 from data_utils import generate_due_dates
 
+
+def _sync_cuda_for_profile():
+    if torch.cuda.is_available() and bool(getattr(configs, "profile_cuda_sync", True)):
+        torch.cuda.synchronize()
+
 @dataclass
 class OperationSpec:
     time_row: Optional[List[float]] = None
     machine_times: Optional[Dict[int, float]] = None
+    avg_proc_time: float = 0.0
 
     def proc_time_on(self, m: int) -> float:
         if self.time_row is not None:
@@ -56,7 +62,7 @@ def split_matrix_to_jobs(job_length: np.ndarray, op_pt: np.ndarray, *,
             min_v = np.min(valid) if valid.size > 0 else 0.0
             total_p += float(avg_v)
             min_p += float(min_v)
-            ops.append(OperationSpec(time_row=row.astype(float).tolist()))
+            ops.append(OperationSpec(time_row=row.astype(float).tolist(), avg_proc_time=float(avg_v)))
             cursor += 1
         meta = {"total_proc_time": total_p, "min_total_proc_time": min_p, "total_ops": L, "op_offset": 0}
         if t_arrive is not None: meta["t_arrive"] = float(t_arrive)
@@ -151,20 +157,6 @@ class GlobalTimelineOrchestrator:
             if p: self._ppo.policy.load_state_dict(torch.load(p, map_location=getattr(configs, "device", "cpu"), weights_only=True))
             self._ppo.policy.eval()
 
-    def clone(self) -> GlobalTimelineOrchestrator:
-        """[NEW] Returns a deep clone of the orchestrator state, sharing the PPO reference."""
-        new_orch = GlobalTimelineOrchestrator(self.M, self.generator, self.select_from_buffer, self.t)
-        new_orch.buffer = copy.deepcopy(self.buffer)
-        new_orch.machine_free_time = self.machine_free_time.copy()
-        new_orch._global_rows = copy.deepcopy(self._global_rows)
-        new_orch._global_row_keys = self._global_row_keys.copy()
-        new_orch._last_full_rows = copy.deepcopy(self._last_full_rows)
-        new_orch._last_jobs_snapshot = copy.deepcopy(self._last_jobs_snapshot)
-        new_orch._job_history_finishes = self._job_history_finishes.copy()
-        new_orch._release_count = self._release_count # [NEW]
-        new_orch._ppo = self._ppo # Share reference
-        return new_orch
-
     def reset(self, *, clear_buffer: bool = True, t0: float = 0.0):
         self.t, self.machine_free_time[:] = float(t0), 0.0
         if clear_buffer: self.buffer.clear()
@@ -183,74 +175,54 @@ class GlobalTimelineOrchestrator:
         rec = BatchScheduleRecorder(self._committed_jobs, self.M)
         done = False
         
-        # [DETAILED LOGGING SETUP]
-        step_summary_logs = []
-        is_r51 = (self._release_count == 51)
-        step_idx = 0
+        # [TIMING]
+        t_fwd_sum = 0.0
+        t_prep_sum = 0.0
+        t_f_op_sum = 0.0
+        t_f_mch_sum = 0.0
+        t_f_pair_sum = 0.0
+        t_upd_sum = 0.0
         
         while not done:
             if self.method == "PPO":
-                with torch.no_grad():
-                    # 1. Capture ALL Features before Decision
-                    raw_features = state.fea_j_tensor.cpu().numpy()[0] # [NumOps, 14]
-                    
-                    # [DEBUG LOGGING DISABLED]
-                    # if is_r51:
-                    #     # Export FULL STATE for every single step in R51
-                    #     full_state_rows = []
-                    #     candidates = env.candidate[0]
-                    #     for op_i in range(raw_features.shape[0]):
-                    #         is_cand = (op_i in candidates)
-                    #         row = {"op_global_idx": op_i, "is_candidate": is_cand}
-                    #         for d in range(14): row[f"f{d}"] = raw_features[op_i, d]
-                    #         full_state_rows.append(row)
-                    #     import pandas as pd; import os
-                    #     full_state_dir = os.path.join(getattr(configs, "plot_global_dir", "plots/global"), f"ppo_r51_full_states_t{self.t:.2f}")
-                    #     os.makedirs(full_state_dir, exist_ok=True)
-                    #     pd.DataFrame(full_state_rows).to_csv(os.path.join(full_state_dir, f"r51_step{step_idx:03d}_state.csv"), index=False)
-
-                    pi, _ = self._ppo.policy(fea_j=state.fea_j_tensor, op_mask=state.op_mask_tensor, candidate=state.candidate_tensor,
-                                             fea_m=state.fea_m_tensor, mch_mask=state.mch_mask_tensor, comp_idx=state.comp_idx_tensor,
-                                             dynamic_pair_mask=state.dynamic_pair_mask_tensor, fea_pairs=state.fea_pairs_tensor)
+                import time
+                _sync_cuda_for_profile()
+                tfwd0 = time.perf_counter()
+                with torch.inference_mode():
+                    pi = self._ppo.policy.policy_only(
+                        fea_j=state.fea_j_tensor, op_mask=state.op_mask_tensor, candidate=state.candidate_tensor,
+                        fea_m=state.fea_m_tensor, mch_mask=state.mch_mask_tensor, comp_idx=state.comp_idx_tensor,
+                        dynamic_pair_mask=state.dynamic_pair_mask_tensor, fea_pairs=state.fea_pairs_tensor
+                    )
                     act = int(pi.argmax(dim=1).item())
-            else: act = heuristic_select_action(self.method, env)
+                _sync_cuda_for_profile()
+                t_fwd_sum += (time.perf_counter() - tfwd0)
+            else:
+                from common_utils import heuristic_select_action
+                act = heuristic_select_action(self.method, env)
             
-            # Prepare summary logging
-            cj, cm = int(act // self.M), int(act % self.M)
-            c_op_idx = int(env.candidate[0, cj])
-            summary_row = {
-                "step": step_idx, "job_id": self._committed_jobs[cj].job_id,
-                "machine": cm, "op_idx": c_op_idx
-            }
-            # Record chosen op's specific features
-            feat_of_chosen = raw_features[c_op_idx]
-            for d in range(14): summary_row[f"f{d}"] = feat_of_chosen[d]
-                
             # Perform action
             state, _, done, info = env.step(np.array([act]))
             
-            # Capture Reward
-            summary_row["reward_mk"] = info["reward_mk"][0]
-            summary_row["reward_td"] = info["reward_td"][0]
-            step_summary_logs.append(summary_row)
-
+            # Aggregate timings from the low-level step
+            t_prep_sum += info.get("t_prep", 0.0)
+            t_f_op_sum += info.get("t_f_op", 0.0)
+            t_f_mch_sum += info.get("t_f_mch", 0.0)
+            t_f_pair_sum += info.get("t_f_pair", 0.0)
+            t_upd_sum += info.get("t_state_upd", 0.0)
+            
             # Record for plan
             rec.record_step_manual(env, act, info)
-            step_idx += 1
             
-        # Export Summary Trace for this Release
-        import pandas as pd
-        import os
-        log_dir = os.path.join(getattr(configs, "plot_global_dir", "plots/global"), "ppo_step_trace")
-        os.makedirs(log_dir, exist_ok=True)
-        pd.DataFrame(step_summary_logs).to_csv(
-            os.path.join(log_dir, f"ppo_steps_r{self._release_count:03d}_t{self.t:.2f}.csv"), 
-            index=False
-        )
-        
-        # if is_r51:
-        #     print(f"\n[DEBUG] FULL PPO States for R51 exported to plots/global/ppo_r51_full_states_t{self.t:.2f}/")
-
+        # Store aggregated timings in the orchestrator
+        self._last_batch_timings = {
+            "t_fwd": t_fwd_sum,
+            "t_prep": t_prep_sum,
+            "t_f_op": t_f_op_sum,
+            "t_f_mch": t_f_mch_sum,
+            "t_f_pair": t_f_pair_sum,
+            "t_upd": t_upd_sum
+        }
         return rec.to_rows()
 
     def event_release_and_reschedule(self, t_e: float) -> Dict:
@@ -266,7 +238,6 @@ class GlobalTimelineOrchestrator:
         self.machine_free_time = busy
 
         # 1. Update snapshot with newly arrived jobs (full versions)
-        # Note: buffer is cleared immediately
         buffer_jobs = list(self.buffer); self.buffer.clear()
         self._last_jobs_snapshot.extend(buffer_jobs)
 
@@ -281,68 +252,23 @@ class GlobalTimelineOrchestrator:
             total_ops = int(js.meta.get("total_ops", len(js.operations)))
             
             if len(started) < total_ops:
-                js_b = copy.deepcopy(js)
+                # Optimized replacement for deepcopy
+                js_b = JobSpec(job_id=js.job_id, operations=js.operations[len(started):], meta=js.meta.copy())
                 js_b.meta["op_offset"] = len(started)
-                js_b.operations = js.operations[len(started):]
                 
                 inprog = [r for r in rows if float(r["start"]) <= self.t < float(r["end"])]
-                if inprog:
-                    ready_at = float(inprog[0]["end"])
-                else:
-                    ready_at = max(float(js.meta.get("t_arrive", 0.0)), self.t)
-                
-                js_b.meta["ready_at"] = ready_at
+                js_b.meta["ready_at"] = float(inprog[0]["end"]) if inprog else max(float(js.meta.get("t_arrive", 0.0)), self.t)
                 jobs_new.append(js_b)
         
         if not jobs_new: return {"event": "tick", "t": self.t}
         
         jl, pt = self._build_batch(jobs_new); env = FJSPEnvForVariousOpNums(n_j=len(jobs_new), n_m=self.M)
-        
-        # [SAVE STATIC SUBPROBLEM CSV - DUAL VIEW]
-        import pandas as pd
-        import os
-        sub_rows = []
-        op_ptr = 0
         pt_scale = (float(configs.low) + float(configs.high)) / 2.0
-        for i, js in enumerate(jobs_new):
-            jid = js.job_id
-            ready_abs = float(js.meta.get("ready_at", self.t))
-            due_abs = float(js.meta.get("due_date", 0.0))
-            offset = int(js.meta.get("op_offset", 0))
-            for local_op_idx, op_spec in enumerate(js.operations):
-                row = {
-                    "t_now_abs": self.t,
-                    "job_id": jid,
-                    "op_idx": offset + local_op_idx,
-                    "ready_abs": ready_abs if local_op_idx == 0 else 0.0,
-                    "due_abs": due_abs,
-                    # [FIXED] Record values AFTER proper scaling for diagnostics
-                    "ready_static": max(0.0, ready_abs - self.t) / pt_scale if local_op_idx == 0 else 0.0,
-                    "due_static": (due_abs - self.t) / pt_scale
-                }
-                for m_idx in range(self.M):
-                    raw_pt = pt[0][op_ptr, m_idx]
-                    row[f"M{m_idx}_PT_abs"] = raw_pt
-                    # PPO env handles PT normalization internally, so we record raw/scale for reference
-                    row[f"M{m_idx}_PT_static"] = raw_pt / pt_scale
-                sub_rows.append(row)
-                op_ptr += 1
-        sub_dir = os.path.join(getattr(configs, "plot_global_dir", "plots/global"), "static_subproblems")
-        os.makedirs(sub_dir, exist_ok=True)
-        pd.DataFrame(sub_rows).to_csv(os.path.join(sub_dir, f"comparison_t{self.t:08.2f}.csv"), index=False)
-
-        # [FIX] Set scale to pt_scale to match PPO training feature distribution!
         norm = _TimeNormalizer(self.t, pt_scale)
-        
-        # Prepare Due Dates (Relative for Features, Absolute for internal Reward calculation if needed)
-        # normalize_due_date=False here because we manually scale them via norm.f
         due_dates_ppo = [norm.f(float(j.meta.get("due_date", 0.0))) for j in jobs_new]
         due_dates_abs = [float(j.meta.get("due_date", 0.0)) for j in jobs_new]
         
-        # [MOD] normalize_due_date=False to avoid double scaling!
-        # [FIX] Ensure due_date_list is wrapped in a list to match [Env, Job] structure
         state = env.set_initial_data(jl, pt, due_date_list=[due_dates_ppo], normalize_due_date=False, true_due_date_list=[due_dates_abs])
-        
         env.true_mch_free_time[0,:] = self.machine_free_time; env.mch_free_time[0,:] = norm.f(self.machine_free_time)
         for i, js_b in enumerate(jobs_new):
             r_abs = float(js_b.meta.get("ready_at", self.t))
@@ -352,24 +278,17 @@ class GlobalTimelineOrchestrator:
         
         # Finalize
         self.machine_free_time = env.true_mch_free_time[0].astype(float).copy()
-        
-        # [FIXED MERGE LOGIC] Ensure absolutely NO ghost operations block the machines
         f_dict = {(int(r["job"]), int(r["op"])): r for r in self._last_full_rows}
         committed_job_ids = {js.job_id for js in jobs_new}
-        # Purge all future plans for jobs being rescheduled
         to_del = [k for k, r in f_dict.items() if k[0] in committed_job_ids and float(r["start"]) >= self.t]
         for k in to_del: del f_dict[k]
-        # Overwrite with fresh PPO results
         for r in rows: f_dict[(int(r["job"]), int(r["op"]))] = r
-            
         self._last_full_rows = sorted(list(f_dict.values()), key=lambda x: (x["job"], x["op"]))
         
-        # [MOD] Keep snapshot as FULL JobSpecs only (remove finished jobs)
         fins = set()
         for jid in {js.job_id for js in self._last_jobs_snapshot}:
             j_rows = [r for r in self._last_full_rows if int(r["job"]) == jid]
-            if j_rows and max(float(r["end"]) for r in j_rows) <= self.t:
-                fins.add(jid)
+            if j_rows and max(float(r["end"]) for r in j_rows) <= self.t: fins.add(jid)
         self._last_jobs_snapshot = [js for js in self._last_jobs_snapshot if js.job_id not in fins]
         
         return {"event": "batch_finalized", "t": self.t, "rows": rows}
@@ -394,35 +313,14 @@ class GlobalTimelineOrchestrator:
             busy_m[int(r["machine"])] += max(0.0, min(float(r["end"]), t1) - max(float(r["start"]), t0))
         return {"total_idle": max(0.0, dt * self.M - np.sum(np.minimum(busy_m, dt))), "interval_dt": dt}
 
-    def compute_weighted_idle(self, t_now: float, horizon: float) -> float:
-        if horizon <= 1e-9: return 0.0
+    def compute_idle_stats(self, t_now: float, horizon: float) -> Tuple[float, float]:
+        if horizon <= 1e-9:
+            return 0.0, 0.0
         t_end, m_ints = t_now + horizon, [[] for _ in range(self.M)]
         for r in self._last_full_rows:
             s, e = max(t_now, float(r["start"])), min(t_end, float(r["end"]))
             if e > s: m_ints[int(r["machine"])].append((s, e))
-        total = 0.0
-        for m in range(self.M):
-            ints = sorted(m_ints[m], key=lambda x: x[0]); merged = []
-            if ints:
-                cs, ce = ints[0]
-                for ns, ne in ints[1:]:
-                    if ns < ce: ce = max(ce, ne)
-                    else: merged.append((cs, ce)); cs, ce = ns, ne
-                merged.append((cs, ce))
-            ptr = t_now
-            for s, e in merged:
-                if s > ptr: total += (s - ptr) - ((s - t_now)**2 - (ptr - t_now)**2) / (2.0 * horizon)
-                ptr = max(ptr, e)
-            if ptr < t_end: total += (t_end - ptr) - ((t_end - t_now)**2 - (ptr - t_now)**2) / (2.0 * horizon)
-        return total / self.M
-
-    def compute_unweighted_idle(self, t_now: float, horizon: float) -> float:
-        """[NEW] Returns average gap per machine without weighting."""
-        if horizon <= 1e-9: return 0.0
-        t_end, m_ints = t_now + horizon, [[] for _ in range(self.M)]
-        for r in self._last_full_rows:
-            s, e = max(t_now, float(r["start"])), min(t_end, float(r["end"]))
-            if e > s: m_ints[int(r["machine"])].append((s, e))
+        total_weighted = 0.0
         total_gap = 0.0
         for m in range(self.M):
             ints = sorted(m_ints[m], key=lambda x: x[0]); merged = []
@@ -434,10 +332,20 @@ class GlobalTimelineOrchestrator:
                 merged.append((cs, ce))
             ptr = t_now
             for s, e in merged:
-                if s > ptr: total_gap += (s - ptr)
+                if s > ptr:
+                    total_gap += (s - ptr)
+                    total_weighted += (s - ptr) - ((s - t_now)**2 - (ptr - t_now)**2) / (2.0 * horizon)
                 ptr = max(ptr, e)
-            if ptr < t_end: total_gap += (t_end - ptr)
-        return total_gap / self.M
+            if ptr < t_end:
+                total_gap += (t_end - ptr)
+                total_weighted += (t_end - ptr) - ((t_end - t_now)**2 - (ptr - t_now)**2) / (2.0 * horizon)
+        return total_weighted / self.M, total_gap / self.M
+
+    def compute_weighted_idle(self, t_now: float, horizon: float) -> float:
+        return self.compute_idle_stats(t_now, horizon)[0]
+
+    def compute_unweighted_idle(self, t_now: float, horizon: float) -> float:
+        return self.compute_idle_stats(t_now, horizon)[1]
 
     def get_wip_stats(self, t_now: float) -> Dict[str, float]:
         slacks, n_tardy, n_act, p_td, total_rem_w = [], 0, 0, 0.0, 0.0
@@ -451,7 +359,7 @@ class GlobalTimelineOrchestrator:
             if not rows: # New buffer jobs
                 n_act += 1; rem_w = 0.0
                 for op in js.operations:
-                    v = np.array(op.time_row); rem_w += np.mean(v[v>0]) if v[v>0].size else 0.0
+                    rem_w += float(op.avg_proc_time)
                 total_rem_w += rem_w
                 due = float(js.meta.get("due_date", 0.0))
                 p_td += max(0.0, t_now + rem_w - due)
@@ -468,7 +376,7 @@ class GlobalTimelineOrchestrator:
             # Do NOT slice it again with len(started_rows).
             rem_w = 0.0
             for op in js.operations:
-                v = np.array(op.time_row); rem_w += np.mean(v[v>0]) if v[v>0].size else 0.0
+                rem_w += float(op.avg_proc_time)
             total_rem_w += rem_w
             
             # Planned TD is based on the FINAL operation's end time in current PPO global plan

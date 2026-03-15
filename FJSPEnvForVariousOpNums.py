@@ -2,9 +2,15 @@ import numpy as np
 import numpy.ma as ma
 import copy
 import sys
+import time
 from dataclasses import dataclass
 import torch
 from params import configs
+
+
+def _sync_cuda_for_profile():
+    if torch.cuda.is_available() and bool(getattr(configs, "profile_cuda_sync", True)):
+        torch.cuda.synchronize()
 
 @dataclass
 class EnvState:
@@ -22,24 +28,38 @@ class EnvState:
     fea_glo_tensor: torch.Tensor = None # [NEW]
 
     device = torch.device(configs.device)
+    initialized: bool = False
+
+    def _init_buffers(self, sz_b, N, M, J):
+        dev = self.device
+        self.fea_j_tensor = torch.zeros((sz_b, N, 14), device=dev)
+        self.op_mask_tensor = torch.zeros((sz_b, N, 3), device=dev)
+        self.fea_m_tensor = torch.zeros((sz_b, M, 9), device=dev)
+        self.mch_mask_tensor = torch.zeros((sz_b, M, M), device=dev)
+        self.dynamic_pair_mask_tensor = torch.zeros((sz_b, J, M), device=dev, dtype=torch.bool)
+        self.comp_idx_tensor = torch.zeros((sz_b, M, M, J), device=dev)
+        self.candidate_tensor = torch.zeros((sz_b, J), device=dev, dtype=torch.long)
+        self.fea_pairs_tensor = torch.zeros((sz_b, J, M, 9), device=dev)
+        self.fea_glo_tensor = torch.zeros((sz_b, 64), device=dev)
+        self.initialized = True
 
     def update(self, fea_j, op_mask, fea_m, mch_mask, dynamic_pair_mask,
-               comp_idx, candidate, fea_pairs, fea_glo=None):
-        """
-            update the state information
-        """
-        device = self.device
-        self.fea_j_tensor = torch.from_numpy(np.copy(fea_j)).float().to(device)
-        self.fea_m_tensor = torch.from_numpy(np.copy(fea_m)).float().to(device)
-        self.fea_pairs_tensor = torch.from_numpy(np.copy(fea_pairs)).float().to(device)
-        if fea_glo is not None:
-            self.fea_glo_tensor = torch.from_numpy(np.copy(fea_glo)).float().to(device)
+               comp_idx, candidate, fea_pairs, fea_glo=None, mode="train"):
+        if not self.initialized:
+            sz_b, N, _ = fea_j.shape
+            M = fea_m.shape[1]; J = candidate.shape[1]
+            self._init_buffers(sz_b, N, M, J)
 
-        self.op_mask_tensor = torch.from_numpy(np.copy(op_mask)).to(device)
-        self.candidate_tensor = torch.from_numpy(np.copy(candidate)).to(device)
-        self.mch_mask_tensor = torch.from_numpy(np.copy(mch_mask)).float().to(device)
-        self.comp_idx_tensor = torch.from_numpy(np.copy(comp_idx)).to(device)
-        self.dynamic_pair_mask_tensor = torch.from_numpy(np.copy(dynamic_pair_mask)).to(device)
+        self.fea_j_tensor.copy_(torch.from_numpy(fea_j))
+        self.fea_m_tensor.copy_(torch.from_numpy(fea_m))
+        self.candidate_tensor.copy_(torch.from_numpy(candidate))
+        self.dynamic_pair_mask_tensor.copy_(torch.from_numpy(dynamic_pair_mask).bool())
+        self.fea_pairs_tensor.copy_(torch.from_numpy(fea_pairs))
+        if mode != "infer":
+            self.op_mask_tensor.copy_(torch.from_numpy(op_mask.astype(float)))
+            self.mch_mask_tensor.copy_(torch.from_numpy(mch_mask.astype(float)))
+            self.comp_idx_tensor.copy_(torch.from_numpy(comp_idx.astype(float)))
+        if fea_glo is not None: self.fea_glo_tensor.copy_(torch.from_numpy(fea_glo))
 
     def print_shape(self):
         print(self.fea_j_tensor.shape)
@@ -254,6 +274,16 @@ class FJSPEnvForVariousOpNums:
         self.mch_current_available_op_nums = np.copy(self.compatible_mch)
         self.candidate_pt = np.array([self.unmasked_op_pt[k][self.candidate[k]] for k in range(self.number_of_envs)])
 
+        if (self.candidate_pt == 0).all(axis=(1, 2)).any():
+            bad_idx = np.where((self.candidate_pt == 0).all(axis=(1, 2)))[0][:8].tolist()
+            raise RuntimeError(
+                "set_initial_data produced all-zero candidate_pt rows: "
+                f"env_idx={bad_idx}, "
+                f"candidate={self.candidate[bad_idx].tolist()}, "
+                f"job_length={self.job_length[bad_idx].tolist()}, "
+                f"head_op_pt_nonzero={[int(np.count_nonzero(self.unmasked_op_pt[i][self.candidate[i]])) for i in bad_idx]}"
+            )
+
         self.dynamic_pair_mask = (self.candidate_pt == 0)
         self.candidate_process_relation = np.copy(self.dynamic_pair_mask)
         self.mch_current_available_jc_nums = np.sum(~self.candidate_process_relation, axis=1)
@@ -267,6 +297,7 @@ class FJSPEnvForVariousOpNums:
 
         self.construct_pair_features()
 
+        # Update state instance
         self.old_state.update(self.fea_j, self.op_mask,
                               self.fea_m, self.mch_mask,
                               self.dynamic_pair_mask, self.comp_idx, self.candidate,
@@ -288,8 +319,19 @@ class FJSPEnvForVariousOpNums:
         self.old_accumulated_tardiness = np.copy(self.accumulated_tardiness)
         self.old_job_current_tardiness = np.copy(self.job_current_tardiness)
 
-        # state
-        self.state = copy.deepcopy(self.old_state)
+        # state: Avoid deepcopy of CUDA tensors
+        self.state = EnvState()
+        self.state.update(self.fea_j, self.op_mask,
+                          self.fea_m, self.mch_mask,
+                          self.dynamic_pair_mask, self.comp_idx, self.candidate,
+                          self.fea_pairs)
+        state_mask_cpu = self.state.dynamic_pair_mask_tensor.detach().cpu().numpy()
+        if not np.array_equal(state_mask_cpu, self.dynamic_pair_mask):
+            raise RuntimeError(
+                "set_initial_data mismatch between dynamic_pair_mask and state tensor: "
+                f"env_mask_sum={np.sum(self.dynamic_pair_mask, axis=(1, 2))[:8].tolist()}, "
+                f"state_mask_sum={np.sum(state_mask_cpu, axis=(1, 2))[:8].tolist()}"
+            )
         return self.state
 
     def reset(self):
@@ -309,8 +351,27 @@ class FJSPEnvForVariousOpNums:
         self.true_due_date = np.copy(self.old_true_due_date)
         self.accumulated_tardiness = np.copy(self.old_accumulated_tardiness)
         self.job_current_tardiness = np.copy(self.old_job_current_tardiness)
-        # state
-        self.state = copy.deepcopy(self.old_state)
+
+        # Rebuild all derived scheduling state from the restored base arrays.
+        self.dynamic_pair_mask = np.copy(self.candidate_process_relation)
+        self.comp_idx = self.logic_operator(~self.dynamic_pair_mask)
+        self.construct_op_features()
+        self.construct_mch_features()
+        self.construct_pair_features()
+        
+        # state: Avoid deepcopy of CUDA tensors
+        self.state = EnvState()
+        self.state.update(self.fea_j, self.op_mask,
+                          self.fea_m, self.mch_mask,
+                          self.dynamic_pair_mask, self.comp_idx, self.candidate,
+                          self.fea_pairs)
+        state_mask_cpu = self.state.dynamic_pair_mask_tensor.detach().cpu().numpy()
+        if not np.array_equal(state_mask_cpu, self.dynamic_pair_mask):
+            raise RuntimeError(
+                "reset mismatch between dynamic_pair_mask and state tensor: "
+                f"env_mask_sum={np.sum(self.dynamic_pair_mask, axis=(1, 2))[:8].tolist()}, "
+                f"state_mask_sum={np.sum(state_mask_cpu, axis=(1, 2))[:8].tolist()}"
+            )
         return self.state
 
     def initial_vars(self):
@@ -492,14 +553,32 @@ class FJSPEnvForVariousOpNums:
         self.mch_working_flag[self.incomplete_env_idx] = mch_free_flag + 0
         self.mch_waiting_time[self.incomplete_env_idx] = (1 - mch_free_flag) * mch_free_duration
 
-        self.mch_remain_work[self.incomplete_env_idx] = np.maximum(-mch_free_duration, 0)
+        # --- Hyper-Granular Timing (Start) ---
+        import time
+        t_prep_st = time.perf_counter()
+        
+        # [Prep] Re-sync or local vars if any...
+        t_prep = time.perf_counter() - t_prep_st
+        
+        # [F_Op]
+        tf0 = time.perf_counter(); self.construct_op_features(); t_f_op = time.perf_counter() - tf0
+        
+        # [F_Mch]
+        tf1 = time.perf_counter(); self.construct_mch_features(); t_f_mch = time.perf_counter() - tf1
+        
+        # [F_Pr]
+        tf2 = time.perf_counter(); fea_pairs = self.construct_pair_features(); t_f_pair = time.perf_counter() - tf2
 
-        self.construct_mch_features()
+        # [Upd] GPU Buffer Update
+        _sync_cuda_for_profile()
+        tu0 = time.perf_counter()
+        self.state.update(self.fea_j, self.op_mask, self.fea_m, self.mch_mask,
+                          self.dynamic_pair_mask, self.comp_idx, self.candidate,
+                          fea_pairs=fea_pairs, mode="infer")
+        _sync_cuda_for_profile()
+        t_state_upd = time.perf_counter() - tu0
+        # --- Hyper-Granular Timing (End) ---
 
-        self.construct_pair_features()
-
-        # Compute reward: 
-        # 1. Gain in estimated makespan (positive is good)
         reward_mk = self.max_endTime - np.max(self.op_ct_lb, axis=1)
         self.max_endTime = np.max(self.op_ct_lb, axis=1)
         
@@ -524,9 +603,6 @@ class FJSPEnvForVariousOpNums:
         
         alpha = float(getattr(configs, "tardiness_alpha", 1.0))
 
-        
-
-        
         # [MODIFIED] Normalization using estimated makespan (mean_op_pt * n_j)
         base_scale = self.mean_op_pt * self.number_of_jobs
         base_scale = np.maximum(base_scale, 1e-8) # Avoid division by zero or negative
@@ -538,9 +614,7 @@ class FJSPEnvForVariousOpNums:
         # to prevent excessive signal dilution in larger problem scales (e.g., 30x5).
         reward = (reward_mk + reward_td) / 10
 
-        self.state.update(self.fea_j, self.op_mask, self.fea_m, self.mch_mask,
-                          self.dynamic_pair_mask, self.comp_idx, self.candidate,
-                          self.fea_pairs)
+        # self.state.update (...) already called above in timing block
         self.done_flag = self.done()
 
         # --- Collect scheduling details for info dictionary (assuming env_idx = 0 for evaluation) ---
@@ -572,7 +646,14 @@ class FJSPEnvForVariousOpNums:
             "raw_mk_gain": float(reward_mk[env_idx]), 
             "raw_local_tardiness": float(tardiness[env_idx]),
             "raw_accumulated_tardiness": float(self.accumulated_tardiness[env_idx]),
-            "current_makespan": float(self.current_makespan[env_idx])
+            "current_makespan": float(self.current_makespan[env_idx]),
+            
+            # [TIMING] Pass back to Gate Agent
+            "t_prep": t_prep,
+            "t_f_op": t_f_op,
+            "t_f_mch": t_f_mch,
+            "t_f_pair": t_f_pair,
+            "t_state_upd": t_state_upd
         }
         # --- End collect scheduling details ---
 
@@ -618,7 +699,7 @@ class FJSPEnvForVariousOpNums:
                                feat_rem_time,
                                feat_slack,
                                feat_cr_log,
-                               feat_is_tardy), axis=2)
+                               feat_is_tardy), axis=2).astype(np.float32, copy=False)
 
         # [NEW] Store RAW features before normalization for debugging
         self.raw_fea_j = np.copy(self.fea_j)
@@ -663,34 +744,34 @@ class FJSPEnvForVariousOpNums:
             fea_f7, 
             z_norm[:, :, 6:10], 
             fea_raw_end
-        ), axis=2)
+        ), axis=2).astype(np.float32, copy=False)
 
     def construct_mch_features(self):
         # [NEW] Option B: Global Pressure via Machine Features
         # Calculate Global Stats first
         raw_slacks = self.raw_fea_j[:, :, 11]
         mask_unscheduled = (self.op_scheduled_flag == 0) # [FIXED] Use op_scheduled_flag
-        
-        avg_slacks = []
-        std_slacks = []
-        for e in range(self.number_of_envs):
-            valid_s = raw_slacks[e][mask_unscheduled[e]]
-            if valid_s.size > 0:
-                mu = np.mean(valid_s)
-                std = np.std(valid_s)
-                avg_slacks.append(np.sign(mu) * np.log1p(np.abs(mu)))
-                std_slacks.append(np.log1p(std))
-            else:
-                avg_slacks.append(0.0); std_slacks.append(0.0)
+
+        valid_counts = np.sum(mask_unscheduled, axis=1).astype(np.float32)
+        safe_counts = np.maximum(valid_counts, 1.0)
+        masked_slacks = raw_slacks * mask_unscheduled
+        slack_mean = np.sum(masked_slacks, axis=1) / safe_counts
+        centered = np.where(mask_unscheduled, raw_slacks - slack_mean[:, np.newaxis], 0.0)
+        slack_std = np.sqrt(np.sum(centered * centered, axis=1) / safe_counts)
+        slack_mean = np.where(valid_counts > 0, slack_mean, 0.0)
+        slack_std = np.where(valid_counts > 0, slack_std, 0.0)
+
+        avg_slacks = np.sign(slack_mean) * np.log1p(np.abs(slack_mean))
+        std_slacks = np.log1p(slack_std)
         
         # Congestion
         rem_ops_count = np.sum(mask_unscheduled, axis=1)
         congestion = np.log1p(rem_ops_count / self.number_of_machines)
         
         # Broadcast global signals to all machines [E, M]
-        g0 = np.tile(np.array(avg_slacks)[:, np.newaxis], (1, self.number_of_machines))
-        g1 = np.tile(np.array(std_slacks)[:, np.newaxis], (1, self.number_of_machines))
-        g2 = np.tile(congestion[:, np.newaxis], (1, self.number_of_machines))
+        g0 = np.broadcast_to(avg_slacks[:, np.newaxis], (self.number_of_envs, self.number_of_machines))
+        g1 = np.broadcast_to(std_slacks[:, np.newaxis], (self.number_of_envs, self.number_of_machines))
+        g2 = np.broadcast_to(congestion[:, np.newaxis], (self.number_of_envs, self.number_of_machines))
 
         # [NEW] Calculate Machine Tardiness Pressure (Local context)
         cand_rem_time = (self.due_date - self.next_schedule_time[:, np.newaxis])
@@ -710,7 +791,7 @@ class FJSPEnvForVariousOpNums:
                                self.mch_mean_pt,
                                self.mch_waiting_time,
                                mch_tardiness_pressure, # Moved local pressure to dim 5
-                               g0, g1, g2), axis=2)
+                               g0, g1, g2), axis=2).astype(np.float32, copy=False)
 
         self.norm_machine_features()
 
@@ -733,10 +814,9 @@ class FJSPEnvForVariousOpNums:
         fea_normalized = ((temp - mean_fea_m[:, np.newaxis, :]) / (std_fea_m[:, np.newaxis, :] + 1e-8))
         
         # Concatenate back: [Normed(0-5), Raw(6-8)]
-        self.fea_m = np.concatenate((fea_normalized, fea_keep_raw), axis=2)
+        self.fea_m = np.concatenate((fea_normalized, fea_keep_raw), axis=2).astype(np.float32, copy=False)
 
     def construct_pair_features(self):
-
         remain_op_pt = ma.array(self.op_pt, mask=~self.remain_process_relation)
 
         chosen_op_max_pt = np.expand_dims(self.op_max_pt[self.env_job_idx, self.candidate], axis=-1)
@@ -759,7 +839,6 @@ class FJSPEnvForVariousOpNums:
         # pair_free_time: [E, J, M], candidate_pt: [E, J, M], due_date: [E, J]
         # All are already normalized by scale
         pair_est_lateness = np.maximum(0, self.pair_free_time + self.candidate_pt - self.due_date[:, :, np.newaxis])
-
         self.fea_pairs = np.stack((self.candidate_pt,
                                    self.candidate_pt / chosen_op_max_pt,
                                    self.candidate_pt / mch_max_candidate_pt,
@@ -768,7 +847,8 @@ class FJSPEnvForVariousOpNums:
                                    self.candidate_pt / pair_max_pt,
                                    self.candidate_pt / chosen_job_remain_work,
                                    pair_wait_time,
-                                   pair_est_lateness), axis=-1)
+                                   pair_est_lateness), axis=-1).astype(np.float32, copy=False)
+        return self.fea_pairs
 
     # -------------------- masks / logic --------------------
 
@@ -870,7 +950,7 @@ class FJSPEnvForVariousOpNums:
         self.state.update(self.fea_j, self.op_mask,
                           self.fea_m, self.mch_mask,
                           self.dynamic_pair_mask, self.comp_idx, self.candidate,
-                          self.fea_pairs)
+                          self.fea_pairs, mode="infer")
         return self.state
 
 

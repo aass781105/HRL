@@ -58,14 +58,15 @@ class Memory:
         :param state: the MDP state
         :return:
         """
-        self.fea_j_seq.append(state.fea_j_tensor)
-        self.op_mask_seq.append(state.op_mask_tensor)
-        self.fea_m_seq.append(state.fea_m_tensor)
-        self.mch_mask_seq.append(state.mch_mask_tensor)
-        self.dynamic_pair_mask_seq.append(state.dynamic_pair_mask_tensor)
-        self.comp_idx_seq.append(state.comp_idx_tensor)
-        self.candidate_seq.append(state.candidate_tensor)
-        self.fea_pairs_seq.append(state.fea_pairs_tensor)
+        # EnvState reuses internal buffers across steps, so memory must snapshot tensors.
+        self.fea_j_seq.append(state.fea_j_tensor.clone())
+        self.op_mask_seq.append(state.op_mask_tensor.clone())
+        self.fea_m_seq.append(state.fea_m_tensor.clone())
+        self.mch_mask_seq.append(state.mch_mask_tensor.clone())
+        self.dynamic_pair_mask_seq.append(state.dynamic_pair_mask_tensor.clone())
+        self.comp_idx_seq.append(state.comp_idx_tensor.clone())
+        self.candidate_seq.append(state.candidate_tensor.clone())
+        self.fea_pairs_seq.append(state.fea_pairs_tensor.clone())
 
     def transpose_data(self):
         """
@@ -165,9 +166,10 @@ class PPO:
         full_batch_size = len(t_data[-1])
         num_batch = np.ceil(full_batch_size / self.minibatch_size)
 
-        loss_epochs = 0
-        v_loss_epochs = 0
-        p_loss_epochs = 0
+        loss_epochs = 0.0
+        v_loss_epochs = 0.0
+        p_loss_epochs = 0.0
+        num_effective_updates = 0
 
         for _ in range(self.k_epochs):
 
@@ -181,24 +183,29 @@ class PPO:
                     start_idx = i * self.minibatch_size
                     end_idx = full_batch_size
 
-                pis, vals = self.policy(fea_j=t_data[0][start_idx:end_idx],
-                                        op_mask=t_data[1][start_idx:end_idx],
-                                        candidate=t_data[6][start_idx:end_idx],
-                                        fea_m=t_data[2][start_idx:end_idx],
-                                        mch_mask=t_data[3][start_idx:end_idx],
-                                        comp_idx=t_data[5][start_idx:end_idx],
-                                        dynamic_pair_mask=t_data[4][start_idx:end_idx],
-                                        fea_pairs=t_data[7][start_idx:end_idx])
+                batch_dynamic_mask = t_data[4][start_idx:end_idx]
+                valid_rows = ~batch_dynamic_mask.reshape(batch_dynamic_mask.size(0), -1).all(dim=1)
+                if not valid_rows.any():
+                    continue
 
-                action_batch = t_data[8][start_idx: end_idx]
+                pis, vals = self.policy(fea_j=t_data[0][start_idx:end_idx][valid_rows],
+                                        op_mask=t_data[1][start_idx:end_idx][valid_rows],
+                                        candidate=t_data[6][start_idx:end_idx][valid_rows],
+                                        fea_m=t_data[2][start_idx:end_idx][valid_rows],
+                                        mch_mask=t_data[3][start_idx:end_idx][valid_rows],
+                                        comp_idx=t_data[5][start_idx:end_idx][valid_rows],
+                                        dynamic_pair_mask=batch_dynamic_mask[valid_rows],
+                                        fea_pairs=t_data[7][start_idx:end_idx][valid_rows])
+
+                action_batch = t_data[8][start_idx: end_idx][valid_rows]
                 logprobs, ent_loss = eval_actions(pis, action_batch)
-                ratios = torch.exp(logprobs - t_data[12][start_idx: end_idx].detach())
+                ratios = torch.exp(logprobs - t_data[12][start_idx: end_idx][valid_rows].detach())
 
-                advantages = t_advantage_seq[start_idx: end_idx]
+                advantages = t_advantage_seq[start_idx: end_idx][valid_rows]
                 surr1 = ratios * advantages
                 surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
 
-                v_loss = self.V_loss_2(vals.squeeze(1), v_target_seq[start_idx: end_idx])
+                v_loss = self.V_loss_2(vals.squeeze(1), v_target_seq[start_idx: end_idx][valid_rows])
                 p_loss = - torch.min(surr1, surr2)
                 ent_loss = - ent_loss.clone()
                 loss = self.vloss_coef * v_loss + self.ploss_coef * p_loss + self.entloss_coef * ent_loss
@@ -208,12 +215,17 @@ class PPO:
                 v_loss_epochs += v_loss.mean().detach()
                 p_loss_epochs += p_loss.mean().detach()
                 loss.mean().backward()
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
                 self.optimizer.step()
+                num_effective_updates += 1
         # soft update
         for policy_old_params, policy_params in zip(self.policy_old.parameters(), self.policy.parameters()):
             policy_old_params.data.copy_(self.tau * policy_old_params.data + (1 - self.tau) * policy_params.data)
 
-        return loss_epochs.item() / self.k_epochs, v_loss_epochs.item() / self.k_epochs, p_loss_epochs.item() / self.k_epochs
+        if num_effective_updates == 0:
+            return 0.0, 0.0, 0.0
+
+        return float(loss_epochs) / num_effective_updates, float(v_loss_epochs) / num_effective_updates, float(p_loss_epochs) / num_effective_updates
 
 
 def PPO_initialize():

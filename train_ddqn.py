@@ -2,6 +2,7 @@
 import os
 import math
 import random
+import time
 import numpy as np
 from collections import deque
 from typing import Tuple
@@ -18,25 +19,61 @@ from model.ddqn_model import QNet
 
 import matplotlib.pyplot as plt
 
-# --------- Replay Buffer ---------
+# --------- Optimized Replay Buffer (Numpy Circular Buffer) ---------
 class ReplayBuffer:
-    def __init__(self, capacity: int = 100_000):
-        self.buf = deque(maxlen=int(capacity))
+    def __init__(self, capacity: int, obs_dim: int):
+        self.capacity = int(capacity)
+        self.obs_dim = obs_dim
+        self.ptr = 0
+        self.size = 0
+        self.s_buf = np.zeros((self.capacity, obs_dim), dtype=np.float32)
+        self.s2_buf = np.zeros((self.capacity, obs_dim), dtype=np.float32)
+        self.a_buf = np.zeros(self.capacity, dtype=np.int64)
+        self.r_buf = np.zeros(self.capacity, dtype=np.float32)
+        self.d_buf = np.zeros(self.capacity, dtype=np.float32)
 
     def push(self, s, a, r, s2, d):
-        self.buf.append((s, a, r, s2, d))
+        self.s_buf[self.ptr] = s
+        self.a_buf[self.ptr] = a
+        self.r_buf[self.ptr] = r
+        self.s2_buf[self.ptr] = s2
+        self.d_buf[self.ptr] = d
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def push_batch(self, s, a, r, s2, d):
+        n = s.shape[0]
+        if self.ptr + n <= self.capacity:
+            self.s_buf[self.ptr:self.ptr+n] = s
+            self.a_buf[self.ptr:self.ptr+n] = a
+            self.r_buf[self.ptr:self.ptr+n] = r
+            self.s2_buf[self.ptr:self.ptr+n] = s2
+            self.d_buf[self.ptr:self.ptr+n] = d
+        else:
+            # Wrap around
+            first = self.capacity - self.ptr
+            self.s_buf[self.ptr:] = s[:first]
+            self.a_buf[self.ptr:] = a[:first]
+            self.r_buf[self.ptr:] = r[:first]
+            self.s2_buf[self.ptr:] = s2[:first]
+            self.d_buf[self.ptr:] = d[:first]
+            second = n - first
+            self.s_buf[:second] = s[first:]
+            self.a_buf[:second] = a[first:]
+            self.r_buf[:second] = r[first:]
+            self.s2_buf[:second] = s2[first:]
+            self.d_buf[:second] = d[first:]
+        
+        self.ptr = (self.ptr + n) % self.capacity
+        self.size = min(self.size + n, self.capacity)
 
     def sample(self, batch_size: int):
-        batch = random.sample(self.buf, batch_size)
-        s, a, r, s2, d = zip(*batch)
-        return (np.stack(s).astype(np.float32),
-                np.array(a, dtype=np.int64),
-                np.array(r, dtype=np.float32),
-                np.stack(s2).astype(np.float32),
-                np.array(d, dtype=np.float32))
+        idx = np.random.randint(0, self.size, size=batch_size)
+        return (self.s_buf[idx], self.a_buf[idx], self.r_buf[idx], 
+                self.s2_buf[idx], self.d_buf[idx])
 
     def __len__(self):
-        return len(self.buf)
+        return self.size
 
 def train_ddqn(
     episodes: int = configs.ddqn_episodes,
@@ -71,10 +108,17 @@ def train_ddqn(
             )
         return _thunk
 
-    # Vectorized Environments (Async for true parallelism)
-    envs = gym.vector.AsyncVectorEnv([make_env(i) for i in range(num_envs)])
+    env_fns = [make_env(i) for i in range(num_envs)]
+
+    # AsyncVectorEnv can hide worker exceptions on Windows; fall back to SyncVectorEnv if reset fails.
+    envs = gym.vector.AsyncVectorEnv(env_fns)
     seeds = [seed + i * 100 for i in range(num_envs)]
-    states, _ = envs.reset(seed=seeds)
+    try:
+        states, _ = envs.reset(seed=seeds)
+    except Exception:
+        envs.close()
+        envs = gym.vector.SyncVectorEnv(env_fns)
+        states, _ = envs.reset(seed=seeds)
     
     obs_dim = states.shape[1] 
     n_actions = 2
@@ -84,7 +128,7 @@ def train_ddqn(
     q_tgt.load_state_dict(q.state_dict())
     opt = optim.Adam(q.parameters(), lr=lr)
     loss_fn = nn.SmoothL1Loss()
-    buf = ReplayBuffer(capacity=buffer_capacity)
+    buf = ReplayBuffer(capacity=buffer_capacity, obs_dim=obs_dim)
 
     def epsilon(ep_idx: int) -> float:
         if eps_decay_episodes <= 0: return eps_end
@@ -92,14 +136,10 @@ def train_ddqn(
         return float(eps_start + (eps_end - eps_start) * frac)
 
     def select_actions(curr_states: np.ndarray, eps: float) -> np.ndarray:
-        actions = []
-        for i in range(num_envs):
-            if random.random() < eps:
-                actions.append(random.randint(0, n_actions - 1))
-            else:
-                actions.append(-1)
-        actions = np.array(actions)
-        mask = (actions == -1)
+        explore_mask = np.random.random(num_envs) < eps
+        actions = np.empty(num_envs, dtype=np.int64)
+        actions[explore_mask] = np.random.randint(0, n_actions, size=int(explore_mask.sum()))
+        mask = ~explore_mask
         if mask.any():
             with torch.no_grad():
                 s_tensor = torch.as_tensor(curr_states[mask], device=device, dtype=torch.float32)
@@ -131,45 +171,59 @@ def train_ddqn(
     temp_losses = [] 
     temp_grads = [] # [FIX] Initialize for gradient norm tracking
 
+    # --- Timing Accumulators (Last 10 EP) ---
+    t_ac = {"fwd": 0.0, "prep": 0.0, "f_op": 0.0, "f_mch": 0.0, "f_pair": 0.0, "state_upd": 0.0}
+    t_main = {"select": 0.0, "env_step": 0.0, "replay": 0.0, "bookkeeping": 0.0, "validation": 0.0}
+
     pbar = tqdm(total=episodes, desc="Averaged Batches")
 
     while len(returns) < episodes:
         curr_eps = epsilon(len(returns) + 1)
+        t0 = time.perf_counter()
         actions = select_actions(states, curr_eps)
+        t_main["select"] += time.perf_counter() - t0
         
         # Step all environments
+        t0 = time.perf_counter()
         next_states, rewards, dones, truncs, infos = envs.step(actions)
+        t_main["env_step"] += time.perf_counter() - t0
 
-        # Process each environment
-        for i in range(num_envs):
-            # 1. Push transition to buffer
-            buf.push(states[i], actions[i], rewards[i], next_states[i], float(dones[i] or truncs[i]))
-            
-            # 2. Accumulate metrics safely (Directly from info arrays)
-            def get_val(key, idx):
-                if key in infos and isinstance(infos[key], (list, np.ndarray)) and idx < len(infos[key]):
-                    return float(infos[key][idx])
-                return 0.0
+        # 1. Vectorized Push to Replay Buffer
+        t0 = time.perf_counter()
+        buf.push_batch(states, actions, rewards, next_states, (dones | truncs).astype(float))
 
-            r_idle = get_val("reward_idle_cost", i)
-            r_buf = get_val("reward_buffer_penalty", i)
-            r_rel = get_val("reward_release_penalty", i)
-            r_stab = get_val("reward_stability_penalty", i)
+        # 2. Vectorized Metric Accumulation
+        running_ep_returns += rewards.astype(float)
+        
+        # Helper to get info arrays or zeros
+        def get_info_arr(key):
+            if key in infos: return np.asarray(infos[key], dtype=float)
+            return np.zeros(num_envs)
 
-            running_ep_returns[i] += float(rewards[i])
-            running_ep_idle[i] += r_idle
-            running_ep_buf[i] += r_buf
-            running_ep_rel[i] += r_rel
-            running_ep_stab[i] += r_stab
-            
-            if dones[i] or truncs[i]:
-                # Extract KPIs directly from the flat info arrays (as per debug output)
-                ep_td = get_val("episode_tardiness", i)
-                ep_mk = get_val("episode_makespan", i)
-                ep_rel_count = int(get_val("release_count", i))
-                ep_flush = get_val("reward_final_flush_penalty", i)
+        running_ep_idle += get_info_arr("reward_idle_cost")
+        running_ep_buf += get_info_arr("reward_buffer_penalty")
+        running_ep_rel += get_info_arr("reward_release_penalty")
+        running_ep_stab += get_info_arr("reward_stability_penalty")
+        
+        # [TIMING] Accumulate detailed PPO timings
+        t_ac["fwd"] += np.sum(get_info_arr("t_ac_fwd"))
+        t_ac["prep"] += np.sum(get_info_arr("t_ac_prep"))
+        t_ac["f_op"] += np.sum(get_info_arr("t_ac_f_op"))
+        t_ac["f_mch"] += np.sum(get_info_arr("t_ac_f_mch"))
+        t_ac["f_pair"] += np.sum(get_info_arr("t_ac_f_pair"))
+        t_ac["state_upd"] += np.sum(get_info_arr("t_ac_state_upd"))
+
+        # 3. Handle Episode Termination (Vectorized Check)
+        term_mask = (dones | truncs)
+        if term_mask.any():
+            idx_finished = np.where(term_mask)[0]
+            for i in idx_finished:
+                # Extract terminal metrics
+                ep_td = float(infos["episode_tardiness"][i]) if "episode_tardiness" in infos else 0.0
+                ep_mk = float(infos["episode_makespan"][i]) if "episode_makespan" in infos else 0.0
+                ep_rel_count = int(infos["release_count"][i]) if "release_count" in infos else 0
+                ep_flush = float(infos["reward_final_flush_penalty"][i]) if "reward_final_flush_penalty" in infos else 0.0
                 
-                # Add to batch buffers
                 batch_ep_returns.append(running_ep_returns[i])
                 batch_ep_idle.append(running_ep_idle[i])
                 batch_ep_buf.append(running_ep_buf[i])
@@ -180,7 +234,7 @@ def train_ddqn(
                 batch_ep_mk.append(ep_mk)
                 batch_ep_rel_count.append(ep_rel_count)
 
-                # Reset running counters for this env
+                # Reset running counters
                 running_ep_returns[i] = 0.0
                 running_ep_idle[i] = 0.0; running_ep_buf[i] = 0.0
                 running_ep_rel[i] = 0.0; running_ep_stab[i] = 0.0
@@ -217,10 +271,12 @@ def train_ddqn(
                 opt.step()
                 soft_update(q, q_tgt, target_tau)
                 temp_losses.append(loss.item()) # Store step loss
+        t_main["replay"] += time.perf_counter() - t0
 
 
         # [CRITICAL] Check Averaging Logic OUTSIDE the per-env loop
         if len(batch_ep_returns) >= num_envs:
+            t0 = time.perf_counter()
             avg_ret = np.mean(batch_ep_returns)
             avg_td = np.mean(batch_ep_td)
             avg_mk = np.mean(batch_ep_mk)
@@ -254,8 +310,24 @@ def train_ddqn(
             batch_ep_td, batch_ep_mk, batch_ep_rel_count = [], [], []
 
             curr_idx = len(returns)
+            
+            # [PROFILE PRINTING]
+            if curr_idx == 1 or curr_idx % 10 == 0:
+                total_ac = sum(t_ac.values())
+                total_main = sum(t_main.values())
+                tqdm.write(f"\n--- HYPER-GRANULAR PPO PROFILE (EP {curr_idx}) ---")
+                tqdm.write(f"PHASE | TOTAL | Prep | Fwd  | F_Op | F_Mch| F_Pr | Upd ")     
+                tqdm.write(f"------|-------|------|------|------|------|------|-----")     
+                tqdm.write(f"ACTUL |{total_ac:6.1f} |{t_ac['prep']:5.1f} |{t_ac['fwd']:5.1f} |{t_ac['f_op']:5.1f} |{t_ac['f_mch']:5.1f} |{t_ac['f_pair']:5.1f} |{t_ac['state_upd']:4.1f}")
+                tqdm.write(f"-------------------------------------------------------")
+                tqdm.write(f"MAIN  |{total_main:6.1f} | Sel={t_main['select']:5.1f} | Step={t_main['env_step']:5.1f} | Replay={t_main['replay']:5.1f} | Book={t_main['bookkeeping']:5.1f} | Val={t_main['validation']:5.1f}")
+                # Reset for next batch
+                for k in t_ac: t_ac[k] = 0.0
+                for k in t_main: t_main[k] = 0.0
+
             # Validation Logic
             if curr_idx % 10 == 0:
+                tv0 = time.perf_counter()
                 val_env = EventGateEnv(n_machines=configs.n_m, heuristic=configs.scheduler_type,
                                        interarrival_mean=interarrival_mean, burst_K=burst_K,
                                        event_horizon=event_horizon, init_jobs=int(configs.init_jobs))
@@ -268,12 +340,14 @@ def train_ddqn(
                 v_kpi = val_env.orch.get_final_kpi_stats(val_env.all_job_due_dates)
                 val_episodes.append(curr_idx); val_makespans.append(v_kpi["makespan"]); val_tardiness.append(v_kpi["tardiness"]); val_rel_counts.append(vi.get("release_count", 0))
                 tqdm.write(f">>> [VAL {curr_idx:04d}] MK={v_kpi['makespan']:7.1f} | TD={v_kpi['tardiness']:8.1f} | Rel={vi.get('release_count', 0)}")
+                t_main["validation"] += time.perf_counter() - tv0
 
             # Log EP
             avg_R_10 = np.mean(returns[-10:]) if len(returns) >= 10 else np.mean(returns)
             curr_L = history_loss[-1] if history_loss else 0.0
             tqdm.write(f"[EP {curr_idx:04d}] R={avg_ret:8.2f} (avg10={avg_R_10:8.2f}) | L={curr_L:6.4f} | MK={avg_mk:7.1f} | TD={avg_td:8.1f} | Rel={avg_rel:.0f}")
             pbar.update(1)
+            t_main["bookkeeping"] += time.perf_counter() - t0
 
         states = next_states
 
