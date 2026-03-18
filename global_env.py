@@ -349,7 +349,16 @@ class GlobalTimelineOrchestrator:
 
     def get_wip_stats(self, t_now: float) -> Dict[str, float]:
         slacks, n_tardy, n_act, p_td, total_rem_w = [], 0, 0, 0.0, 0.0
-        if not self._last_jobs_snapshot: return {"wip_min_slack": 0.0, "wip_avg_slack": 0.0, "wip_tardy_ratio": 0.0, "planned_td": 0.0, "total_rem_work": 0.0, "wip_slack_std": 0.0, "wip_count": 0}
+        if not self._last_jobs_snapshot:
+            return {
+                "wip_min_slack": 0.0,
+                "wip_avg_slack": 0.0,
+                "wip_tardy_ratio": 0.0,
+                "planned_td": 0.0,
+                "total_rem_work": 0.0,
+                "wip_slack_std": 0.0,
+                "wip_count": 0,
+            }
         
         job_rows = {}
         for r in self._last_full_rows: job_rows.setdefault(int(r["job"]), []).append(r)
@@ -362,7 +371,6 @@ class GlobalTimelineOrchestrator:
                     rem_w += float(op.avg_proc_time)
                 total_rem_w += rem_w
                 due = float(js.meta.get("due_date", 0.0))
-                p_td += max(0.0, t_now + rem_w - due)
                 slacks.append(due - (t_now + rem_w))
                 continue
             
@@ -390,8 +398,25 @@ class GlobalTimelineOrchestrator:
             # [DEBUG] Track Job 1 specifically if needed
             # if jid == 1: print(f"  [DEBUG WIP] Job 1: t_now={t_now:.1f}, p_finish={p_finish:.1f}, rem_w={rem_w:.1f}, due={due:.1f}")
 
-        if n_act == 0: return {"wip_min_slack": 0.0, "wip_avg_slack": 0.0, "wip_tardy_ratio": 0.0, "planned_td": 0.0, "total_rem_work": 0.0, "wip_slack_std": 0.0, "wip_count": 0}
-        return {"wip_min_slack": min(slacks), "wip_avg_slack": np.mean(slacks), "wip_tardy_ratio": n_tardy/n_act, "planned_td": p_td, "total_rem_work": total_rem_w, "wip_slack_std": float(np.std(slacks)), "wip_count": n_act}
+        if n_act == 0:
+            return {
+                "wip_min_slack": 0.0,
+                "wip_avg_slack": 0.0,
+                "wip_tardy_ratio": 0.0,
+                "planned_td": 0.0,
+                "total_rem_work": 0.0,
+                "wip_slack_std": 0.0,
+                "wip_count": 0,
+            }
+        return {
+            "wip_min_slack": min(slacks),
+            "wip_avg_slack": np.mean(slacks),
+            "wip_tardy_ratio": n_tardy/n_act,
+            "planned_td": p_td,
+            "total_rem_work": total_rem_w,
+            "wip_slack_std": float(np.std(slacks)),
+            "wip_count": n_act,
+        }
 
     def get_final_kpi_stats(self, all_due: Dict[int, float]) -> Dict[str, float]:
         fins = self._job_history_finishes.copy()
@@ -399,11 +424,11 @@ class GlobalTimelineOrchestrator:
         total_td = sum(max(0.0, fins.get(jid, 0.0) - due) for jid, due in all_due.items())
         return {"makespan": float(np.max(self.machine_free_time)), "tardiness": total_td}
 
-    def get_total_tardiness_estimate(self) -> float:
-        if not self._last_jobs_snapshot: return 0.0
+    def get_total_tardiness_estimate(self, all_due: Dict[int, float]) -> float:
         fins = self._job_history_finishes.copy()
-        for r in self._last_full_rows: fins[int(r["job"])] = max(fins.get(int(r["job"]), 0.0), float(r["end"]))
-        return sum(max(0.0, fins.get(int(js.job_id), 0.0) - float(js.meta.get("due_date", 0.0))) for js in self._last_jobs_snapshot)
+        for r in self._last_full_rows:
+            fins[int(r["job"])] = max(fins.get(int(r["job"]), 0.0), float(r["end"]))
+        return sum(max(0.0, fins.get(int(jid), 0.0) - float(due)) for jid, due in all_due.items())
 
     def _build_batch(self, jobs: List[JobSpec]):
         jl = np.array([len(j.operations) for j in jobs], dtype=int)

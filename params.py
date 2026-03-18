@@ -155,33 +155,43 @@ parser.add_argument('--ppo_sample', type=str2bool, default=False, help='PPO 推�
 # ============================
 # DDQN Gate Policy & Training
 # ============================
-parser.add_argument('--gate_policy', type=str, default='cadence',
+parser.add_argument('--gate_policy', type=str, default='ddqn',
                     choices=['ddqn', 'cadence'],
                     help='Gate 策略：ddqn=用模型；cadence=按固定事件步長釋放 (cadence=1 等同於 Always)')
-parser.add_argument('--gate_cadence', type=int, default=3, help='當 gate_policy=cadence 時，每隔幾個到達事件釋放一次緩衝區')
+parser.add_argument('--gate_cadence', type=int, default=1, help='當 gate_policy=cadence 時，每隔幾個到達事件釋放一次緩衝區')
 parser.add_argument('--eval_action_selection', type=str, default='greedy',
                     choices=['sample', 'greedy'],
                     help='sample or greedy')
-parser.add_argument('--ddqn_model_path', type=str, default=r"ddqn_ckpt\stab_05_256_3.pth", help='DDQN 推論權重路徑（.pth）')
-parser.add_argument('--ddqn_name', type=str, default='stab_05_256_3', help='DDQN 訓練存檔名稱 (不含 .pth)')
+parser.add_argument('--ddqn_model_path', type=str, default=r"ddqn_ckpt\testt1.pth", help='DDQN 推論權重路徑（.pth）')
+parser.add_argument('--ddqn_name', type=str, default='testt1', help='DDQN 訓練存檔名稱 (不含 .pth)')
 
 # DDQN Training Hyperparameters
-parser.add_argument('--ddqn_num_layers', type=int, default=3, help='Number of hidden layers in DDQN')
-parser.add_argument('--ddqn_hidden_dim', type=int, default=256, help='Hidden dimension of DDQN network')
+parser.add_argument('--ddqn_num_layers', type=int, default=4, help='Number of hidden layers in DDQN')
+parser.add_argument('--ddqn_hidden_dim', type=int, default=512, help='Hidden dimension of DDQN network')
+parser.add_argument('--ddqn_dueling', type=str2bool, default=True, help='Whether to use Dueling DQN architecture')
 parser.add_argument('--ddqn_episodes', type=int, default=100, help='DDQN 訓練集 episode 數')
 parser.add_argument('--ddqn_lr', type=float, default=5e-5, help='DDQN 學習率')
-parser.add_argument('--ddqn_gamma', type=float, default=0.999, help='DDQN 折扣因子 γ')
-parser.add_argument('--ddqn_eps_start', type=float, default=0.8, help='ε-greedy 初始 ε')
-parser.add_argument('--ddqn_eps_end', type=float, default=0.05, help='ε-greedy 最小 ε')
-parser.add_argument('--ddqn_eps_decay_episodes', type=int, default=70, help='ε 從起始到終值的衰減 episode 數')
-parser.add_argument('--ddqn_batch_size', type=int, default=1024, help='DDQN 更新時的 minibatch 大小')
+parser.add_argument('--ddqn_gamma', type=float, default=0.995, help='DDQN 折扣因子 γ')
+parser.add_argument('--ddqn_eps_start', type=float, default=0.9, help='ε-greedy 初始 ε')
+parser.add_argument('--ddqn_eps_end', type=float, default=0.01, help='ε-greedy 最小 ε')
+parser.add_argument('--ddqn_eps_decay_episodes', type=int, default=50, help='ε 從起始到終值的衰減 episode 數')
+parser.add_argument('--ddqn_batch_size', type=int, default=256, help='DDQN 更新時的 minibatch 大小')
+parser.add_argument('--ddqn_replay_ratio', type=int, default=2, help='Number of gradient updates per environment step')
 parser.add_argument('--ddqn_buffer_capacity', type=int, default=10_000, help='Replay buffer 容量')
-parser.add_argument('--ddqn_target_tau', type=float, default=0.005, help='目標網路軟更新係數 τ')
+parser.add_argument('--ddqn_target_tau', type=float, default=0.001, help='目標網路軟更新係數 τ')
 parser.add_argument('--ddqn_seed', type=int, default=42, help='DDQN 訓練隨機種子（與事件種子獨立）')
 parser.add_argument('--ddqn_validate_every', type=int, default=10, help='每多少個 episodes 做一次驗證（greedy）')
 parser.add_argument('--ddqn_val_episodes', type=int, default=5, help='驗證時計算平均回報的 episodes 數')
 parser.add_argument('--ddqn_out_dir', type=str, default='ddqn_ckpt', help='DDQN 訓練權重輸出資料夾')
-parser.add_argument('--ddqn_num_envs', type=int, default=4, help='DDQN 訓練並行環境數')
+parser.add_argument('--ddqn_num_envs', type=int, default=1, help='DDQN 訓練並行環境數')
+parser.add_argument('--ddqn_lr_decay', type=str2bool, default=True, help='Whether to linearly decay DDQN learning rate')
+parser.add_argument('--ddqn_lr_end', type=float, default=1e-5, help='Final DDQN learning rate when decay is enabled')
+parser.add_argument('--ddqn_use_per', type=str2bool, default=True, help='Use prioritized experience replay (PER)')
+parser.add_argument('--ddqn_per_alpha', type=float, default=0.6, help='PER priority exponent alpha')
+parser.add_argument('--ddqn_per_beta_start', type=float, default=0.4, help='PER importance-sampling beta start')
+parser.add_argument('--ddqn_per_beta_end', type=float, default=1.0, help='PER importance-sampling beta end')
+parser.add_argument('--ddqn_per_eps', type=float, default=1e-3, help='Small epsilon added to PER priorities')
+parser.add_argument('--ddqn_stratified_min_frac', type=float, default=0.3, help='Minimum per-action fraction in a batch (0~0.5), e.g., 0.3')
 
 
 # ============================
@@ -189,11 +199,12 @@ parser.add_argument('--ddqn_num_envs', type=int, default=4, help='DDQN 訓練並
 # ============================
 parser.add_argument('--reward_alpha', type=float, default=0.3, help='Weight for Makespan in reward (alpha). Idle weight will be (1-alpha). Default 0.3 matches previous 0.3/0.7 split.')
 parser.add_argument('--tardiness_alpha', type=float, default=10.0, help='Weight for Tardiness in PPO reward calculation.')
-parser.add_argument('--stability_scale', type=float, default=0.1, help='決策穩定性懲罰 (Action 1 的額外扣分)。設為 0 代表純效能模式。')
-parser.add_argument('--buffer_penalty_coef', type=float, default=0.01, help='Coefficient for buffer tardiness penalty')
-parser.add_argument('--release_penalty_coef', type=float, default=0.05, help='Coefficient for release tardiness penalty')
-parser.add_argument('--idle_penalty_coef', type=float, default=0.1, help='Weight for machine idle time penalty')
-parser.add_argument('--flush_penalty_coef', type=float, default=0.05, help='Weight for final makespan reward at simulation end')
+parser.add_argument('--stability_scale', type=float, default=0.0, help='決策穩定性懲罰 (Action 1 的額外扣分)。設為 0 代表純效能模式。')
+parser.add_argument('--buffer_penalty_coef', type=float, default=0.0, help='Coefficient for buffer tardiness penalty')
+parser.add_argument('--release_penalty_coef', type=float, default=0.1, help='Coefficient for gate shaping and terminal TD reward')
+parser.add_argument('--shaping_reward_coef', type=float, default=0.1, help='Coefficient for shaping reward term')
+parser.add_argument('--terminal_reward_coef', type=float, default=0.1, help='Coefficient for terminal TD reward term')
+parser.add_argument('--flush_penalty_coef', type=float, default=0.0, help='Weight for final makespan reward at simulation end')
 
 
 # ============================
@@ -207,6 +218,7 @@ parser.add_argument('--plot_batch_dir', type=str, default='plots/batch', help='�
 # External Solvers
 # ============================
 parser.add_argument('--max_solve_time', type=int, default=1800, help='The maximum solving time of OR-Tools')
+parser.add_argument('--ddqn_instance_episodes', type=int, default=200, help='Episodes to reuse the same event instance before switching')
 
 
 # ============================

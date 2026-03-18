@@ -1,4 +1,0 @@
-schedule_type: same
-seed_train: 1
-eval_model_name: same_seed1_1500
-ppo_model_path: trained_network/SD2/same_seed1_1500.pth

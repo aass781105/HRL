@@ -3,20 +3,49 @@ import torch
 import torch.nn as nn
 
 class QNet(nn.Module):
-    def __init__(self, obs_dim: int, n_actions: int = 2, hidden: int = 128, num_layers: int = 3):
+    def __init__(self, obs_dim: int, n_actions: int = 2, hidden: int = 128, num_layers: int = 3, dueling: bool = True):
         super().__init__()
-        layers = []
+        self.dueling = bool(dueling)
+        trunk_layers = []
         last_dim = obs_dim
-        for i in range(num_layers - 1):
-            layers.append(nn.Linear(last_dim, hidden))
-            layers.append(nn.ReLU(inplace=True))
-            layers.append(nn.LayerNorm(hidden))
+        for _ in range(max(0, num_layers - 1)):
+            trunk_layers.append(nn.Linear(last_dim, hidden))
+            trunk_layers.append(nn.ReLU(inplace=True))
+            trunk_layers.append(nn.LayerNorm(hidden))
             last_dim = hidden
-        layers.append(nn.Linear(last_dim, n_actions))
-        self.net = nn.Sequential(*layers)
+
+        self.trunk = nn.Sequential(*trunk_layers) if trunk_layers else nn.Identity()
+        if self.dueling:
+            head_hidden = max(32, hidden // 2)
+            head_hidden2 = max(32, head_hidden // 2)
+            self.value_head = nn.Sequential(
+                nn.Linear(last_dim, head_hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(head_hidden, head_hidden2),
+                nn.ReLU(inplace=True),
+                nn.Linear(head_hidden2, 1),
+            )
+            self.adv_head = nn.Sequential(
+                nn.Linear(last_dim, head_hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(head_hidden, head_hidden2),
+                nn.ReLU(inplace=True),
+                nn.Linear(head_hidden2, n_actions),
+            )
+            self.q_head = None
+        else:
+            self.q_head = nn.Linear(last_dim, n_actions)
+            self.value_head = None
+            self.adv_head = None
 
     def forward(self, x):
-        return self.net(x)
+        h = self.trunk(x)
+        if self.dueling:
+            v = self.value_head(h)
+            a = self.adv_head(h)
+            q = v + (a - a.mean(dim=1, keepdim=True))
+            return q
+        return self.q_head(h)
 
 def log_scale_reward(x: float) -> float:
     return float(np.sign(x) * np.log1p(np.abs(x)))
@@ -61,8 +90,9 @@ def calculate_ddqn_state(
         total_rem_work = float(wip_stats.get("total_rem_work", 0.0))
         
         # [MOD] o11: Tardiness Density Ratio (Planned TD / Total Processing Work)
-        # This provides a stable indicator of how 'overdue' the pending work is.
-        c_log = p_td / (total_rem_work + 1.0)
+        # Clip only (no additional scaling) to avoid rare extreme spikes.
+        c_log_raw = p_td / (total_rem_work + 1.0)
+        c_log = float(np.clip(c_log_raw, 0.0, 10.0))
         
         w_std, w_cnt = float(wip_stats.get("wip_slack_std", 0.0))/time_scale, float(wip_stats.get("wip_count", 0.0))
         s_den = w_avg / (w_cnt + 1.0)

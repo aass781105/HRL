@@ -1,0 +1,38 @@
+ddqn_name: buffer_terminal_overfit_buf0015
+ddqn_model_path: ddqn_ckpt\buffer_terminal_overfit_buf0015.pth
+
+ddqn_dueling: true
+ddqn_hidden_dim: 512
+ddqn_num_layers: 4
+
+ddqn_use_per: true
+ddqn_per_alpha: 0.6
+ddqn_per_beta_start: 0.4
+ddqn_per_beta_end: 1.0
+ddqn_per_eps: 0.001
+ddqn_stratified_min_frac: 0.0
+
+ddqn_episodes: 60
+ddqn_num_envs: 1
+ddqn_instance_episodes: 500
+ddqn_same_problem_eval_every: 10
+
+ddqn_lr: 4.0e-5
+ddqn_lr_decay: true
+ddqn_lr_end: 2.0e-5
+ddqn_gamma: 0.99
+ddqn_batch_size: 128
+ddqn_replay_ratio: 2
+ddqn_buffer_capacity: 4000
+ddqn_target_tau: 0.001
+
+ddqn_eps_start: 0.5
+ddqn_eps_end: 0.01
+ddqn_eps_decay_episodes: 30
+
+buffer_penalty_coef: 0.015
+shaping_reward_coef: 0.0
+terminal_reward_coef: 0.1
+release_penalty_coef: 0.1
+flush_penalty_coef: 0.0
+stability_scale: 0.0
