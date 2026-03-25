@@ -604,13 +604,12 @@ class FJSPEnvForVariousOpNums:
         alpha = float(getattr(configs, "tardiness_alpha", 1.0))
 
         # [MODIFIED] Normalization using estimated makespan (mean_op_pt * n_j)
-        base_scale = self.mean_op_pt * self.number_of_jobs
-        base_scale = np.maximum(base_scale, 1e-8) # Avoid division by zero or negative
+        base_scale = self.mean_op_pt 
         
-        # Linear Scaling
+        # Linear Scalings
         reward_td = - alpha * (tardiness / base_scale)
         
-        # [MODIFIED] Total reward normalized by sqrt of number of jobs 
+        # [MODIFIED] Total reward normalized by number of jobs 
         # to prevent excessive signal dilution in larger problem scales (e.g., 30x5).
         reward = (reward_mk + reward_td) / 10
 
@@ -621,7 +620,7 @@ class FJSPEnvForVariousOpNums:
         env_idx = 0 # For single-instance evaluation
         
         job_id_in_batch = int(chosen_job[env_idx]) # This is the index in the current batch of jobs
-        op_global_id = int(chosen_op[env_idx]) # The global op index
+        op_global_id = int(chosen_op[env_idx]) # The global op indexsss
 
         # Calculate op_id_in_job from op_global_id and job_first_op_id
         # self.job_first_op_id has shape (E, N_jobs_in_batch).

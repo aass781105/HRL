@@ -1,0 +1,37 @@
+ppo_gate_name: ppo_train_value3_512_4env_400upd_xplore_l099_stab003_inst50_buf0
+ppo_gate_model_path: ppo_ckpt/ppo_train_value3_512_4env_400upd_xplore_l099_stab003_inst50_buf0.pth
+gate_policy: ppo
+
+ppo_gate_hidden_dim: 512
+ppo_gate_num_layers: 3
+ppo_gate_value_hidden_dim: 512
+ppo_gate_value_num_layers: 3
+
+ppo_gate_updates: 400
+ppo_gate_num_envs: 4
+ppo_gate_use_async_envs: true
+ppo_gate_train_seed: 142
+ppo_gate_instance_episodes: 50
+
+ppo_gate_lr: 3.0e-5
+ppo_gate_lr_decay: true
+ppo_gate_lr_end: 1.0e-5
+ppo_gate_gamma: 0.99
+ppo_gate_gae_lambda: 0.99
+ppo_gate_clip: 0.2
+ppo_gate_entropy_coef: 0.026
+ppo_gate_entropy_decay: true
+ppo_gate_entropy_end: 0.010
+ppo_gate_value_coef: 0.2
+ppo_gate_update_epochs: 2
+ppo_gate_minibatch_size: 256
+ppo_gate_max_grad_norm: 1.0
+
+ppo_gate_same_problem_eval_every: 0
+ppo_gate_validate_every: 10
+
+buffer_penalty_coef: 0.0
+shaping_reward_coef: 0.0
+td_reward_coef: 0.1
+mk_reward_coef: 0.0
+stability_scale: 0.003

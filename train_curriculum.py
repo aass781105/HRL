@@ -216,8 +216,32 @@ class Trainer:
             self.memory.clear_memory()
 
             mk_std, td_std = np.std(all_mk_rewards), np.std(all_td_rewards)
+            mk_mean = float(np.mean(all_mk_rewards)) if all_mk_rewards else 0.0
+            td_mean = float(np.mean(all_td_rewards)) if all_td_rewards else 0.0
+            mk_abs_sum = float(np.sum(np.abs(all_mk_rewards))) if all_mk_rewards else 0.0
+            td_abs_sum = float(np.sum(np.abs(all_td_rewards))) if all_td_rewards else 0.0
+            total_abs_sum = mk_abs_sum + td_abs_sum
+            if total_abs_sum > 1e-12:
+                mk_share = mk_abs_sum / total_abs_sum
+                td_share = td_abs_sum / total_abs_sum
+            else:
+                mk_share = 0.0
+                td_share = 0.0
             self.log.append([i_update, np.mean(ep_rewards)])
-            self.detailed_log.append([i_update, np.mean(ep_rewards), ep_mk_gain, mk_std, ep_td_penalty, td_std, np.mean(self.env.current_makespan), np.mean(self.env.accumulated_tardiness)])
+            self.detailed_log.append([
+                i_update,
+                np.mean(ep_rewards),
+                ep_mk_gain,
+                mk_std,
+                ep_td_penalty,
+                td_std,
+                mk_mean,
+                td_mean,
+                mk_share,
+                td_share,
+                np.mean(self.env.current_makespan),
+                np.mean(self.env.accumulated_tardiness)
+            ])
             self.loss_log.append([i_update, loss, v_loss, p_loss])
 
             if (i_update + 1) % self.validate_timestep == 0:
@@ -252,7 +276,21 @@ class Trainer:
                 # [UPDATED] Clean Console Output with Training Metrics
                 avg_reward = np.mean(ep_rewards)
                 # Use current loss values from the update step
-                tqdm.write(f'Update {i_update+1}/{self.max_updates} | R: {avg_reward:.2f} | Loss: {loss:.4f} | V-Loss: {v_loss:.4f} | Vali MK: {overall_ms_mean:.1f} | Vali TD: {overall_td_mean:.1f} | Best TD: {self.record:.1f}')
+                tqdm.write(
+                    f'Update {i_update+1}/{self.max_updates} | '
+                    f'R: {avg_reward:.2f} | Loss: {loss:.4f} | V-Loss: {v_loss:.4f} | '
+                    f'MK_r: {mk_mean:.4f} ({mk_share*100:5.1f}%) | '
+                    f'TD_r: {td_mean:.4f} ({td_share*100:5.1f}%) | '
+                    f'Vali MK: {overall_ms_mean:.1f} | Vali TD: {overall_td_mean:.1f} | Best TD: {self.record:.1f}'
+                )
+            else:
+                avg_reward = np.mean(ep_rewards)
+                tqdm.write(
+                    f'Update {i_update+1}/{self.max_updates} | '
+                    f'R: {avg_reward:.2f} | Loss: {loss:.4f} | V-Loss: {v_loss:.4f} | '
+                    f'MK_r: {mk_mean:.4f} ({mk_share*100:5.1f}%) | '
+                    f'TD_r: {td_mean:.4f} ({td_share*100:5.1f}%)'
+                )
 
         self.train_et = time.time()
         self.save_training_log()

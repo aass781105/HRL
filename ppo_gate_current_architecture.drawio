@@ -1,0 +1,128 @@
+<mxfile host="app.diagrams.net" agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0" version="29.6.3">
+  <diagram id="ppo-gate-current-arch" name="PPO Gate Current Architecture">
+    <mxGraphModel dx="1134" dy="624" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2200" pageHeight="1400" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=18;fontStyle=1;" value="&lt;b&gt;Hight Level agent - PPO Gate Architecture&lt;/b&gt;" vertex="1">
+          <mxGeometry height="50" width="760" x="700" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="state" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;spacingLeft=10;" value="&lt;b&gt;Environment State (18-D)&lt;/b&gt;&lt;br&gt;Source: calculate_ddqn_state(...) in model/ddqn_model.py&lt;br&gt;&lt;br&gt;1. log1p(buffer_size)&lt;br&gt;2. avg machine remaining load&lt;br&gt;3. min machine remaining load&lt;br&gt;4. weighted idle&lt;br&gt;5. buffer tardiness ratio&lt;br&gt;6. buffer min slack&lt;br&gt;7. buffer avg slack&lt;br&gt;8. WIP min slack&lt;br&gt;9. WIP avg slack&lt;br&gt;10. WIP tardy ratio&lt;br&gt;11. machine load std&lt;br&gt;12. c_log = clip(planned_td/(total_rem_work+1), 0, 10)&lt;br&gt;13. buffer slack std&lt;br&gt;14. WIP slack std&lt;br&gt;15. WIP count&lt;br&gt;16. max_load - min_load&lt;br&gt;17. slack density&lt;br&gt;18. unweighted idle&lt;br&gt;&lt;br&gt;All time-like terms are normalized by time_scale = mean_pt." vertex="1">
+          <mxGeometry height="470" width="410" x="40" y="140" as="geometry" />
+        </mxCell>
+        <mxCell id="envnote" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=10;" value="&lt;b&gt;Action Space&lt;/b&gt;&lt;br&gt;0 = HOLD&lt;br&gt;1 = RELEASE&lt;br&gt;&lt;br&gt;Env: EventGateEnv&lt;br&gt;Observation space shape = (18,)" vertex="1">
+          <mxGeometry height="120" width="410" x="40" y="640" as="geometry" />
+        </mxCell>
+        <mxCell id="trunkgroup" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" value="" vertex="1">
+          <mxGeometry height="660" width="440" x="560" y="130" as="geometry" />
+        </mxCell>
+        <mxCell id="trunktitle" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1;" value="&lt;b&gt;Shared Trunk (current main line)&lt;/b&gt;&lt;br&gt;Source: model/ppo_gate_model.py&lt;br&gt;separate_trunks = false" vertex="1">
+          <mxGeometry height="70" width="320" x="620" y="150" as="geometry" />
+        </mxCell>
+        <mxCell id="trunk1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#b85450;align=left;spacingLeft=10;" value="&lt;b&gt;Trunk Layer 1&lt;/b&gt;&lt;br&gt;Linear(18 -&gt; 512)&lt;br&gt;ReLU&lt;br&gt;LayerNorm(512)" vertex="1">
+          <mxGeometry height="100" width="280" x="640" y="260" as="geometry" />
+        </mxCell>
+        <mxCell id="trunk2" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#b85450;align=left;spacingLeft=10;" value="&lt;b&gt;Trunk Layer 2&lt;/b&gt;&lt;br&gt;Linear(512 -&gt; 512)&lt;br&gt;ReLU&lt;br&gt;LayerNorm(512)" vertex="1">
+          <mxGeometry height="100" width="280" x="640" y="395" as="geometry" />
+        </mxCell>
+        <mxCell id="trunk3" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#b85450;align=left;spacingLeft=10;" value="&lt;b&gt;Trunk Layer 3&lt;/b&gt;&lt;br&gt;Linear(512 -&gt; 512)&lt;br&gt;ReLU&lt;br&gt;LayerNorm(512)" vertex="1">
+          <mxGeometry height="100" width="280" x="640" y="530" as="geometry" />
+        </mxCell>
+        <mxCell id="sharedout" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=10;" value="&lt;b&gt;Shared feature h&lt;/b&gt;&lt;br&gt;Dimension = 512&lt;br&gt;Same h goes to both policy head and value head." vertex="1">
+          <mxGeometry height="90" width="320" x="620" y="670" as="geometry" />
+        </mxCell>
+        <mxCell id="policygroup" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" value="" vertex="1">
+          <mxGeometry height="370" width="430" x="1090" y="100" as="geometry" />
+        </mxCell>
+        <mxCell id="policytitle" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1;" value="&lt;b&gt;Actor / Policy Head&lt;/b&gt;" vertex="1">
+          <mxGeometry height="50" width="220" x="1190" y="120" as="geometry" />
+        </mxCell>
+        <mxCell id="policyhead" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;align=left;spacingLeft=10;" value="&lt;b&gt;Policy Head&lt;/b&gt;&lt;br&gt;Linear(512 -&gt; 2)&lt;br&gt;&lt;br&gt;Output logits for:&lt;br&gt;- action 0: HOLD&lt;br&gt;- action 1: RELEASE" vertex="1">
+          <mxGeometry height="120" width="310" x="1150" y="205" as="geometry" />
+        </mxCell>
+        <mxCell id="policydist" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=10;" value="&lt;b&gt;Action Selection&lt;/b&gt;&lt;br&gt;Training: Categorical(logits).sample()&lt;br&gt;Evaluation: argmax(logits)&lt;br&gt;&lt;br&gt;This produces HOLD / RELEASE decision." vertex="1">
+          <mxGeometry height="110" width="360" x="1125" y="350" as="geometry" />
+        </mxCell>
+        <mxCell id="valuegroup" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="" vertex="1">
+          <mxGeometry height="410" width="470" x="1090" y="540" as="geometry" />
+        </mxCell>
+        <mxCell id="valuetitle" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" value="&lt;b&gt;Critic / Value Head (value3)&lt;/b&gt;" vertex="1">
+          <mxGeometry height="50" width="260" x="1190" y="560" as="geometry" />
+        </mxCell>
+        <mxCell id="value1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;align=left;spacingLeft=10;" value="&lt;b&gt;Value Layer 1&lt;/b&gt;&lt;br&gt;Linear(512 -&gt; 512)&lt;br&gt;ReLU&lt;br&gt;LayerNorm(512)" vertex="1">
+          <mxGeometry height="95" width="330" x="1150" y="635" as="geometry" />
+        </mxCell>
+        <mxCell id="value2" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;align=left;spacingLeft=10;" value="&lt;b&gt;Value Layer 2&lt;/b&gt;&lt;br&gt;Linear(512 -&gt; 512)&lt;br&gt;ReLU&lt;br&gt;LayerNorm(512)" vertex="1">
+          <mxGeometry height="95" width="330" x="1150" y="750" as="geometry" />
+        </mxCell>
+        <mxCell id="value3" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;align=left;spacingLeft=10;" value="&lt;b&gt;Value Output&lt;/b&gt;&lt;br&gt;Linear(512 -&gt; 1)&lt;br&gt;&lt;br&gt;Output: V(s)" vertex="1">
+          <mxGeometry height="70" width="330" x="1150" y="860" as="geometry" />
+        </mxCell>
+        <mxCell id="ppo" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;align=left;spacingLeft=10;" value="&lt;b&gt;PPO Update&lt;/b&gt;&lt;br&gt;Source: train_ppo_gate.py&lt;br&gt;&lt;br&gt;1. Collect episodes from 2 envs&lt;br&gt;2. Compute GAE(γ=0.99, λ=0.95)&lt;br&gt;3. Normalize advantage&lt;br&gt;4. PPO clipped policy loss&lt;br&gt;5. Value MSE loss&lt;br&gt;6. Entropy bonus&lt;br&gt;7. Gradient clipping&lt;br&gt;&lt;br&gt;Current tuned2 example:&lt;br&gt;- lr 4e-5 -&gt; 1.5e-5&lt;br&gt;- entropy_coef = 0.012&lt;br&gt;- value_coef = 0.2&lt;br&gt;- update_epochs = 3&lt;br&gt;- minibatch_size = 128" vertex="1">
+          <mxGeometry height="260" width="420" x="1640" y="450" as="geometry" />
+        </mxCell>
+        <mxCell id="note" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;align=left;spacingLeft=10;" value="&lt;b&gt;Current Main-Line Interpretation&lt;/b&gt;&lt;br&gt;The network does not directly see future jobs.&lt;br&gt;It sees current buffer / WIP / machine-load summary features, and learns when HOLD vs RELEASE improves long-term TD." vertex="1">
+          <mxGeometry height="120" width="420" x="1640" y="760" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" edge="1" parent="1" style="endArrow=classic;html=1;rounded=0;strokeWidth=2;" target="trunk1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="450" y="310" as="sourcePoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="trunk1" style="endArrow=classic;html=1;rounded=0;strokeWidth=2;" target="trunk2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="trunk2" style="endArrow=classic;html=1;rounded=0;strokeWidth=2;" target="trunk3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="trunk3" style="endArrow=classic;html=1;rounded=0;strokeWidth=2;" target="sharedout">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" edge="1" parent="1" source="policyhead" style="endArrow=classic;html=1;rounded=0;strokeWidth=2;" target="policydist">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" edge="1" parent="1" source="value1" style="endArrow=classic;html=1;rounded=0;strokeWidth=2;" target="value2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9" edge="1" parent="1" source="value2" style="endArrow=classic;html=1;rounded=0;strokeWidth=2;" target="value3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="ppx9QiVEvAeBX8yEINtH-1" edge="1" parent="1" source="sharedout" style="endArrow=classic;html=1;rounded=0;exitX=0.5;exitY=1;exitDx=0;exitDy=0;curved=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="policyhead" value="">
+          <mxGeometry height="50" relative="1" width="50" as="geometry">
+            <Array as="points">
+              <mxPoint x="780" y="850" />
+              <mxPoint x="1040" y="850" />
+              <mxPoint x="1040" y="265" />
+            </Array>
+            <mxPoint x="1120" y="710" as="sourcePoint" />
+            <mxPoint x="1040" y="250" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="ppx9QiVEvAeBX8yEINtH-2" edge="1" parent="1" style="endArrow=classic;html=1;rounded=0;" target="value1" value="">
+          <mxGeometry height="50" relative="1" width="50" as="geometry">
+            <mxPoint x="1040" y="681.25" as="sourcePoint" />
+            <mxPoint x="1150" y="683.75" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="ppx9QiVEvAeBX8yEINtH-3" edge="1" parent="1" source="value3" style="endArrow=classic;html=1;rounded=0;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="ppo" value="">
+          <mxGeometry height="50" relative="1" width="50" as="geometry">
+            <Array as="points">
+              <mxPoint x="1315" y="1000" />
+              <mxPoint x="1610" y="1000" />
+              <mxPoint x="1610" y="400" />
+              <mxPoint x="1850" y="400" />
+            </Array>
+            <mxPoint x="1460" y="600" as="sourcePoint" />
+            <mxPoint x="1870" y="320" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="ppx9QiVEvAeBX8yEINtH-4" edge="1" parent="1" source="policydist" style="endArrow=none;html=1;rounded=0;exitX=1.001;exitY=0.458;exitDx=0;exitDy=0;exitPerimeter=0;" value="">
+          <mxGeometry height="50" relative="1" width="50" as="geometry">
+            <mxPoint x="1485" y="404.88" as="sourcePoint" />
+            <mxPoint x="1610" y="400" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

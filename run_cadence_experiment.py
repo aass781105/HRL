@@ -9,7 +9,7 @@ def run_sensitivity_analysis():
     results = []
     
     # 建立主輸出目錄
-    base_plot_dir = "plots/cadence_study_curriculum_old"
+    base_plot_dir = "plots/cadence_study_same2"
     os.makedirs(base_plot_dir, exist_ok=True)
     
     print("-" * 30)

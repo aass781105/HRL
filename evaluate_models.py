@@ -2,8 +2,8 @@
 # This script benchmarks a PPO model on a fixed set of dynamically generated instances.
 # It reads all configuration from the global `configs` object (from params.py)
 # to determine which model to test, how many times to run each instance, and
-# parameters for the dynamic environment. It also supports a DDQN-based gate policy
-# for job release decisions.
+# parameters for the dynamic environment. The high-level gate policy supports
+# PPO gate or cadence-based release decisions.
 # The results are saved to a uniquely named CSV file based on the model name.
 
 import os
@@ -64,8 +64,8 @@ BatchScheduleRecorder.record_step = patched_record_step
 # ============================== End of Monkey Patch ===============================
 
 
-# --- DDQN Gating Components (from main.py) ---
-from model.ddqn_model import QNet, calculate_ddqn_state
+from model.gate_state import calculate_gate_state
+from model.ppo_gate_model import PPOGateNet
 
 def fixed_k_sampler(K: int):
     """[ADDED] 固定一次釋放 K 筆的 sampler。"""
@@ -77,10 +77,9 @@ def _gate_obs(orch: GlobalTimelineOrchestrator, n_machines: int, t_now: float,
               burst_K: int, interarrival_mean: float,
               buf_cap_cfg: int = 0) -> np.ndarray:
     """
-    Calculates the observation for the DDQN gating policy.
-    Mirrors the observation function used in training.
+    Calculates the observation for the PPO high-level gate policy.
     """
-    scale = float(getattr(configs, "norm_scale", 100.0))
+    scale = (float(configs.low) + float(configs.high)) / 2.0
     cap = int(buf_cap_cfg) if int(buf_cap_cfg) > 0 else max(1, int(burst_K) * 3)
     
     mft_abs = np.asarray(orch.machine_free_time, dtype=float)
@@ -88,46 +87,48 @@ def _gate_obs(orch: GlobalTimelineOrchestrator, n_machines: int, t_now: float,
     horizon = float(rem.min()) if rem.size > 0 else 0.0
     
     w_idle = orch.compute_weighted_idle(t_now, horizon)
-    
-    return calculate_ddqn_state(
+
+    buf_stats = {"tardiness_ratio": 0.0, "min_slack": 0.0, "avg_slack": 0.0, "slack_std": 0.0}
+    if orch.buffer:
+        slacks = []
+        neg = 0
+        for j in orch.buffer:
+            total_proc = float(j.meta.get("total_proc_time", 0.0))
+            due = float(j.meta.get("due_date", 0.0))
+            slack = due - t_now - total_proc
+            slacks.append(slack)
+            if t_now + total_proc > due:
+                neg += 1
+        buf_stats = {
+            "tardiness_ratio": neg / len(orch.buffer),
+            "min_slack": min(slacks),
+            "avg_slack": float(np.mean(slacks)),
+            "slack_std": float(np.std(slacks)),
+        }
+
+    wip_stats = orch.get_wip_stats(t_now)
+
+    return calculate_gate_state(
         buffer_size=len(orch.buffer),
         machine_free_time=orch.machine_free_time,
         t_now=t_now,
         n_machines=n_machines,
         obs_buffer_cap=cap,
         time_scale=scale,
-        weighted_idle=w_idle
+        weighted_idle=w_idle,
+        unweighted_idle=orch.compute_unweighted_idle(t_now, horizon) if horizon > 0 else 0.0,
+        buffer_stats=buf_stats,
+        wip_stats=wip_stats,
     )
-
-    # Time-based features
-    mft_abs = np.asarray(orch.machine_free_time, dtype=float)
-    rem = np.maximum(0.0, mft_abs - float(t_now))
-    if rem.size > 0:
-        total_rem = float(rem.sum()) / n_machines
-        first_idle_rem = float(rem.min())
-    else:
-        total_rem = 0.0
-        first_idle_rem = 0.0
-
-    o1 = float(total_rem) / scale
-    o2 = float(first_idle_rem) / scale
-
-    return np.array([o0, o1, o2], dtype=np.float32)
-# --- End of DDQN Components ---
 
 
 def run_dynamic_ppo_episode(adapter, ppo_policy, action_selection, device, max_events,
-                            gate_policy, ddqn_model, burst_size, interarrival_mean, job_gen):
+                            gate_policy, ppo_gate_model, burst_size, interarrival_mean, job_gen):
     """
-    Runs a single dynamic episode, incorporating a DDQN gate for release decisions.
+    Runs a single dynamic episode with PPO or cadence gate decisions.
     """
     orch = adapter.o
-    ddqn_device = torch.device(configs.device)
     release_count = 0
-
-    # Variables for 'time' gate policy
-    gate_time_threshold = float(getattr(configs, "gate_time_threshold", 50.0))
-    acc_since_release = 0.0
     t_prev = 0.0
 
     num_arrivals = 0
@@ -146,28 +147,20 @@ def run_dynamic_ppo_episode(adapter, ppo_policy, action_selection, device, max_e
             
         # --- Gating Decision ---
         decide_release = False
-        if gate_policy == 'ddqn' and ddqn_model is not None and len(orch.buffer) > 0:
+        if gate_policy == 'ppo' and ppo_gate_model is not None and len(orch.buffer) > 0:
             gate_obs_buffer_cap = int(getattr(configs, "gate_obs_buffer_cap", 0))
             obs = _gate_obs(orch, orch.M, t_now, burst_size, interarrival_mean,
                             buf_cap_cfg=gate_obs_buffer_cap)
             with torch.no_grad():
-                qv = ddqn_model(torch.from_numpy(obs).float().unsqueeze(0).to(ddqn_device))
+                logits, _ = ppo_gate_model(torch.from_numpy(obs).float().unsqueeze(0).to(device))
                 if action_selection == 'sample':
-                    # Use Softmax (Boltzmann) exploration based on Q-values
-                    act = torch.distributions.Categorical(logits=qv).sample().item()
+                    act = torch.distributions.Categorical(logits=logits).sample().item()
                 else:
-                    # Greedy
-                    act = qv.argmax(dim=1).item()
+                    act = torch.argmax(logits, dim=1).item()
             decide_release = (act == 1)
-        elif gate_policy == 'time':
-            acc_since_release += dt_interval
-            if acc_since_release >= gate_time_threshold:
-                decide_release = True
-                acc_since_release = 0.0
-            else:
-                decide_release = False
-        else: # 'always' or other policies default to release
-            decide_release = True
+        else:
+            cadence = max(1, int(getattr(configs, "gate_cadence", 1)))
+            decide_release = (num_arrivals % cadence == 0)
         
         # --- Scheduling (if released) ---
         if decide_release:
@@ -239,8 +232,8 @@ def main():
     ppo_model_path = getattr(configs, 'ppo_model_path', None)
     action_selection = getattr(configs, 'eval_action_selection', 'sample')
 
-    gate_policy = getattr(configs, 'gate_policy', 'ddqn').lower()
-    ddqn_model_path = getattr(configs, 'ddqn_model_path', None)
+    gate_policy = getattr(configs, 'gate_policy', 'ppo').lower()
+    ppo_gate_model_path = getattr(configs, 'ppo_gate_model_path', None)
     
     if not ppo_model_path:
         tqdm.write("Error: PPO model path not specified. Please set --eval_ppo_model_path.")
@@ -248,18 +241,30 @@ def main():
 
     device = torch.device(configs.device)
     
-    # --- Load DDQN Gate Model (if applicable) ---
-    ddqn_model = None
-    if gate_policy == 'ddqn':
-        if not ddqn_model_path or not os.path.exists(ddqn_model_path):
-            tqdm.write(f"[WARN] gate_policy is 'ddqn' but ddqn_model_path is invalid: {ddqn_model_path}")
-            tqdm.write("       Falling back to 'always' release policy.")
-            gate_policy = 'always'
+    # --- Load PPO Gate Model (if applicable) ---
+    ppo_gate_model = None
+    if gate_policy == 'ppo':
+        if not ppo_gate_model_path or not os.path.exists(ppo_gate_model_path):
+            tqdm.write(f"[WARN] gate_policy is 'ppo' but ppo_gate_model_path is invalid: {ppo_gate_model_path}")
+            tqdm.write("       Falling back to cadence gate policy.")
+            gate_policy = 'cadence'
         else:
-            ddqn_model = QNet(obs_dim=4, hidden=128, n_actions=2).to(device)
-            ddqn_model.load_state_dict(torch.load(ddqn_model_path, map_location=device, weights_only=True))
-            ddqn_model.eval()
-            tqdm.write(f"Successfully loaded DDQN gate model from: {ddqn_model_path}")
+            ppo_gate_model = PPOGateNet(
+                obs_dim=18,
+                n_actions=2,
+                hidden=int(getattr(configs, "ppo_gate_hidden_dim", 256)),
+                num_layers=int(getattr(configs, "ppo_gate_num_layers", 3)),
+                separate_trunks=bool(getattr(configs, "ppo_gate_separate_trunks", False)),
+                actor_hidden=int(getattr(configs, "ppo_gate_actor_hidden_dim", getattr(configs, "ppo_gate_hidden_dim", 256))),
+                actor_num_layers=int(getattr(configs, "ppo_gate_actor_num_layers", getattr(configs, "ppo_gate_num_layers", 3))),
+                critic_hidden=int(getattr(configs, "ppo_gate_critic_hidden_dim", getattr(configs, "ppo_gate_hidden_dim", 256))),
+                critic_num_layers=int(getattr(configs, "ppo_gate_critic_num_layers", getattr(configs, "ppo_gate_num_layers", 3))),
+                value_hidden=int(getattr(configs, "ppo_gate_value_hidden_dim", getattr(configs, "ppo_gate_hidden_dim", 256))),
+                value_num_layers=int(getattr(configs, "ppo_gate_value_num_layers", 1)),
+            ).to(device)
+            ppo_gate_model.load_state_dict(torch.load(ppo_gate_model_path, map_location=device, weights_only=True))
+            ppo_gate_model.eval()
+            tqdm.write(f"Successfully loaded PPO gate model from: {ppo_gate_model_path}")
 
     tqdm.write("-" * 25 + " Starting Dynamic Model Evaluation " + "-" * 25)
     tqdm.write(f"PPO Model: {model_name}")
@@ -309,7 +314,7 @@ def main():
             
             makespan, rel_cnt = run_dynamic_ppo_episode(
                 adapter, ppo_policy, action_selection, device, event_horizon,
-                gate_policy, ddqn_model, burst_size, interarrival_mean,
+                gate_policy, ppo_gate_model, burst_size, interarrival_mean,
                 job_generator
             )
             instance_makespans.append(makespan)

@@ -23,7 +23,8 @@ from plot_utils import plot_simulation_summary_stats
 
 import torch
 import torch.nn as nn
-from model.ddqn_model import QNet, calculate_ddqn_state, log_scale_reward
+from model.gate_state import calculate_gate_state
+from model.ppo_gate_model import PPOGateNet
 
 # -----------------------------------------------------------------------------
 
@@ -45,16 +46,16 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
     gen = EventBurstGenerator(SD2_instance_generator, base_cfg, configs.n_m, interarrival_mean, fixed_k_sampler(int(burst_K)), rng)
     orch = GlobalTimelineOrchestrator(configs.n_m, gen, t0=0.0)
     
-    gate_policy = str(getattr(configs, "gate_policy", "ddqn")).lower()
-    is_ddqn = (gate_policy == "ddqn")
+    gate_policy = str(getattr(configs, "gate_policy", "ppo")).lower()
+    is_ppo = (gate_policy == "ppo")
 
     all_job_due_dates: Dict[int, float] = {}
     mean_pt = (float(configs.low) + float(configs.high)) / 2.0
     reward_scale = mean_pt
     stability_scale = float(getattr(configs, "stability_scale", 0.0))
     buffer_penalty_coef = float(getattr(configs, "buffer_penalty_coef", 0.0))
-    shaping_reward_coef = float(getattr(configs, "shaping_reward_coef", getattr(configs, "release_penalty_coef", 0.1)))
-    terminal_reward_coef = float(getattr(configs, "terminal_reward_coef", getattr(configs, "release_penalty_coef", 0.1)))
+    shaping_reward_coef = float(getattr(configs, "shaping_reward_coef", 0.0))
+    td_reward_coef = float(getattr(configs, "td_reward_coef", 0.1))
 
     def compress_rel_tail(raw_value: float, threshold: float = 2.0, tail_scale: float = 1.0) -> float:
         abs_value = abs(float(raw_value))
@@ -80,23 +81,35 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
                 'slack': due_abs - ready_abs - rem_work
             })
 
-    ddqn_model = None; ddqn_device = torch.device(getattr(configs, "device", "cpu"))
-    if gate_policy == "ddqn":
-        ddqn_model = QNet(
+    ppo_gate_model = None
+    gate_device = torch.device(getattr(configs, "device", "cpu"))
+    if gate_policy == "ppo":
+        ppo_gate_model = PPOGateNet(
             obs_dim=18,
             n_actions=2,
-            hidden=configs.ddqn_hidden_dim,
-            num_layers=configs.ddqn_num_layers,
-            dueling=bool(getattr(configs, "ddqn_dueling", True)),
-        ).to(ddqn_device)
+            hidden=int(getattr(configs, "ppo_gate_hidden_dim", 256)),
+            num_layers=int(getattr(configs, "ppo_gate_num_layers", 3)),
+            separate_trunks=bool(getattr(configs, "ppo_gate_separate_trunks", False)),
+            actor_hidden=int(getattr(configs, "ppo_gate_actor_hidden_dim", getattr(configs, "ppo_gate_hidden_dim", 256))),
+            actor_num_layers=int(getattr(configs, "ppo_gate_actor_num_layers", getattr(configs, "ppo_gate_num_layers", 3))),
+            critic_hidden=int(getattr(configs, "ppo_gate_critic_hidden_dim", getattr(configs, "ppo_gate_hidden_dim", 256))),
+            critic_num_layers=int(getattr(configs, "ppo_gate_critic_num_layers", getattr(configs, "ppo_gate_num_layers", 3))),
+            value_hidden=int(getattr(configs, "ppo_gate_value_hidden_dim", getattr(configs, "ppo_gate_hidden_dim", 256))),
+            value_num_layers=int(getattr(configs, "ppo_gate_value_num_layers", 1)),
+        ).to(gate_device)
         try:
-            ddqn_model.load_state_dict(torch.load(getattr(configs, "ddqn_model_path", ""), map_location=ddqn_device, weights_only=True)); ddqn_model.eval()
-            print(f"[DDQN] Loaded weights.")
+            ppo_gate_model.load_state_dict(torch.load(getattr(configs, "ppo_gate_model_path", ""), map_location=gate_device, weights_only=True))
+            ppo_gate_model.eval()
+            print(f"[PPO-GATE] Loaded weights.")
         except:
-            print(f"[WARN] Fallback."); gate_policy = "cadence"; is_ddqn = False
+            print(f"[WARN] Fallback."); gate_policy = "cadence"; is_ppo = False
 
     csv_dir = plot_global_dir or "plots/global"; os.makedirs(csv_dir, exist_ok=True)
-    suffix = f"DDQN_{getattr(configs, 'ddqn_name', 'default')}" if gate_policy=="ddqn" else f"Cadence_{getattr(configs, 'gate_cadence', 1)}"
+    if gate_policy == "ppo":
+        suffix = f"PPO_{getattr(configs, 'ppo_gate_name', 'default')}"
+    else:
+        suffix = f"Cadence_{getattr(configs, 'gate_cadence', 1)}"
+    os.makedirs(csv_dir, exist_ok=True)
     raw_csv_file = open(os.path.join(csv_dir, f"log_{suffix}_raw_state.csv"), "w", newline="", encoding="utf-8")
     raw_csv_writer = csv.writer(raw_csv_file)
     obs_csv_file = open(os.path.join(csv_dir, f"log_{suffix}_agent_state.csv"), "w", newline="", encoding="utf-8")
@@ -114,12 +127,20 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
         "Phi_Before", "Phi_After", "Agent_Final_TD",
         "Final_Makespan", "Final_Tardiness", "Release_Count",
     ]
-    obs_headers = ["Event_ID", "Time", "Inter_Arrival", "Action", "Action_Str"] + [f"Obs_{i}" for i in range(18)] + [
+    obs_headers = [
+        "Event_ID", "Time", "Inter_Arrival", "Action", "Action_Str",
+        "Log_Buffer_Count", "Norm_Avg_Load", "Norm_Min_Load", "Norm_Load_Range", "Norm_Load_Std",
+        "Norm_Weighted_Idle", "Norm_Unweighted_Idle",
+        "Buf_NegSlack_Ratio", "Norm_Buf_Min_Slack", "Norm_Buf_Avg_Slack", "Norm_Buf_Slack_Std",
+        "WIP_Job_Count", "WIP_Tardy_Ratio", "Norm_WIP_Min_Slack", "Norm_WIP_Avg_Slack", "Norm_WIP_Slack_Std",
+        "Clipped_Planned_TD_Ratio", "Avg_WIP_Slack_Per_Job",
+    ] + [
         "Actual_TD",
         "Reward_Total", "Reward_Stab", "Reward_Buffer", "Reward_Shaping", "Reward_Terminal", "Reward_Flush",
         "Phi_Before", "Phi_After", "Agent_Final_TD",
         "Final_Makespan", "Final_Tardiness", "Release_Count",
     ]
+    obs_csv_order = [0, 1, 2, 15, 10, 3, 17, 4, 5, 6, 12, 14, 9, 7, 8, 13, 11, 16]
     raw_csv_writer.writerow(raw_headers)
     obs_csv_writer.writerow(obs_headers)
 
@@ -241,7 +262,7 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
             "total_rem_work": raw_s[17]
         }
         
-        obs = calculate_ddqn_state(
+        obs = calculate_gate_state(
             len(orch.buffer),
             orch.machine_free_time,
             t_now,
@@ -253,8 +274,14 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
             b_dict,
             w_dict
         )
-        if is_ddqn:
-            act = ddqn_model(torch.from_numpy(obs).float().unsqueeze(0).to(ddqn_device)).argmax(dim=1).item()
+        if is_ppo:
+            with torch.no_grad():
+                logits, _ = ppo_gate_model(torch.from_numpy(obs).float().unsqueeze(0).to(gate_device))
+                if str(getattr(configs, "eval_action_selection", "greedy")).lower() == "sample":
+                    dist = torch.distributions.Categorical(logits=logits)
+                    act = int(dist.sample().item())
+                else:
+                    act = int(torch.argmax(logits, dim=1).item())
         else:
             act = 1 if (stats["arrive"] % configs.gate_cadence == 0) else 0
 
@@ -297,8 +324,8 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
                 total_neg_slack += float((100.0 - slack) * 0.5)
         r_buf = -(total_neg_slack * buffer_penalty_coef) / scale
         r_shape = 0.0
-        r_terminal = 0.0
-        r_flush = 0.0
+        r_td = 0.0
+        r_mk = 0.0
         final_mk = ""
         final_td = ""
         phi_before_csv = f"{phi_before:.2f}" if use_shaping else ""
@@ -321,13 +348,13 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
             final_mk_val = float(final_stats["makespan"])
             phi_after = float(total_td) if use_shaping else 0.0
             terminal_scale = max(scale * float(max_events), scale)
-            r_terminal = float((-(total_td) / terminal_scale) * terminal_reward_coef)
+            r_td = float((-(total_td) / terminal_scale) * td_reward_coef)
             cached_projected_td = None
 
             mk_norm = max(scale * float(max_events), scale)
             mk_ratio = (final_mk_val / mk_norm)
-            r_flush_raw = -(((mk_ratio + 1.0) ** 2) - 1.0) * float(configs.flush_penalty_coef)
-            r_flush = float(r_flush_raw)
+            r_mk_raw = -(((mk_ratio + 1.0) ** 2) - 1.0) * float(configs.mk_reward_coef)
+            r_mk = float(r_mk_raw)
             final_mk = f"{final_mk_val:.2f}"
             final_td = f"{total_td:.2f}"
             phi_after_csv = f"{phi_after:.2f}" if use_shaping else ""
@@ -342,7 +369,7 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
                 cached_projected_td = None
 
         r_shape = float((-(phi_after - phi_before) / scale) * shaping_reward_coef) if use_shaping else 0.0
-        step_reward = r_stab + r_buf + r_shape + r_terminal + r_flush
+        step_reward = r_stab + r_buf + r_shape + r_td + r_mk
         total_cumulative_reward += step_reward
         action_str = "RELEASE" if act == 1 else "HOLD"
         common_tail = [
@@ -351,8 +378,8 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
             f"{r_stab:.4f}",
             f"{r_buf:.4f}",
             f"{r_shape:.4f}",
-            f"{r_terminal:.4f}",
-            f"{r_flush:.4f}",
+            f"{r_td:.4f}",
+            f"{r_mk:.4f}",
             phi_before_csv,
             phi_after_csv,
             agent_final_td_csv,
@@ -367,7 +394,7 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
         )
         obs_csv_writer.writerow(
             [stats["arrive"], f"{t_now:.2f}", f"{inter_arrival:.2f}", act, action_str] +
-            [f"{float(x):.6f}" for x in obs] +
+            [f"{float(obs[i]):.6f}" for i in obs_csv_order] +
             common_tail
         )
 
@@ -399,12 +426,7 @@ def main():
     print("-" * 20 + " Dynamic FJSP HRL Evaluation " + "-" * 20)
     
     # [FIXED] Dynamic output naming based on actual policy
-    if configs.gate_policy == "ddqn":
-        output_name = f"DDQN_{getattr(configs, 'ddqn_name', 'default')}"
-    else:
-        output_name = f"Cadence_{getattr(configs, 'gate_cadence', 1)}"
-        
-    plot_dir = os.path.join("plots/global", output_name)
+    plot_dir = "plots/global"
     
     mk, stats = run_event_driven_until_nevents(
         max_events=int(configs.event_horizon), 

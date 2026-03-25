@@ -8,7 +8,7 @@ from gymnasium import spaces
 from params import configs
 from data_utils import SD2_instance_generator, generate_due_dates
 from global_env import GlobalTimelineOrchestrator, EventBurstGenerator, split_matrix_to_jobs
-from model.ddqn_model import calculate_ddqn_state, log_scale_reward
+from model.gate_state import calculate_gate_state
 
 class EventGateEnv(gym.Env):
     def __init__(self,
@@ -35,6 +35,7 @@ class EventGateEnv(gym.Env):
         self.events_done = 0
         self.episode_tardiness = 0.0
         self.release_count = 0
+        self.agent_release_count = 0
         self.all_job_due_dates = {}
         self._prev_arrival_time = 0.0
         self._cached_projected_td = None
@@ -131,7 +132,7 @@ class EventGateEnv(gym.Env):
         w_idle, u_idle = self.orch.compute_idle_stats(t_now, mx_l)
         buf_stats = self._get_buffer_stats(t_now)
         wip_stats = self.orch.get_wip_stats(t_now)
-        return calculate_ddqn_state(len(self.orch.buffer), self.orch.machine_free_time, t_now, self.M, 0, self.time_scale, w_idle, u_idle, buf_stats, wip_stats)
+        return calculate_gate_state(len(self.orch.buffer), self.orch.machine_free_time, t_now, self.M, 0, self.time_scale, w_idle, u_idle, buf_stats, wip_stats)
 
     def _get_buffer_stats(self, t_now: float):
         if not self.orch.buffer: return {"tardiness_ratio": 0.0, "min_slack": 0.0, "avg_slack": 0.0, "slack_std": 0.0}
@@ -143,6 +144,8 @@ class EventGateEnv(gym.Env):
         return {"tardiness_ratio": neg_count / len(self.orch.buffer), "min_slack": min(slacks), "avg_slack": sum(slacks) / len(slacks), "slack_std": float(np.std(slacks))}
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
+        options = options or {}
+        count_episode = bool(options.get("count_episode", True))
         if seed is not None:
             self.master_seed = int(seed)
             self.internal_episode_counter = 0
@@ -150,15 +153,18 @@ class EventGateEnv(gym.Env):
             self.master_seed = int(getattr(configs, "event_seed", 42))
             self.internal_episode_counter = 0
 
-        episodes_per_instance = max(1, int(getattr(configs, "ddqn_instance_episodes", 200)))
-        instance_seed = int(self.master_seed + (self.internal_episode_counter // episodes_per_instance))
-        self.internal_episode_counter += 1
+        episodes_per_instance = max(1, int(getattr(configs, "ppo_gate_instance_episodes", 10)))
+        episode_counter = int(self.internal_episode_counter)
+        instance_seed = int(self.master_seed + (episode_counter // episodes_per_instance))
+        if count_episode:
+            self.internal_episode_counter += 1
         
         # Call super().reset for Gymnasium compliance (manages self.np_random)
         super().reset(seed=instance_seed)
         
         _, self.gen, self.orch, self.all_job_due_dates, self.t_now, self.t_next, self.release_count = self._build_simulation(instance_seed)
         self.episode_tardiness, self.events_done = 0.0, 0
+        self.agent_release_count = 0
         self._prev_arrival_time = 0.0
         self._cached_projected_td = None
 
@@ -170,8 +176,8 @@ class EventGateEnv(gym.Env):
         current_event_idx = int(self.events_done + 1)
         inter_arrival = float(t_event - self._prev_arrival_time)
         baseline_td_at_step = 0.0
-        shaping_reward_coef = float(getattr(configs, "shaping_reward_coef", getattr(configs, "release_penalty_coef", 0.1)))
-        terminal_reward_coef = float(getattr(configs, "terminal_reward_coef", getattr(configs, "release_penalty_coef", 0.1)))
+        shaping_reward_coef = float(getattr(configs, "shaping_reward_coef", 0.0))
+        td_reward_coef = float(getattr(configs, "td_reward_coef", 0.1))
         use_shaping = abs(shaping_reward_coef) > 1e-12
         if use_shaping:
             phi_before = float(self._cached_projected_td) if self._cached_projected_td is not None else self._estimate_release_now_td(self.orch, t_event)
@@ -182,13 +188,21 @@ class EventGateEnv(gym.Env):
         if int(action) == 1:
             self.orch.event_release_and_reschedule(t_event)
             self.release_count += 1
+            self.agent_release_count += 1
         else:
             self.orch.tick_without_release(t_event)
         actual_td_now = float(self.orch.get_total_tardiness_estimate(self.all_job_due_dates))
 
         # Common rewards (Buffer, Stability)
         scale = self.time_scale
-        r_stab = -(float(action) * float(configs.stability_scale))
+        terminal_stability_only = bool(getattr(configs, "stability_terminal_only", False))
+        free_releases = max(0, int(getattr(configs, "stability_free_releases", 0)))
+        stability_scale = float(configs.stability_scale)
+        excess_releases = max(0, int(self.agent_release_count) - free_releases)
+        prev_excess_releases = max(0, int(self.agent_release_count) - 1 - free_releases)
+        marginal_stab = float(excess_releases * (excess_releases + 1) // 2 - prev_excess_releases * (prev_excess_releases + 1) // 2)
+        charged_release = marginal_stab if int(action) == 1 else 0.0
+        r_stab = 0.0 if terminal_stability_only else -(float(charged_release) * stability_scale)
         total_neg_slack = 0.0
         for job_state in self.orch.buffer:
             due_abs = float(job_state.meta.get("due_date", t_event))
@@ -206,8 +220,8 @@ class EventGateEnv(gym.Env):
         self.events_done += 1
         done = bool(self.events_done >= self.event_horizon)
 
-        r_flush = 0.0
-        r_terminal = 0.0
+        r_td = 0.0
+        r_mk = 0.0
         ep_mk = 0.0
         if done:
             while len(self.orch.buffer) > 0:
@@ -219,13 +233,17 @@ class EventGateEnv(gym.Env):
             ep_mk = final["makespan"]
             phi_after = float(self.episode_tardiness) if use_shaping else 0.0
             terminal_scale = max(scale * float(self.event_horizon), scale)
-            r_terminal = float((-(self.episode_tardiness) / terminal_scale) * terminal_reward_coef)
+            r_td = float((-(self.episode_tardiness) / terminal_scale) * td_reward_coef)
             self._cached_projected_td = None
             
             mk_norm = max(scale * float(self.event_horizon), scale)
             mk_ratio = (ep_mk / mk_norm)
-            r_flush_raw = -(((mk_ratio + 1.0) ** 2) - 1.0) * float(configs.flush_penalty_coef)
-            r_flush = float(r_flush_raw)
+            r_mk_raw = -(((mk_ratio + 1.0) ** 2) - 1.0) * float(configs.mk_reward_coef)
+            r_mk = float(r_mk_raw)
+            if terminal_stability_only:
+                charged_releases = max(0, int(self.agent_release_count) - free_releases)
+                cumulative_stab = float(charged_releases * (charged_releases + 1) // 2)
+                r_stab = -(cumulative_stab * stability_scale)
         else:
             self._advance_to_next_arrival()
             if use_shaping:
@@ -237,8 +255,7 @@ class EventGateEnv(gym.Env):
         self._prev_arrival_time = t_event
 
         r_shape = float((-(phi_after - phi_before) / scale) * shaping_reward_coef) if use_shaping else 0.0
-        reward_gate_total = r_shape + r_terminal
-        reward = r_stab + r_buf + r_shape + r_terminal + r_flush
+        reward = r_stab + r_buf + r_shape + r_td + r_mk
 
         info = {
             "event_id": current_event_idx,
@@ -251,13 +268,11 @@ class EventGateEnv(gym.Env):
             "release_count": self.release_count, 
             "reward_buffer_penalty": r_buf, 
             "reward_shaping_penalty": r_shape,
-            "reward_terminal_penalty": r_terminal,
-            "reward_gate_penalty": reward_gate_total,
+            "reward_td_penalty": r_td,
             "reward_release_raw_penalty": r_shape,
-            "reward_release_penalty": reward_gate_total,
-            "reward_td_terminal_penalty": r_terminal,
+            "reward_td_terminal_penalty": r_td,
             "reward_stability_penalty": r_stab, 
-            "reward_final_flush_penalty": r_flush,
+            "reward_mk_penalty": r_mk,
             "phi_before": float(phi_before),
             "phi_after": float(phi_after),
             "agent_last_release_td": float(0.0),

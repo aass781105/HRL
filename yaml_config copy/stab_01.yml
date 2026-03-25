@@ -1,3 +1,0 @@
-﻿ddqn_name: stab_01_log_256_8
-stability_scale: 0.1
-ddqn_model_path: ddqn_ckpt\stab_01_log_256_8.pth

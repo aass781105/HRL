@@ -18,7 +18,8 @@ from global_env import (
 from data_utils import SD2_instance_generator, generate_due_dates
 
 import torch
-from model.ddqn_model import QNet, calculate_ddqn_state
+from model.gate_state import calculate_gate_state
+from model.ppo_gate_model import PPOGateNet
 
 def run_matrix_tracing_simulation():
     seed = int(getattr(configs, "event_seed", 42))
@@ -32,11 +33,25 @@ def run_matrix_tracing_simulation():
     gen = EventBurstGenerator(SD2_instance_generator, base_cfg, configs.n_m, configs.interarrival_mean, lambda _r: int(configs.burst_size), rng)
     orch = GlobalTimelineOrchestrator(configs.n_m, gen, lambda b, o: list(range(len(b))), t0=0.0)
 
-    gate_policy = str(getattr(configs, "gate_policy", "ddqn")).lower()
-    ddqn_model = None; ddqn_device = torch.device(getattr(configs, "device", "cpu"))
-    if gate_policy == "ddqn":
-        ddqn_model = QNet(obs_dim=18, hidden=128, n_actions=2).to(ddqn_device) # UPGRADED TO 18
-        ddqn_model.load_state_dict(torch.load(configs.ddqn_model_path, map_location=ddqn_device, weights_only=True)); ddqn_model.eval()
+    gate_policy = str(getattr(configs, "gate_policy", "ppo")).lower()
+    ppo_gate_model = None
+    gate_device = torch.device(getattr(configs, "device", "cpu"))
+    if gate_policy == "ppo":
+        ppo_gate_model = PPOGateNet(
+            obs_dim=18,
+            n_actions=2,
+            hidden=int(getattr(configs, "ppo_gate_hidden_dim", 256)),
+            num_layers=int(getattr(configs, "ppo_gate_num_layers", 3)),
+            separate_trunks=bool(getattr(configs, "ppo_gate_separate_trunks", False)),
+            actor_hidden=int(getattr(configs, "ppo_gate_actor_hidden_dim", getattr(configs, "ppo_gate_hidden_dim", 256))),
+            actor_num_layers=int(getattr(configs, "ppo_gate_actor_num_layers", getattr(configs, "ppo_gate_num_layers", 3))),
+            critic_hidden=int(getattr(configs, "ppo_gate_critic_hidden_dim", getattr(configs, "ppo_gate_hidden_dim", 256))),
+            critic_num_layers=int(getattr(configs, "ppo_gate_critic_num_layers", getattr(configs, "ppo_gate_num_layers", 3))),
+            value_hidden=int(getattr(configs, "ppo_gate_value_hidden_dim", getattr(configs, "ppo_gate_hidden_dim", 256))),
+            value_num_layers=int(getattr(configs, "ppo_gate_value_num_layers", 1)),
+        ).to(gate_device)
+        ppo_gate_model.load_state_dict(torch.load(configs.ppo_gate_model_path, map_location=gate_device, weights_only=True))
+        ppo_gate_model.eval()
 
     job_matrix_data = {}
     all_job_due_dates = {}
@@ -85,12 +100,16 @@ def run_matrix_tracing_simulation():
             for j in new_jobs: all_job_due_dates[j.job_id] = j.meta["due_date"]
             orch.buffer.extend(new_jobs)
         record_snapshot(orch, t_now, f"Step_{i}")
-        if gate_policy == "ddqn":
+        if gate_policy == "ppo":
             mft_abs = np.asarray(orch.machine_free_time, dtype=float); rem = np.maximum(0.0, mft_abs - t_now); max_load = np.max(rem); mean_pt = (float(configs.low) + float(configs.high)) / 2.0
-            t_next_event = gen.sample_next_time(t_now)
             b_dict = get_buffer_stats_for_obs(orch, t_now); w_dict = orch.get_wip_stats(t_now)
-            obs = calculate_ddqn_state(len(orch.buffer), orch.machine_free_time, t_now, configs.n_m, 0, mean_pt, orch.compute_weighted_idle(t_now, float(max_load)) if max_load>0 else 0.0, b_dict, w_dict, t_next=t_next_event)
-            with torch.no_grad(): act = ddqn_model(torch.from_numpy(obs).float().unsqueeze(0).to(ddqn_device)).argmax(dim=1).item()
+            obs = calculate_gate_state(len(orch.buffer), orch.machine_free_time, t_now, configs.n_m, 0, mean_pt, orch.compute_weighted_idle(t_now, float(max_load)) if max_load>0 else 0.0, orch.compute_unweighted_idle(t_now, float(max_load)) if max_load>0 else 0.0, b_dict, w_dict)
+            with torch.no_grad():
+                logits, _ = ppo_gate_model(torch.from_numpy(obs).float().unsqueeze(0).to(gate_device))
+                if str(getattr(configs, "eval_action_selection", "greedy")).lower() == "sample":
+                    act = int(torch.distributions.Categorical(logits=logits).sample().item())
+                else:
+                    act = int(torch.argmax(logits, dim=1).item())
         else: act = 1 if (i % configs.gate_cadence == 0) else 0
         if act == 1: orch.event_release_and_reschedule(t_now)
         else: orch.tick_without_release(t_now)
@@ -103,7 +122,7 @@ def run_matrix_tracing_simulation():
     for r in orch._global_rows: jid = int(r["job"]); job_finishes[jid] = max(job_finishes.get(jid, 0.0), float(r["end"]))
     for r in orch._last_full_rows: jid = int(r["job"]); job_finishes[jid] = max(job_finishes.get(jid, 0.0), float(r["end"]))
     df = pd.DataFrame.from_dict(job_matrix_data, orient='index'); df['Raw_Due_Date'] = [all_job_due_dates.get(jid, 0.0) for jid in df.index]; df['Raw_Finish_Time'] = [job_finishes.get(jid, 0.0) for jid in df.index]; df['Final_TD'] = [max(0.0, job_finishes.get(jid, 0.0) - all_job_due_dates[jid]) if jid in all_job_due_dates else 0.0 for jid in df.index]
-    df.sort_index(inplace=True); suffix = f"DDQN_{getattr(configs, 'ddqn_name', 'default')}" if gate_policy=="ddqn" else f"Cadence_{getattr(configs, 'gate_cadence', 1)}"
+    df.sort_index(inplace=True); suffix = f"PPO_{getattr(configs, 'ppo_gate_name', 'default')}" if gate_policy=="ppo" else f"Cadence_{getattr(configs, 'gate_cadence', 1)}"
     out_path = f"matrix_tracing_{suffix}.csv"; df.to_csv(out_path); print(f"Matrix saved to: {out_path}")
 
 if __name__ == "__main__": run_matrix_tracing_simulation()
