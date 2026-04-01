@@ -1,0 +1,16 @@
+{
+  "instance_json": "or_tools_solutions\\dynamic\\dynamic_seed42_h20_k1_instance.json",
+  "solver": "single_low_level_ppo",
+  "ppo_model_path": "trained_network\\SD2\\same.pth",
+  "action_selection": "greedy",
+  "num_jobs": 25,
+  "num_operations": 125,
+  "n_machines": 5,
+  "objective": "0.5*MK + 0.5*TD",
+  "objective_value": 3507.462440625783,
+  "makespan": 1208.4786759270075,
+  "total_tardiness": 5806.446205324559,
+  "detail_csv": "evaluation_results\\dynamic_ppo_runs\\ppo_dynamic_seed42_h20_k1_instance_detail.csv",
+  "detail_by_machine_csv": "evaluation_results\\dynamic_ppo_runs\\ppo_dynamic_seed42_h20_k1_instance_detail_by_machine.csv",
+  "gantt_png": "evaluation_results\\dynamic_ppo_runs\\ppo_dynamic_seed42_h20_k1_instance_gantt.png"
+}

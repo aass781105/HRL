@@ -16,6 +16,7 @@ from global_env import (
     split_matrix_to_jobs,
 )
 from data_utils import SD2_instance_generator, generate_due_dates
+from dynamic_job_stream import register_initial_jobs, sample_initial_jobs
 
 import torch
 from model.gate_state import calculate_gate_state
@@ -38,7 +39,7 @@ def run_matrix_tracing_simulation():
     gate_device = torch.device(getattr(configs, "device", "cpu"))
     if gate_policy == "ppo":
         ppo_gate_model = PPOGateNet(
-            obs_dim=18,
+            obs_dim=21,
             n_actions=2,
             hidden=int(getattr(configs, "ppo_gate_hidden_dim", 256)),
             num_layers=int(getattr(configs, "ppo_gate_num_layers", 3)),
@@ -57,14 +58,14 @@ def run_matrix_tracing_simulation():
     all_job_due_dates = {}
     
     def get_buffer_stats_for_obs(orchestrator, t_now):
-        if not orchestrator.buffer: return {"tardiness_ratio": 0.0, "min_slack": 0.0, "avg_slack": 0.0, "slack_std": 0.0}
+        if not orchestrator.buffer: return {"buffer_neg_slack_ratio": 0.0, "min_slack": 0.0, "avg_slack": 0.0, "slack_std": 0.0, "slack_q25": 0.0}
         slacks, neg_slack_count = [], 0
         for j in orchestrator.buffer:
             min_work = float(j.meta.get("min_total_proc_time", 0.0))
             due = all_job_due_dates[j.job_id]; s = due - t_now - min_work
             slacks.append(s)
             if t_now + min_work > due: neg_slack_count += 1
-        return {"tardiness_ratio": neg_slack_count / len(orchestrator.buffer), "min_slack": min(slacks), "avg_slack": sum(slacks) / len(slacks), "slack_std": float(np.std(slacks))}
+        return {"buffer_neg_slack_ratio": neg_slack_count / len(orchestrator.buffer), "min_slack": min(slacks), "avg_slack": sum(slacks) / len(slacks), "slack_std": float(np.std(slacks)), "slack_q25": float(np.percentile(slacks, 25))}
 
     def record_snapshot(orchestrator, t_now, step_label, is_terminal=False):
         job_rows = {}
@@ -87,13 +88,12 @@ def run_matrix_tracing_simulation():
     # --- 模擬開始 ---
     INIT_J = int(getattr(configs, "init_jobs", 0))
     if INIT_J > 0:
-        jl, pt, _ = SD2_instance_generator(base_cfg, rng=rng)
-        dd_rel = generate_due_dates(jl, pt, tightness=getattr(configs, "due_date_tightness", 1.2), due_date_mode='k', rng=rng)
-        init_jobs = split_matrix_to_jobs(jl, pt, base_job_id=0, t_arrive=0.0, due_dates=0.0 + dd_rel)
-        for j in init_jobs: all_job_due_dates[j.job_id] = j.meta["due_date"]
-        orch.buffer.extend(init_jobs); gen.bump_next_id(max((j.job_id for j in init_jobs)) + 1); record_snapshot(orch, 0.0, "Step_0"); orch.event_release_and_reschedule(0.0)
+        init_jobs = sample_initial_jobs(configs, rng=rng, base_job_id=0, t_arrive=0.0)
+        register_initial_jobs(orch, gen, init_jobs, all_job_due_dates, t0=0.0)
+        record_snapshot(orch, 0.0, "Step_0")
 
     t_now, t_prev = 0.0, 0.0; t_next = gen.sample_next_time(t_now); max_events = int(configs.event_horizon)
+    steps_since_last_release = 0
     for i in tqdm(range(1, max_events + 1), desc="Tracing"):
         t_now = float(t_next); new_jobs = gen.generate_burst(t_now)
         if new_jobs:
@@ -103,7 +103,21 @@ def run_matrix_tracing_simulation():
         if gate_policy == "ppo":
             mft_abs = np.asarray(orch.machine_free_time, dtype=float); rem = np.maximum(0.0, mft_abs - t_now); max_load = np.max(rem); mean_pt = (float(configs.low) + float(configs.high)) / 2.0
             b_dict = get_buffer_stats_for_obs(orch, t_now); w_dict = orch.get_wip_stats(t_now)
-            obs = calculate_gate_state(len(orch.buffer), orch.machine_free_time, t_now, configs.n_m, 0, mean_pt, orch.compute_weighted_idle(t_now, float(max_load)) if max_load>0 else 0.0, orch.compute_unweighted_idle(t_now, float(max_load)) if max_load>0 else 0.0, b_dict, w_dict)
+            inter_arrival_scaled = float((t_now - t_prev) / mean_pt) if mean_pt > 0 else 0.0
+            obs = calculate_gate_state(
+                len(orch.buffer),
+                orch.machine_free_time,
+                t_now,
+                configs.n_m,
+                0,
+                mean_pt,
+                orch.compute_weighted_idle(t_now, float(max_load)) if max_load > 0 else 0.0,
+                orch.compute_unweighted_idle(t_now, float(max_load)) if max_load > 0 else 0.0,
+                b_dict,
+                w_dict,
+                inter_arrival_scaled=inter_arrival_scaled,
+                steps_since_last_release=steps_since_last_release,
+            )
             with torch.no_grad():
                 logits, _ = ppo_gate_model(torch.from_numpy(obs).float().unsqueeze(0).to(gate_device))
                 if str(getattr(configs, "eval_action_selection", "greedy")).lower() == "sample":
@@ -111,8 +125,13 @@ def run_matrix_tracing_simulation():
                 else:
                     act = int(torch.argmax(logits, dim=1).item())
         else: act = 1 if (i % configs.gate_cadence == 0) else 0
-        if act == 1: orch.event_release_and_reschedule(t_now)
-        else: orch.tick_without_release(t_now)
+        if act == 1:
+            orch.event_release_and_reschedule(t_now)
+            steps_since_last_release = 0
+        else:
+            orch.tick_without_release(t_now)
+            steps_since_last_release += 1
+        t_prev = t_now
         t_next = gen.sample_next_time(t_now)
 
     record_snapshot(orch, t_now, "Pre_Flush")

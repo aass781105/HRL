@@ -9,7 +9,7 @@ def run_sensitivity_analysis():
     results = []
     
     # 建立主輸出目錄
-    base_plot_dir = "plots/cadence_study_same2"
+    base_plot_dir = getattr(configs, "plot_global_dir", "plots/cadence_study_small")
     os.makedirs(base_plot_dir, exist_ok=True)
     
     print("-" * 30)
@@ -29,7 +29,9 @@ def run_sensitivity_analysis():
         configs.eval_model_name = f"cadence_{c:02d}"
         
         # 定義存圖與 CSV 的子資料夾
-        sub_dir = os.path.join(base_plot_dir, f"cadence_{c:02d}")
+        base_name = str(getattr(configs, "plot_run_name", "")).strip()
+        sub_label = f"cadence_{c:02d}" if not base_name else f"{base_name}_cadence_{c:02d}"
+        sub_dir = os.path.join(base_plot_dir, sub_label)
         
         # 執行模擬
         mk, stats = run_event_driven_until_nevents(

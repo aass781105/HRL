@@ -88,7 +88,7 @@ def _gate_obs(orch: GlobalTimelineOrchestrator, n_machines: int, t_now: float,
     
     w_idle = orch.compute_weighted_idle(t_now, horizon)
 
-    buf_stats = {"tardiness_ratio": 0.0, "min_slack": 0.0, "avg_slack": 0.0, "slack_std": 0.0}
+    buf_stats = {"buffer_neg_slack_ratio": 0.0, "min_slack": 0.0, "avg_slack": 0.0, "slack_std": 0.0, "slack_q25": 0.0}
     if orch.buffer:
         slacks = []
         neg = 0
@@ -100,10 +100,11 @@ def _gate_obs(orch: GlobalTimelineOrchestrator, n_machines: int, t_now: float,
             if t_now + total_proc > due:
                 neg += 1
         buf_stats = {
-            "tardiness_ratio": neg / len(orch.buffer),
+            "buffer_neg_slack_ratio": neg / len(orch.buffer),
             "min_slack": min(slacks),
             "avg_slack": float(np.mean(slacks)),
             "slack_std": float(np.std(slacks)),
+            "slack_q25": float(np.percentile(slacks, 25)),
         }
 
     wip_stats = orch.get_wip_stats(t_now)
@@ -119,6 +120,8 @@ def _gate_obs(orch: GlobalTimelineOrchestrator, n_machines: int, t_now: float,
         unweighted_idle=orch.compute_unweighted_idle(t_now, horizon) if horizon > 0 else 0.0,
         buffer_stats=buf_stats,
         wip_stats=wip_stats,
+        inter_arrival_scaled=0.0,
+        steps_since_last_release=0,
     )
 
 
@@ -250,7 +253,7 @@ def main():
             gate_policy = 'cadence'
         else:
             ppo_gate_model = PPOGateNet(
-                obs_dim=18,
+                obs_dim=21,
                 n_actions=2,
                 hidden=int(getattr(configs, "ppo_gate_hidden_dim", 256)),
                 num_layers=int(getattr(configs, "ppo_gate_num_layers", 3)),

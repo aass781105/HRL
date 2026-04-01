@@ -1,0 +1,55 @@
+ppo_gate_name: main_ppo_g099_l099_10e_100u_i25_mb1024_tdterm_s5term_nobase2_h20_j5
+gate_policy: ppo
+ppo_gate_model_path: ppo_ckpt/ppo_g099_l099_10e_100u_i25_mb1024_tdterm_s5term_nobase2.pth
+
+ppo_gate_hidden_dim: 512
+ppo_gate_num_layers: 3
+ppo_gate_value_hidden_dim: 512
+ppo_gate_value_num_layers: 3
+
+ppo_gate_updates: 100
+ppo_gate_num_envs: 10
+ppo_gate_use_async_envs: true
+ppo_gate_train_seed: 142
+ppo_gate_instance_episodes: 25
+
+n_m: 5
+low: 1
+high: 99
+event_horizon: 20
+interarrival_mean: 25
+init_jobs: 5
+burst_size: 1
+event_seed: 42
+
+ppo_gate_lr: 3.0e-5
+ppo_gate_lr_decay: true
+ppo_gate_lr_end: 1.2e-5
+ppo_gate_gamma: 0.99
+ppo_gate_gae_lambda: 0.99
+ppo_gate_clip: 0.2
+ppo_gate_entropy_coef: 0.018
+ppo_gate_entropy_decay: true
+ppo_gate_entropy_end: 0.005
+ppo_gate_value_coef: 0.3
+ppo_gate_update_epochs: 2
+ppo_gate_minibatch_size: 1024
+ppo_gate_max_grad_norm: 1.0
+
+ppo_gate_same_problem_eval_every: 0
+ppo_gate_validate_every: 10
+
+td_signal_source: agent_only
+td_credit_mode: terminal_only
+stability_mode_v2: free_threshold_terminal
+
+buffer_penalty_coef: 0.0
+shaping_reward_coef: 0.0
+td_reward_coef: 0.1
+mk_reward_coef: 0.0
+stability_scale: 0.005
+stability_free_releases: 5
+
+release_reward_redistribute: false
+release_reward_decay: 0.9
+fast_mode: false

@@ -78,6 +78,89 @@ def compute_gae_and_returns(
     return advantages, returns
 
 
+def redistribute_release_rewards(
+    rewards: np.ndarray,
+    actions: np.ndarray,
+    shaping_rewards: np.ndarray,
+    decay: float,
+) -> np.ndarray:
+    redistributed = rewards.astype(np.float32).copy()
+    shaping_arr = shaping_rewards.astype(np.float32)
+    release_idx = np.flatnonzero(actions.astype(np.int64) == 1)
+    if release_idx.size == 0:
+        return redistributed
+    decay = float(decay)
+    decay = min(max(decay, 0.0), 1.0)
+    prev_release = -1
+    for idx in release_idx:
+        raw_shape = float(shaping_arr[idx])
+        if abs(raw_shape) <= 1e-12:
+            prev_release = int(idx)
+            continue
+        start = prev_release + 1
+        end = int(idx)
+        span = end - start + 1
+        if span <= 0:
+            prev_release = int(idx)
+            continue
+        redistributed[idx] -= raw_shape
+        weights = np.array([decay ** (end - step) for step in range(start, end + 1)], dtype=np.float32)
+        weight_sum = float(np.sum(weights))
+        if weight_sum <= 1e-12:
+            redistributed[idx] += raw_shape
+            prev_release = int(idx)
+            continue
+        redistributed[start:end + 1] += (weights / weight_sum) * raw_shape
+        prev_release = int(idx)
+    return redistributed
+
+
+def resolve_td_credit_mode() -> str:
+    explicit = str(getattr(configs, "td_credit_mode", "")).strip().lower()
+    if explicit:
+        return explicit
+    shaping_reward_coef = float(getattr(configs, "shaping_reward_coef", 0.0))
+    td_reward_coef = float(getattr(configs, "td_reward_coef", 0.0))
+    if abs(shaping_reward_coef) > 1e-12:
+        return "redistribute" if bool(getattr(configs, "release_reward_redistribute", False)) else "step_only"
+    if abs(td_reward_coef) > 1e-12:
+        return "terminal_only"
+    return "step_only"
+
+
+def resolve_stability_mode() -> str:
+    explicit = str(getattr(configs, "stability_mode_v2", "")).strip().lower()
+    if explicit:
+        return explicit
+    legacy = str(getattr(configs, "stability_mode", "immediate_all")).strip().lower()
+    if abs(float(getattr(configs, "stability_scale", 0.0))) <= 1e-12:
+        return "off"
+    if legacy == "immediate_all":
+        return "immediate_all"
+    if bool(getattr(configs, "stability_terminal_only", False)):
+        return "free_threshold_terminal"
+    return "free_threshold_distributed"
+
+
+def apply_stability_mode_to_episode(episode: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    mode = resolve_stability_mode()
+    if mode != "free_threshold_distributed":
+        return episode
+    total_penalty = float(episode.get("stability_total_penalty", 0.0))
+    if abs(total_penalty) <= 1e-12:
+        return episode
+    actions = episode["actions"].astype(np.int64)
+    release_idx = np.flatnonzero(actions == 1)
+    if release_idx.size == 0:
+        return episode
+    rewards = episode["rewards"].astype(np.float32).copy()
+    rewards[release_idx] += float(total_penalty) / float(release_idx.size)
+    episode["rewards"] = rewards
+    episode["episode_return"] = float(np.sum(rewards))
+    episode["reward_stability"] = float(total_penalty)
+    return episode
+
+
 def collect_episode(
     env: EventGateEnv,
     model: PPOGateNet,
@@ -86,11 +169,14 @@ def collect_episode(
     obs, _ = env.reset()
     done = False
     states, actions, logps, values, rewards, dones = [], [], [], [], [], []
+    event_ids, actual_tds, baseline_step_tds = [], [], []
+    step_shape_rewards = []
     ep_buf = 0.0
     ep_shape = 0.0
     ep_term = 0.0
     ep_stab = 0.0
     ep_flush = 0.0
+    stability_total_penalty = 0.0
     info = {}
     while not done:
         s_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
@@ -109,21 +195,31 @@ def collect_episode(
         values.append(float(value.item()))
         rewards.append(float(reward))
         dones.append(float(done))
+        event_ids.append(int(info.get("event_id", len(event_ids) + 1)))
+        actual_tds.append(float(info.get("actual_td", 0.0)))
+        baseline_step_tds.append(float(info.get("baseline_event_td", 0.0)))
+        step_shape_rewards.append(float(info.get("reward_shaping_penalty", 0.0)))
         ep_buf += float(info.get("reward_buffer_penalty", 0.0))
         ep_shape += float(info.get("reward_shaping_penalty", 0.0))
         ep_term += float(info.get("reward_td_penalty", 0.0))
         ep_stab += float(info.get("reward_stability_penalty", 0.0))
         ep_flush += float(info.get("reward_mk_penalty", 0.0))
+        stability_total_penalty = float(info.get("reward_stability_total_penalty", stability_total_penalty))
         obs = next_obs
+    rewards_arr = np.asarray(rewards, dtype=np.float32)
 
     return {
         "states": np.asarray(states, dtype=np.float32),
         "actions": np.asarray(actions, dtype=np.int64),
         "logps": np.asarray(logps, dtype=np.float32),
         "values": np.asarray(values, dtype=np.float32),
-        "rewards": np.asarray(rewards, dtype=np.float32),
+        "rewards": rewards_arr,
         "dones": np.asarray(dones, dtype=np.float32),
-        "episode_return": float(np.sum(rewards)),
+        "event_ids": np.asarray(event_ids, dtype=np.int64),
+        "actual_tds": np.asarray(actual_tds, dtype=np.float32),
+        "baseline_step_tds": np.asarray(baseline_step_tds, dtype=np.float32),
+        "shape_rewards": np.asarray(step_shape_rewards, dtype=np.float32),
+        "episode_return": float(np.sum(rewards_arr)),
         "episode_mk": float(info.get("episode_makespan", 0.0)),
         "episode_td": float(info.get("episode_tardiness", 0.0)),
         "episode_rel": int(info.get("release_count", 0)),
@@ -131,6 +227,7 @@ def collect_episode(
         "reward_shaping": float(ep_shape),
         "reward_terminal": float(ep_term),
         "reward_stability": float(ep_stab),
+        "stability_total_penalty": float(stability_total_penalty),
         "reward_flush": float(ep_flush),
     }
 
@@ -164,11 +261,16 @@ def collect_episode_batch_vectorized(
     ep_values = [[] for _ in range(num_envs)]
     ep_rewards = [[] for _ in range(num_envs)]
     ep_dones = [[] for _ in range(num_envs)]
+    ep_event_ids = [[] for _ in range(num_envs)]
+    ep_actual_tds = [[] for _ in range(num_envs)]
+    ep_baseline_step_tds = [[] for _ in range(num_envs)]
+    ep_shape_rewards = [[] for _ in range(num_envs)]
     ep_buf = np.zeros(num_envs, dtype=np.float32)
     ep_shape = np.zeros(num_envs, dtype=np.float32)
     ep_term = np.zeros(num_envs, dtype=np.float32)
     ep_stab = np.zeros(num_envs, dtype=np.float32)
     ep_flush = np.zeros(num_envs, dtype=np.float32)
+    ep_stab_total = np.zeros(num_envs, dtype=np.float32)
     episode_mk = np.zeros(num_envs, dtype=np.float32)
     episode_td = np.zeros(num_envs, dtype=np.float32)
     episode_rel = np.zeros(num_envs, dtype=np.int64)
@@ -204,11 +306,16 @@ def collect_episode_batch_vectorized(
             ep_values[idx].append(float(values[idx]))
             ep_rewards[idx].append(float(rewards[idx]))
             ep_dones[idx].append(float(done))
+            ep_event_ids[idx].append(int(get_info_value(infos, "event_id", idx, len(ep_event_ids[idx]) + 1)))
+            ep_actual_tds[idx].append(float(get_info_value(infos, "actual_td", idx, 0.0)))
+            ep_baseline_step_tds[idx].append(float(get_info_value(infos, "baseline_event_td", idx, 0.0)))
+            ep_shape_rewards[idx].append(float(get_info_value(infos, "reward_shaping_penalty", idx, 0.0)))
             ep_buf[idx] += float(get_info_value(infos, "reward_buffer_penalty", idx, 0.0))
             ep_shape[idx] += float(get_info_value(infos, "reward_shaping_penalty", idx, 0.0))
             ep_term[idx] += float(get_info_value(infos, "reward_td_penalty", idx, 0.0))
             ep_stab[idx] += float(get_info_value(infos, "reward_stability_penalty", idx, 0.0))
             ep_flush[idx] += float(get_info_value(infos, "reward_mk_penalty", idx, 0.0))
+            ep_stab_total[idx] = float(get_info_value(infos, "reward_stability_total_penalty", idx, ep_stab_total[idx]))
             if done:
                 completed[idx] = True
                 episode_mk[idx] = float(get_info_value(infos, "episode_makespan", idx, 0.0))
@@ -235,6 +342,10 @@ def collect_episode_batch_vectorized(
             "values": np.asarray(ep_values[idx], dtype=np.float32),
             "rewards": rewards_arr,
             "dones": np.asarray(ep_dones[idx], dtype=np.float32),
+            "event_ids": np.asarray(ep_event_ids[idx], dtype=np.int64),
+            "actual_tds": np.asarray(ep_actual_tds[idx], dtype=np.float32),
+            "baseline_step_tds": np.asarray(ep_baseline_step_tds[idx], dtype=np.float32),
+            "shape_rewards": np.asarray(ep_shape_rewards[idx], dtype=np.float32),
             "episode_return": float(np.sum(rewards_arr)),
             "episode_mk": float(episode_mk[idx]),
             "episode_td": float(episode_td[idx]),
@@ -243,6 +354,7 @@ def collect_episode_batch_vectorized(
             "reward_shaping": float(ep_shape[idx]),
             "reward_terminal": float(ep_term[idx]),
             "reward_stability": float(ep_stab[idx]),
+            "stability_total_penalty": float(ep_stab_total[idx]),
             "reward_flush": float(ep_flush[idx]),
         })
     return episodes
@@ -253,6 +365,19 @@ def merge_episode_batch(
     gamma: float,
     gae_lambda: float,
 ) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray, Dict[str, float]]:
+    use_release_redistribute = (resolve_td_credit_mode() == "redistribute")
+    release_decay = float(getattr(configs, "release_reward_decay", 0.9))
+    if use_release_redistribute:
+        for ep in episodes:
+            ep["rewards"] = redistribute_release_rewards(
+                rewards=ep["rewards"],
+                actions=ep["actions"],
+                shaping_rewards=ep["shape_rewards"],
+                decay=release_decay,
+            )
+            ep["episode_return"] = float(np.sum(ep["rewards"]))
+    for ep in episodes:
+        apply_stability_mode_to_episode(ep)
     batch = {
         "states": np.concatenate([ep["states"] for ep in episodes], axis=0),
         "actions": np.concatenate([ep["actions"] for ep in episodes], axis=0),
@@ -405,7 +530,7 @@ def train_ppo_gate():
 
     device = torch.device(getattr(configs, "device", "cpu"))
     model = PPOGateNet(
-        obs_dim=18,
+        obs_dim=21,
         n_actions=2,
         hidden=int(getattr(configs, "ppo_gate_hidden_dim", 256)),
         num_layers=int(getattr(configs, "ppo_gate_num_layers", 3)),
@@ -463,6 +588,9 @@ def train_ppo_gate():
     states = np.asarray(states, dtype=np.float32)
 
     probe_states = build_fixed_probe_states(seed)
+    name = str(getattr(configs, "ppo_gate_name", "ppo_gate_latest"))
+    plot_dir = os.path.join("plots", "train_ppo")
+    os.makedirs(plot_dir, exist_ok=True)
     history_ret, history_loss, history_ploss, history_vloss, history_entropy = [], [], [], [], []
     history_lr, history_pgap = [], []
     history_mk, history_td, history_rel = [], [], []
@@ -573,9 +701,7 @@ def train_ppo_gate():
     pbar.close()
     envs.close()
 
-    name = str(getattr(configs, "ppo_gate_name", "ppo_gate_latest"))
     ckpt_dir = "ppo_ckpt"
-    plot_dir = os.path.join("plots", "train_ppo")
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(plot_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(ckpt_dir, f"{name}.pth"))

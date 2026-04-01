@@ -530,8 +530,6 @@ class FJSPEnvForVariousOpNums:
 
         self.op_remain_work = np.maximum(self.op_ct - np.expand_dims(self.next_schedule_time, axis=1), 0)
 
-        self.construct_op_features()
-
         self.dynamic_pair_mask = np.copy(self.candidate_process_relation)
 
         self.unavailable_pairs = np.array([pair_free_time[k] > self.next_schedule_time[j]

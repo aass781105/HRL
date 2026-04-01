@@ -43,6 +43,8 @@ parser.add_argument('--cover_data_flag', type=str2bool, default=False, help='Whe
 parser.add_argument('--cover_heu_flag', type=str2bool, default=False, help='Whether covering test results of heuristics')
 parser.add_argument('--cover_train_flag', type=str2bool, default=True, help='Whether covering the trained model')
 parser.add_argument('--sort_flag', type=str2bool, default=True, help='Whether sorting the printed results by the makespan')
+parser.add_argument('--debug_reward_trace', type=str2bool, default=False, help='Whether printing detailed gate reward traces')
+parser.add_argument('--debug_reward_positive_threshold', type=float, default=0.5, help='Print shaping traces when reward_shaping_penalty exceeds this threshold')
 
 
 # ============================
@@ -123,13 +125,13 @@ parser.add_argument('--eval_model_name', type=str, default="new", help='用於�
 # ============================
 # Dynamic Simulation (Event-Driven)
 # ============================
-parser.add_argument('--event_horizon', type=float, default=100.0, help='事件驅動模式的模擬事件上限')
+parser.add_argument('--event_horizon', type=float, default=20.0, help='事件驅動模式的模擬事件上限')
 parser.add_argument('--interarrival_mean', type=float, default=25, help='Poisson interarrival_mean')
-parser.add_argument('--init_jobs', type=int, default= 10, help='初始工單數')
+parser.add_argument('--init_jobs', type=int, default= 5, help='初始工單數')
 parser.add_argument('--burst_size', type=int, default=1, help='每次生成工單數')
 parser.add_argument('--event_seed', type=int, default=42, help='事件驅動到達過程的亂數種子（Exponential 間隔）')
 parser.add_argument('--episode_seed_base', type=int, default=12345, help='episode 級別的基種子；每個 episode 以此為基準派生子亂數流')
-parser.add_argument('--fast_mode', type=str2bool, default=True, help='是否開啟高速模式（跳過甘特圖與詳細 CSV 生成）')
+parser.add_argument('--fast_mode', type=str2bool, default=False, help='是否開啟高速模式（跳過甘特圖與詳細 CSV 生成）')
 
 # ============================
 # Curriculum Learning Specifics
@@ -153,9 +155,10 @@ parser.add_argument('--ppo_sample', type=str2bool, default=False, help='PPO 推�
 
 
 parser.add_argument('--gate_policy', type=str, default='ppo',
-                    choices=['ppo', 'cadence'],
-                    help='High-level gate policy: ppo=actor-critic, cadence=fixed event release cadence')
+                    choices=['ppo', 'cadence', 'slack_threshold'],
+                    help='High-level gate policy: ppo=actor-critic, cadence=fixed event release cadence, slack_threshold=release when buffer min slack is below threshold')
 parser.add_argument('--gate_cadence', type=int, default=5, help='當 gate_policy=cadence 時，每隔幾個到達事件釋放一次緩衝區')
+parser.add_argument('--buffer_slack_release_threshold', type=float, default=0.0, help='When gate_policy=slack_threshold, release if current buffer min slack is below this threshold')
 parser.add_argument('--eval_action_selection', type=str, default='greedy',
                     choices=['sample', 'greedy'],
                     help='sample or greedy')
@@ -170,9 +173,13 @@ parser.add_argument('--reward_alpha', type=float, default=0.3, help='Weight for 
 parser.add_argument('--tardiness_alpha', type=float, default=1.0, help='Weight for Tardiness in PPO reward calculation.')
 parser.add_argument('--stability_scale', type=float, default=0.0, help='決策穩定性懲罰 (Action 1 的額外扣分)。設為 0 代表純效能模式。')
 parser.add_argument('--buffer_penalty_coef', type=float, default=0.0, help='Coefficient for buffer tardiness penalty')
+parser.add_argument('--stability_mode', type=str, default='immediate_all', choices=['immediate_all', 'free_threshold'], help='Stability reward mode: immediate_all = current per-release penalty; free_threshold = releases are free until stability_free_releases, then penalize via terminal or redistribution.')
 parser.add_argument('--stability_terminal_only', type=str2bool, default=False, help='If true, apply stability penalty only once at episode end using agent-chosen release count.')
 parser.add_argument('--stability_free_releases', type=int, default=0, help='Number of agent-chosen releases that are free before stability penalty starts.')
 parser.add_argument('--release_penalty_coef', type=float, default=0.1, help='Deprecated legacy parameter. No longer used by gate reward logic.')
+parser.add_argument('--td_signal_source', type=str, default='', choices=['', 'none', 'agent_only', 'baseline_gap_final', 'baseline_gap_release_interval'], help='High-level TD reward source selector. Empty string keeps legacy compatibility.')
+parser.add_argument('--td_credit_mode', type=str, default='', choices=['', 'step_only', 'redistribute', 'terminal_only'], help='High-level TD credit assignment mode. Empty string keeps legacy compatibility.')
+parser.add_argument('--stability_mode_v2', type=str, default='', choices=['', 'off', 'immediate_all', 'immediate_all_terminal', 'free_threshold_terminal', 'free_threshold_distributed'], help='High-level stability mode selector. Empty string keeps legacy compatibility.')
 parser.add_argument('--shaping_reward_coef', type=float, default=0.0, help='Coefficient for shaping reward term')
 parser.add_argument('--td_reward_coef', type=float, default=0.1, help='Coefficient for final TD reward term')
 parser.add_argument('--mk_reward_coef', type=float, default=0.0, help='Weight for final MK reward term at simulation end')
@@ -183,6 +190,7 @@ parser.add_argument('--mk_reward_coef', type=float, default=0.0, help='Weight fo
 # ============================
 parser.add_argument('--plot_global_dir', type=str, default='plots/global', help='全局甘特圖輸出資料夾（每次重排立即輸出）')
 parser.add_argument('--plot_batch_dir', type=str, default='plots/batch', help='批次甘特圖輸出資料夾（重排後該批 finalize 時輸出）')
+parser.add_argument('--plot_run_name', type=str, default='', help='Optional run-name override used in exported folder naming')
 
 
 # ============================
