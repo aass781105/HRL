@@ -75,7 +75,8 @@ def fixed_k_sampler(K: int):
 
 def _gate_obs(orch: GlobalTimelineOrchestrator, n_machines: int, t_now: float,
               burst_K: int, interarrival_mean: float,
-              buf_cap_cfg: int = 0) -> np.ndarray:
+              buf_cap_cfg: int = 0,
+              is_last_step: bool = False) -> np.ndarray:
     """
     Calculates the observation for the PPO high-level gate policy.
     """
@@ -122,6 +123,7 @@ def _gate_obs(orch: GlobalTimelineOrchestrator, n_machines: int, t_now: float,
         wip_stats=wip_stats,
         inter_arrival_scaled=0.0,
         steps_since_last_release=0,
+        is_last_step=is_last_step,
     )
 
 
@@ -152,18 +154,27 @@ def run_dynamic_ppo_episode(adapter, ppo_policy, action_selection, device, max_e
         decide_release = False
         if gate_policy == 'ppo' and ppo_gate_model is not None and len(orch.buffer) > 0:
             gate_obs_buffer_cap = int(getattr(configs, "gate_obs_buffer_cap", 0))
-            obs = _gate_obs(orch, orch.M, t_now, burst_size, interarrival_mean,
-                            buf_cap_cfg=gate_obs_buffer_cap)
+            obs = _gate_obs(
+                orch,
+                orch.M,
+                t_now,
+                burst_size,
+                interarrival_mean,
+                buf_cap_cfg=gate_obs_buffer_cap,
+                is_last_step=bool(num_arrivals >= max_events),
+            )
             with torch.no_grad():
                 logits, _ = ppo_gate_model(torch.from_numpy(obs).float().unsqueeze(0).to(device))
                 if action_selection == 'sample':
                     act = torch.distributions.Categorical(logits=logits).sample().item()
                 else:
                     act = torch.argmax(logits, dim=1).item()
+            if float(obs[-1]) >= 0.5:
+                act = 1
             decide_release = (act == 1)
         else:
             cadence = max(1, int(getattr(configs, "gate_cadence", 1)))
-            decide_release = (num_arrivals % cadence == 0)
+            decide_release = bool(num_arrivals >= max_events) or (num_arrivals % cadence == 0)
         
         # --- Scheduling (if released) ---
         if decide_release:
@@ -253,7 +264,7 @@ def main():
             gate_policy = 'cadence'
         else:
             ppo_gate_model = PPOGateNet(
-                obs_dim=21,
+                obs_dim=22,
                 n_actions=2,
                 hidden=int(getattr(configs, "ppo_gate_hidden_dim", 256)),
                 num_layers=int(getattr(configs, "ppo_gate_num_layers", 3)),

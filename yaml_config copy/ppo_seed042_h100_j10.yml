@@ -1,0 +1,16 @@
+gate_policy: ppo
+scheduler_type: PPO
+ppo_gate_name: ppo_g099_l099_10e_100u_i25_mb1024_tdterm_sallterm_nobase
+ppo_gate_model_path: ppo_ckpt/ppo_g0999_l0999_10e_200u_i25_h100_j10_tdterm_s20term_nb.pth
+n_m: 5
+low: 1
+high: 99
+event_horizon: 100
+interarrival_mean: 25
+init_jobs: 10
+burst_size: 1
+event_seed: 42
+
+fast_mode: false
+plot_global_dir: plots/global/ppo_gate_h100_j10
+plot_run_name: seed042

@@ -1,0 +1,17 @@
+gate_cadence: 3
+
+n_m: 5
+low: 1
+high: 99
+event_horizon: 20
+interarrival_mean: 25
+init_jobs: 5
+burst_size: 1
+event_seed: 42
+
+max_solve_time: 5
+ortools_subproblem_time_limit: 3600
+
+fast_mode: false
+plot_global_dir: plots/global/ortcad_seed042
+plot_run_name: seed042_c3_t10

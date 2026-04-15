@@ -39,7 +39,7 @@ def run_matrix_tracing_simulation():
     gate_device = torch.device(getattr(configs, "device", "cpu"))
     if gate_policy == "ppo":
         ppo_gate_model = PPOGateNet(
-            obs_dim=21,
+            obs_dim=22,
             n_actions=2,
             hidden=int(getattr(configs, "ppo_gate_hidden_dim", 256)),
             num_layers=int(getattr(configs, "ppo_gate_num_layers", 3)),
@@ -117,6 +117,7 @@ def run_matrix_tracing_simulation():
                 w_dict,
                 inter_arrival_scaled=inter_arrival_scaled,
                 steps_since_last_release=steps_since_last_release,
+                is_last_step=bool(i >= max_events),
             )
             with torch.no_grad():
                 logits, _ = ppo_gate_model(torch.from_numpy(obs).float().unsqueeze(0).to(gate_device))
@@ -124,7 +125,10 @@ def run_matrix_tracing_simulation():
                     act = int(torch.distributions.Categorical(logits=logits).sample().item())
                 else:
                     act = int(torch.argmax(logits, dim=1).item())
-        else: act = 1 if (i % configs.gate_cadence == 0) else 0
+            if float(obs[-1]) >= 0.5:
+                act = 1
+        else:
+            act = 1 if (i >= max_events or (i % configs.gate_cadence == 0)) else 0
         if act == 1:
             orch.event_release_and_reschedule(t_now)
             steps_since_last_release = 0

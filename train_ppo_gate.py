@@ -184,6 +184,8 @@ def collect_episode(
             logits, value = model(s_t)
             dist = Categorical(logits=logits)
             action = dist.sample()
+            if float(obs[-1]) >= 0.5:
+                action = torch.ones_like(action, dtype=torch.int64)
             logp = dist.log_prob(action)
         act = int(action.item())
         next_obs, reward, terminated, truncated, info = env.step(act)
@@ -290,6 +292,10 @@ def collect_episode_batch_vectorized(
                 logits, value = model(obs_active)
                 dist = Categorical(logits=logits)
                 action = dist.sample()
+                last_mask = obs_active[:, -1] >= 0.5
+                if torch.any(last_mask):
+                    action = action.clone()
+                    action[last_mask] = 1
                 logp = dist.log_prob(action)
             actions[active_idx] = action.cpu().numpy()
             logps[active_idx] = logp.cpu().numpy()
@@ -498,6 +504,8 @@ def eval_same_problem_greedy(model: PPOGateNet, device: torch.device, eval_seed:
         with torch.no_grad():
             logits, _ = model(torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0))
             act = int(torch.argmax(logits, dim=1).item())
+        if float(obs[-1]) >= 0.5:
+            act = 1
         obs, _, terminated, truncated, info = env.step(act)
         done = bool(terminated or truncated)
     kpi = env.orch.get_final_kpi_stats(env.all_job_due_dates)
@@ -513,6 +521,8 @@ def validate_greedy(model: PPOGateNet, device: torch.device, seed: int = 999) ->
         with torch.no_grad():
             logits, _ = model(torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0))
             act = int(torch.argmax(logits, dim=1).item())
+        if float(obs[-1]) >= 0.5:
+            act = 1
         obs, _, terminated, truncated, info = env.step(act)
         done = bool(terminated or truncated)
     kpi = env.orch.get_final_kpi_stats(env.all_job_due_dates)
@@ -530,7 +540,7 @@ def train_ppo_gate():
 
     device = torch.device(getattr(configs, "device", "cpu"))
     model = PPOGateNet(
-        obs_dim=21,
+        obs_dim=22,
         n_actions=2,
         hidden=int(getattr(configs, "ppo_gate_hidden_dim", 256)),
         num_layers=int(getattr(configs, "ppo_gate_num_layers", 3)),

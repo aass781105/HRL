@@ -151,7 +151,7 @@ class EventGateEnv(gym.Env):
         self._prev_arrival_time = 0.0
         self.instance_seed = 0
         self.steps_since_last_release = 0
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(21,), dtype=np.float32) 
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(22,), dtype=np.float32)
         self.action_space = spaces.Discrete(2)
 
     @staticmethod
@@ -323,6 +323,7 @@ class EventGateEnv(gym.Env):
         buf_stats = self._get_buffer_stats(t_now)
         wip_stats = self.orch.get_wip_stats(t_now)
         inter_arrival_scaled = float((t_now - self._prev_arrival_time) / self.time_scale) if self.time_scale > 0 else 0.0
+        is_last_step = bool((self.events_done + 1) >= self.event_horizon)
         return calculate_gate_state(
             len(self.orch.buffer),
             self.orch.machine_free_time,
@@ -336,6 +337,7 @@ class EventGateEnv(gym.Env):
             wip_stats,
             inter_arrival_scaled=inter_arrival_scaled,
             steps_since_last_release=self.steps_since_last_release,
+            is_last_step=is_last_step,
         )
 
     def _get_buffer_stats(self, t_now: float):
@@ -402,12 +404,14 @@ class EventGateEnv(gym.Env):
         t_next = float(self.t_next)
         current_event_idx = int(self.events_done + 1)
         inter_arrival = float(t_event - self._prev_arrival_time)
+        forced_last_release = bool(current_event_idx >= self.event_horizon)
+        executed_action = 1 if forced_last_release else int(action)
         td_signal_source = self._resolve_td_signal_source()
         td_credit_mode = self._resolve_td_credit_mode()
         td_step_coef = self._resolve_td_step_coef()
         td_terminal_coef = self._resolve_td_terminal_coef()
 
-        if int(action) == 1:
+        if int(executed_action) == 1:
             self.orch.event_release_and_reschedule(t_event)
             self.release_count += 1
             self.agent_release_count += 1
@@ -423,7 +427,7 @@ class EventGateEnv(gym.Env):
         stability_scale = float(configs.stability_scale)
         r_stab = 0.0
         if stability_mode == "immediate_all":
-            r_stab = -stability_scale if int(action) == 1 else 0.0
+            r_stab = -stability_scale if int(executed_action) == 1 else 0.0
         total_neg_slack = 0.0
         for job_state in self.orch.buffer:
             due_abs = float(job_state.meta.get("due_date", t_event))
@@ -483,7 +487,7 @@ class EventGateEnv(gym.Env):
         self._prev_arrival_time = t_event
 
         r_shape = 0.0
-        if int(action) == 1 and td_credit_mode in ("step_only", "redistribute") and abs(td_step_coef) > 1e-12:
+        if int(executed_action) == 1 and td_credit_mode in ("step_only", "redistribute") and abs(td_step_coef) > 1e-12:
             agent_td_delta = float(actual_td_now - self._last_release_td)
             baseline_td_delta = float(baseline_step_td - prev_baseline_td)
             if td_signal_source == "agent_only":
@@ -519,6 +523,9 @@ class EventGateEnv(gym.Env):
             "event_id": current_event_idx,
             "time": t_event,
             "inter_arrival": inter_arrival,
+            "forced_last_release": bool(forced_last_release),
+            "requested_action": int(action),
+            "executed_action": int(executed_action),
             "actual_td": actual_td_now,
             "baseline_td": float(self.baseline_final_td),
             "baseline_event_td": float(baseline_step_td),

@@ -14,9 +14,10 @@ def calculate_gate_state(
     wip_stats: dict = None,
     inter_arrival_scaled: float = 0.0,
     steps_since_last_release: int = 0,
+    is_last_step: bool = False,
 ) -> np.ndarray:
     """
-    20-dimensional state for the high-level gate agent.
+    22-dimensional state for the high-level gate agent.
     """
     o0 = float(np.log1p(buffer_size))
     mft_abs = np.asarray(machine_free_time, dtype=float)
@@ -56,8 +57,9 @@ def calculate_gate_state(
 
     o18 = float(inter_arrival_scaled)
     o19 = float(np.log1p(max(0, int(steps_since_last_release))))
+    o20 = float(1.0 if bool(is_last_step) else 0.0)
 
     return np.array(
-        [o0, o1, o2, o3, buf_neg, buf_min, buf_avg, w_min, w_avg, w_rat, o10, c_log, buf_std, w_std, w_cnt, o15, s_den, o17, o18, o19, buf_q25],
+        [o0, o1, o2, o3, buf_neg, buf_min, buf_avg, w_min, w_avg, w_rat, o10, c_log, buf_std, w_std, w_cnt, o15, s_den, o17, o18, o19, buf_q25, o20],
         dtype=np.float32,
     )

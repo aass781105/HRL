@@ -9,7 +9,10 @@ def run_sensitivity_analysis():
     results = []
     
     # 建立主輸出目錄
-    base_plot_dir = getattr(configs, "plot_global_dir", "plots/cadence_study_small")
+    configured_plot_dir = getattr(configs, "plot_global_dir", "plots/global")
+    plot_root = os.path.dirname(configured_plot_dir) or "plots/global"
+    env_tag = f"h{int(configs.event_horizon)}_j{int(configs.init_jobs)}"
+    base_plot_dir = os.path.join(plot_root, f"cadence_{env_tag}")
     os.makedirs(base_plot_dir, exist_ok=True)
     
     print("-" * 30)
@@ -53,7 +56,9 @@ def run_sensitivity_analysis():
 
     # 4. 生成統計總表
     df = pd.DataFrame(results)
-    summary_path = os.path.join(base_plot_dir, "cadence_sensitivity_summary.csv")
+    base_name = str(getattr(configs, "plot_run_name", "")).strip()
+    summary_name = "cadence_sensitivity_summary.csv" if not base_name else f"{base_name}_cadence_sensitivity_summary.csv"
+    summary_path = os.path.join(base_plot_dir, summary_name)
     df.to_csv(summary_path, index=False)
     
     # 同時印出表格方便複製

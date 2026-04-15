@@ -1,0 +1,13 @@
+{
+  "policy": "ORTCadence_6",
+  "event_seed": 42,
+  "gate_cadence": 6,
+  "event_horizon": 20,
+  "init_jobs": 5,
+  "release_count": 5,
+  "makespan": 962.0,
+  "total_tardiness": 504.8840615392668,
+  "subproblem_time_limit": 3600.0,
+  "time_scale": 1,
+  "output_dir": "plots/global/ortcad_seed042\\20260402_164421_seed042_c6_t10"
+}

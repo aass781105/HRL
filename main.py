@@ -117,7 +117,7 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
     gate_device = torch.device(getattr(configs, "device", "cpu"))
     if gate_policy == "ppo":
         ppo_gate_model = PPOGateNet(
-            obs_dim=21,
+            obs_dim=22,
             n_actions=2,
             hidden=int(getattr(configs, "ppo_gate_hidden_dim", 256)),
             num_layers=int(getattr(configs, "ppo_gate_num_layers", 3)),
@@ -158,12 +158,11 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
     run_dir_name = f"{timestamp}_{safe_name}"
     csv_dir = os.path.join(base_plot_dir, run_dir_name)
     os.makedirs(csv_dir, exist_ok=True)
-    raw_csv_file = open(os.path.join(csv_dir, "raw_state.csv"), "w", newline="", encoding="utf-8")
+    csv_prefix = safe_name
+    raw_csv_file = open(os.path.join(csv_dir, f"{csv_prefix}_raw_state.csv"), "w", newline="", encoding="utf-8")
     raw_csv_writer = csv.writer(raw_csv_file)
-    obs_csv_file = open(os.path.join(csv_dir, "agent_state.csv"), "w", newline="", encoding="utf-8")
+    obs_csv_file = open(os.path.join(csv_dir, f"{csv_prefix}_agent_state.csv"), "w", newline="", encoding="utf-8")
     obs_csv_writer = csv.writer(obs_csv_file)
-    step1_csv_file = open(os.path.join(csv_dir, "step1_td_check.csv"), "w", newline="", encoding="utf-8")
-    step1_csv_writer = csv.writer(step1_csv_file)
 
     raw_headers = [
         "Event_ID", "Time", "Inter_Arrival", "Action", "Action_Str",
@@ -186,7 +185,7 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
         "Buffer_NegSlack_Ratio", "Norm_Buf_Min_Slack", "Norm_Buf_Avg_Slack", "Norm_Buf_Slack_Std", "Norm_Buf_Slack_Q25",
         "WIP_Job_Count", "WIP_Tardy_Ratio", "Norm_WIP_Min_Slack", "Norm_WIP_Avg_Slack", "Norm_WIP_Slack_Std",
         "Clipped_Planned_TD_Ratio", "Avg_WIP_Slack_Per_Job",
-        "Scaled_Inter_Arrival", "Log_Steps_Since_Last_Release",
+        "Scaled_Inter_Arrival", "Log_Steps_Since_Last_Release", "Is_Last_Step",
     ] + [
         "Baseline_Step_TD", "Baseline_Prev_Release_Event_ID", "Baseline_Prev_Release_TD", "Baseline_TD_Delta",
         "Agent_Prev_Release_Event_ID", "Agent_Prev_Release_TD", "Agent_TD_Delta",
@@ -195,10 +194,9 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
         "Phi_Before", "Phi_After", "Agent_Final_TD", "TD_Gap_vs_Baseline_Cadence",
         "Final_Makespan", "Final_Tardiness", "Release_Count",
     ]
-    obs_csv_order = [0, 1, 2, 15, 10, 3, 17, 4, 5, 6, 12, 14, 9, 7, 8, 13, 11, 16, 18, 19, 20]
+    obs_csv_order = [0, 1, 2, 15, 10, 3, 17, 4, 5, 6, 12, 14, 9, 7, 8, 13, 11, 16, 18, 19, 20, 21]
     raw_csv_writer.writerow(raw_headers)
     obs_csv_writer.writerow(obs_headers)
-    step1_csv_writer.writerow(["Event_ID", "Agent_Step_TD", "Baseline_Step_TD"])
 
     release_count, plot_seq = 0, 0
     total_cumulative_reward = 0.0
@@ -359,6 +357,7 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
             for j in new_jobs: all_job_due_dates[j.job_id] = j.meta["due_date"]
             orch.buffer.extend(new_jobs)
         stats["arrive"] += 1
+        is_last_step = bool(stats["arrive"] >= int(max_events))
         
         raw_s = get_raw_state_info(orch, t_now)
         b_dict = {"buffer_neg_slack_ratio": raw_s[7], "min_slack": raw_s[8], "avg_slack": raw_s[9], "slack_std": raw_s[10], "slack_q25": raw_s[11]}
@@ -385,8 +384,11 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
             w_dict,
             inter_arrival_scaled=(float(inter_arrival) / float(reward_scale)) if reward_scale > 0 else 0.0,
             steps_since_last_release=steps_since_last_release,
+            is_last_step=is_last_step,
         )
-        if is_ppo:
+        if is_last_step:
+            act = 1
+        elif is_ppo:
             with torch.no_grad():
                 logits, _ = ppo_gate_model(torch.from_numpy(obs).float().unsqueeze(0).to(gate_device))
                 if str(getattr(configs, "eval_action_selection", "greedy")).lower() == "sample":
@@ -535,8 +537,6 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
         pending_obs_rows.append(obs_row)
         if int(act) == 1:
             release_row_indices.append(len(pending_raw_rows) - 1)
-        if int(stats["arrive"]) == 1:
-            step1_csv_writer.writerow([1, f"{actual_td_logged:.2f}", f"{baseline_step_td:.2f}"])
 
         t_prev = t_now
         t_next = t_next_future
@@ -580,7 +580,6 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
     obs_csv_writer.writerow(obs_summary)
     raw_csv_file.close()
     obs_csv_file.close()
-    step1_csv_file.close()
     return final_mk, {"release_count": release_count, "total_tardiness": total_td}
 
 def main():
