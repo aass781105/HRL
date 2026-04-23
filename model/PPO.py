@@ -152,6 +152,22 @@ class PPO:
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.lr)
         self.V_loss_2 = nn.MSELoss()
         self.device = torch.device(config.device)
+        self.last_grad_stats = {
+            "shared_grad_norm": 0.0,
+            "actor_grad_norm": 0.0,
+            "critic_grad_norm": 0.0,
+            "critic_actor_ratio": 0.0,
+        }
+
+    @staticmethod
+    def _module_grad_l2_norm(module):
+        total_sq = 0.0
+        for p in module.parameters():
+            if p.grad is None:
+                continue
+            g = p.grad.detach()
+            total_sq += float(torch.sum(g * g).item())
+        return float(np.sqrt(total_sq))
 
     def update(self, memory):
         '''
@@ -170,6 +186,9 @@ class PPO:
         v_loss_epochs = 0.0
         p_loss_epochs = 0.0
         num_effective_updates = 0
+        grad_shared_epochs = 0.0
+        grad_actor_epochs = 0.0
+        grad_critic_epochs = 0.0
 
         for _ in range(self.k_epochs):
 
@@ -215,6 +234,9 @@ class PPO:
                 v_loss_epochs += v_loss.mean().detach()
                 p_loss_epochs += p_loss.mean().detach()
                 loss.mean().backward()
+                grad_shared_epochs += self._module_grad_l2_norm(self.policy.feature_exact)
+                grad_actor_epochs += self._module_grad_l2_norm(self.policy.actor)
+                grad_critic_epochs += self._module_grad_l2_norm(self.policy.critic)
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
                 self.optimizer.step()
                 num_effective_updates += 1
@@ -223,7 +245,24 @@ class PPO:
             policy_old_params.data.copy_(self.tau * policy_old_params.data + (1 - self.tau) * policy_params.data)
 
         if num_effective_updates == 0:
+            self.last_grad_stats = {
+                "shared_grad_norm": 0.0,
+                "actor_grad_norm": 0.0,
+                "critic_grad_norm": 0.0,
+                "critic_actor_ratio": 0.0,
+            }
             return 0.0, 0.0, 0.0
+
+        avg_shared = float(grad_shared_epochs) / num_effective_updates
+        avg_actor = float(grad_actor_epochs) / num_effective_updates
+        avg_critic = float(grad_critic_epochs) / num_effective_updates
+        ratio = (avg_critic / max(avg_actor, 1e-12))
+        self.last_grad_stats = {
+            "shared_grad_norm": avg_shared,
+            "actor_grad_norm": avg_actor,
+            "critic_grad_norm": avg_critic,
+            "critic_actor_ratio": float(ratio),
+        }
 
         return float(loss_epochs) / num_effective_updates, float(v_loss_epochs) / num_effective_updates, float(p_loss_epochs) / num_effective_updates
 

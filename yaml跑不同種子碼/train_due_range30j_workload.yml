@@ -1,0 +1,8 @@
+eval_model_name: llmk_range_30j_workload
+ppo_model_path: trained_network\SD2\llmk_range_30j_workload.pth
+due_date_mode: range
+val_due_date_mode: range
+schedule_type: same
+ll_td_mode: workload
+n_j: 30
+vloss_coef: 0.01

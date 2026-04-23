@@ -29,6 +29,10 @@ def seed_dynamic_simulation(seed: int) -> np.random.Generator:
 
 def create_dynamic_generator(config, *, interarrival_mean: float, burst_k: int, rng: np.random.Generator) -> EventBurstGenerator:
     base_cfg = copy.deepcopy(config)
+    # Keep main/dynamic world separate from low-level training data mixture:
+    # dynamic arrivals use fixed 5 operations per job.
+    setattr(base_cfg, "op_per_job", 5)
+    setattr(base_cfg, "enable_op_mixture", False)
     return EventBurstGenerator(
         SD2_instance_generator,
         base_cfg,
@@ -55,6 +59,9 @@ def sample_initial_jobs(config, *, rng: np.random.Generator, base_job_id: int = 
 
     init_cfg = copy.deepcopy(config)
     setattr(init_cfg, "n_j", init_jobs)
+    # Keep initial jobs consistent with dynamic bursts: fixed 5 operations.
+    setattr(init_cfg, "op_per_job", 5)
+    setattr(init_cfg, "enable_op_mixture", False)
     jl, pt, _ = SD2_instance_generator(init_cfg, rng=rng)
     dd_rel = generate_due_dates(
         jl,

@@ -63,6 +63,7 @@ parser.add_argument('--high', type=int, default=99, help='Upper Bound of process
 
 # SD2 Generation Specifics
 parser.add_argument('--op_per_job', type=float, default=0, help='Number of operations per job, default 0, means the number equals m')
+parser.add_argument('--enable_op_mixture', type=str2bool, default=False, help='Enable mixed per-job operation counts (used by low-level PPO training only).')
 parser.add_argument('--op_per_mch_min', type=int, default=1, help='Minimum number of compatible machines for each operation')
 parser.add_argument('--op_per_mch_max', type=int, default=5, help='Maximum number of compatible machines for each operation')
 parser.add_argument('--data_size', type=int, default=100, help='The number of instances for data generation')
@@ -96,7 +97,7 @@ parser.add_argument('--lr_end', type=float, default=1e-4, help='Final learning r
 parser.add_argument('--gamma', type=float, default=1, help='Discount factor used in training')
 parser.add_argument('--k_epochs', type=int, default=4, help='Update frequency of each episode')
 parser.add_argument('--eps_clip', type=float, default=0.2, help='Clip parameter')
-parser.add_argument('--vloss_coef', type=float, default=0.5, help='Critic loss coefficient')
+parser.add_argument('--vloss_coef', type=float, default=1, help='Critic loss coefficient')
 parser.add_argument('--ploss_coef', type=float, default=1, help='Policy loss coefficient')
 parser.add_argument('--entloss_coef', type=float, default=0.03, help='Entropy loss coefficient')
 parser.add_argument('--tau', type=float, default=0, help='Policy soft update coefficient')
@@ -119,15 +120,15 @@ parser.add_argument('--test_mode', type=str2bool, default=False, help='Whether u
 parser.add_argument('--sample_times', type=int, default=100, help='Sampling times for the sampling strategy')
 parser.add_argument('--test_model', nargs='+', default=['curriculum_train_10x5+mix','curriculum_train_40x5+mix'], help='List of model for testing')
 parser.add_argument('--test_method', nargs='+', default=["MWKR"], help='List of heuristic methods for testing')
-parser.add_argument('--eval_model_name', type=str, default="new", help='用於儲存檔案的檔名')
+parser.add_argument('--eval_model_name', type=str, default="llmk1000", help='用於儲存檔案的檔名')
 
 
 # ============================
 # Dynamic Simulation (Event-Driven)
 # ============================
-parser.add_argument('--event_horizon', type=float, default=20.0, help='事件驅動模式的模擬事件上限')
+parser.add_argument('--event_horizon', type=float, default=100.0, help='事件驅動模式的模擬事件上限')
 parser.add_argument('--interarrival_mean', type=float, default=25, help='Poisson interarrival_mean')
-parser.add_argument('--init_jobs', type=int, default= 5, help='初始工單數')
+parser.add_argument('--init_jobs', type=int, default= 10, help='初始工單數')
 parser.add_argument('--burst_size', type=int, default=1, help='每次生成工單數')
 parser.add_argument('--event_seed', type=int, default=42, help='事件驅動到達過程的亂數種子（Exponential 間隔）')
 parser.add_argument('--episode_seed_base', type=int, default=12345, help='episode 級別的基種子；每個 episode 以此為基準派生子亂數流')
@@ -138,8 +139,9 @@ parser.add_argument('--fast_mode', type=str2bool, default=False, help='是否開
 # ============================
 parser.add_argument('--curriculum_cycle', type=int, default=250, help='Updates per curriculum stage')
 parser.add_argument('--tardiness_dilution_power', type=float, default=1, help='Beta factor for tardiness dilution')
-parser.add_argument('--schedule_type', type=str, default='same', choices=['s2', 's3', 'same'], help='Type of curriculum schedule to use')
-parser.add_argument('--due_date_mode', type=str, default='k', choices=['k', 'M'], help='Due date generation mode: k (Individual) or M (Common). Note: M is used primarily in static curriculum.')
+parser.add_argument('--schedule_type', type=str, default='same', choices=['s2', 's3', 'same', 'u10_50'], help='Type of curriculum schedule to use')
+parser.add_argument('--due_date_mode', type=str, default='range', choices=['k', 'M', 'range', 'range15', 'range2', 'norm'], help='Due date generation mode: k (Individual), M (Common), range (uniform symmetric range), range15 (1.5x wider than range), norm (normal with random mean). range2 is kept as a backward-compatible alias.')
+parser.add_argument('--val_due_date_mode', type=str, default='range', choices=['', 'k', 'M', 'range', 'range15', 'range2', 'norm'], help='Validation due date mode override. Empty string means using due_date_mode.')
 parser.add_argument('--m_value', type=float, default=0.6, help='M-value used for Common Due Date (Static Curriculum Only)')
 parser.add_argument('--due_date_tightness', type=float, default=1.2, help='Tightness base factor (k). Current logic uses U[1.2, 2.0] for individual due dates.')
 parser.add_argument('--due_date_noise', type=float, default=0.0, help='Multiplicative noise level for due dates')
@@ -169,8 +171,12 @@ parser.add_argument('--ppo_gate_name', type=str, default='test', help='PPO gate 
 # ============================
 # Reward, Penalty & Weights
 # ============================
-parser.add_argument('--reward_alpha', type=float, default=0.3, help='Weight for Makespan in reward (alpha). Idle weight will be (1-alpha). Default 0.3 matches previous 0.3/0.7 split.')
-parser.add_argument('--tardiness_alpha', type=float, default=1.0, help='Weight for Tardiness in PPO reward calculation.')
+parser.add_argument('--reward_alpha', type=float, default=0.3, help='Deprecated. Unused in current low-level PPO reward path.')
+parser.add_argument('--tardiness_alpha', type=float, default=1.0, help='Deprecated. TD weighting is now controlled by ll_td_coef.')
+parser.add_argument('--ll_mk_coef', type=float, default=1.0, help='Low-level PPO reward coefficient for MK component.')
+parser.add_argument('--ll_td_coef', type=float, default=1.0, help='Low-level PPO reward coefficient for TD component.')
+parser.add_argument('--ll_td_mode', type=str, default='mean_pt', choices=['mean_pt', 'workload', 'slack_delta_mean_pt', 'tardiness_delta_mean_pt', 'mean_pt_split_ops', 'td_minus_workload_relu'],
+                    help='Low-level TD reward mode: mean_pt=TD/mean_pt, workload=TD/job_workload, slack_delta_mean_pt=negative slack-drop / mean_pt (only at job completion), tardiness_delta_mean_pt=per-op marginal tardiness increase / mean_pt, td_minus_workload_relu=-max(0, tardiness-workload). mean_pt_split_ops is kept as alias to tardiness_delta_mean_pt.')
 parser.add_argument('--stability_scale', type=float, default=0.0, help='決策穩定性懲罰 (Action 1 的額外扣分)。設為 0 代表純效能模式。')
 parser.add_argument('--buffer_penalty_coef', type=float, default=0.0, help='Coefficient for buffer tardiness penalty')
 parser.add_argument('--stability_mode', type=str, default='immediate_all', choices=['immediate_all', 'free_threshold'], help='Stability reward mode: immediate_all = current per-release penalty; free_threshold = releases are free until stability_free_releases, then penalize via terminal or redistribution.')

@@ -1,0 +1,5 @@
+eval_model_name: llmk_range_workload
+ppo_model_path: trained_network\SD2\llmk_range_workload.pth
+due_date_mode: range
+val_due_date_mode: range
+ll_td_mode: workload

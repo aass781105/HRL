@@ -1,0 +1,17 @@
+{
+  "instance_json": "evaluation_results/dynamic_instance_seed42_h20_k1.json",
+  "solver": "low_level_ppo_cadence_export",
+  "ppo_model_path": "trained_network\\SD2\\llmk1.pth",
+  "cadence": 3,
+  "num_jobs_total": 25,
+  "num_events": 20,
+  "num_init_jobs": 5,
+  "num_batches_recorded": 8,
+  "makespan": 1199.7392756558233,
+  "total_tardiness": 2013.9435868431653,
+  "objective": "0.5*MK + 0.5*TD",
+  "objective_value": 1606.8414312494942,
+  "manifest_jsonl": "evaluation_results\\dynamic_ppo_cadence_export\\ppo_cadence_03_dynamic_instance_seed42_h20_k1_batch_manifests.jsonl",
+  "summary_csv": "evaluation_results\\dynamic_ppo_cadence_export\\ppo_cadence_03_dynamic_instance_seed42_h20_k1_batch_summary.csv",
+  "schedule_csv": "evaluation_results\\dynamic_ppo_cadence_export\\ppo_cadence_03_dynamic_instance_seed42_h20_k1_schedule.csv"
+}

@@ -83,6 +83,9 @@ class EventBurstGenerator:
                  rng: Optional[np.random.Generator] = None,
                  starting_job_id: int = 0):
         self.sd2_fn, self.cfg, self.M = sd2_fn, base_config, int(n_machines)
+        # Dynamic world should use fixed 5 operations per job.
+        setattr(self.cfg, "op_per_job", 5)
+        setattr(self.cfg, "enable_op_mixture", False)
         self.interarrival_mean = float(interarrival_mean)
         self.rng = rng or np.random.default_rng()
         self.k_sampler = k_sampler or (lambda _rng: 1)
@@ -150,6 +153,8 @@ class GlobalTimelineOrchestrator:
         self._last_full_rows, self._last_jobs_snapshot = [], []
         self._job_history_finishes: Dict[int, float] = {}
         self._release_count = 0 # [NEW] Track release events
+        self.last_batch_manifest = None
+        self.last_batch_rows = []
         self.method = str(getattr(configs, "scheduler_type", "PPO")).upper()
         self._ppo = PPO_initialize() if self.method == "PPO" else None
         if self._ppo:
@@ -162,6 +167,8 @@ class GlobalTimelineOrchestrator:
         if clear_buffer: self.buffer.clear()
         self._global_rows, self._global_row_keys, self._last_full_rows, self._last_jobs_snapshot, self._job_history_finishes = [], set(), [], [], {}
         self._release_count = 0 # [NEW]
+        self.last_batch_manifest = None
+        self.last_batch_rows = []
 
     def _extend_global_rows_dedup(self, rows: List[Dict]):
         for r in rows:
@@ -170,6 +177,97 @@ class GlobalTimelineOrchestrator:
                 self._global_row_keys.add(k); self._global_rows.append(r)
                 jid = int(r["job"])
                 self._job_history_finishes[jid] = max(self._job_history_finishes.get(jid, 0.0), float(r["end"]))
+
+    def _build_last_batch_manifest(
+        self,
+        *,
+        jobs_new: List[JobSpec],
+        batch_time: float,
+        pt_scale: float,
+        jl,
+        pt,
+        due_dates_ppo,
+        due_dates_abs,
+        event_id: Optional[int] = None,
+    ) -> Dict:
+        batch_time = float(batch_time)
+        pt_scale = max(float(pt_scale), 1e-6)
+        norm = _TimeNormalizer(batch_time, pt_scale)
+        job_length_list = [int(x) for x in np.asarray(jl[0], dtype=int).tolist()] if jl else []
+        op_pt_list = np.asarray(pt[0], dtype=float).tolist() if pt else []
+        due_dates_abs = [float(x) for x in due_dates_abs]
+        due_dates_ppo = [float(x) for x in due_dates_ppo]
+        ready_times_abs = [float(js.meta.get("ready_at", batch_time)) for js in jobs_new]
+        ready_times_rel = [float(x - batch_time) for x in ready_times_abs]
+        ready_times_env = [float(norm.f(x)) for x in ready_times_abs]
+
+        jobs_payload = []
+        for batch_idx, js in enumerate(jobs_new):
+            op_offset = int(js.meta.get("op_offset", 0))
+            total_ops = int(js.meta.get("total_ops", op_offset + len(js.operations)))
+            arrive_abs = float(js.meta.get("t_arrive", batch_time))
+            arrive_rel = float(arrive_abs - batch_time)
+            ready_abs = float(js.meta.get("ready_at", batch_time))
+            due_abs = float(js.meta.get("due_date", 0.0))
+            ops_payload = []
+            for local_op_idx, op in enumerate(js.operations):
+                machine_times = {}
+                if op.time_row is not None:
+                    for m_idx, pt_val in enumerate(op.time_row):
+                        if float(pt_val) > 0:
+                            machine_times[str(int(m_idx))] = float(pt_val)
+                elif op.machine_times is not None:
+                    for m_idx, pt_val in op.machine_times.items():
+                        if float(pt_val) > 0:
+                            machine_times[str(int(m_idx))] = float(pt_val)
+                ops_payload.append(
+                    {
+                        "local_op_id": int(local_op_idx),
+                        "global_op_id": int(op_offset + local_op_idx),
+                        "machine_times": machine_times,
+                    }
+                )
+
+            jobs_payload.append(
+                {
+                    "batch_job_index": int(batch_idx),
+                    "job_id": int(js.job_id),
+                    "started_ops": int(op_offset),
+                    "remaining_ops": int(len(js.operations)),
+                    "total_ops": int(total_ops),
+                    "job_length": int(len(js.operations)),
+                    "t_arrive_abs": arrive_abs,
+                    "t_arrive_rel": arrive_rel,
+                    "ready_at_abs": ready_abs,
+                    "ready_at_rel": float(ready_abs - batch_time),
+                    "ready_at_env": float(norm.f(ready_abs)),
+                    "due_date_abs": due_abs,
+                    "due_date_rel": float(due_abs - batch_time),
+                    "due_date_env": float(norm.f(due_abs)),
+                    "operations": ops_payload,
+                }
+            )
+
+        manifest = {
+            "event": "batch_finalized",
+            "event_id": int(event_id) if event_id is not None else None,
+            "batch_time_abs": batch_time,
+            "release_index": int(self._release_count),
+            "pt_scale": pt_scale,
+            "n_jobs": int(len(jobs_new)),
+            "n_ops": int(sum(len(j.operations) for j in jobs_new)),
+            "machine_free_time_abs": [float(x) for x in np.asarray(self.machine_free_time, dtype=float).tolist()],
+            "machine_free_time_env": [float(x) for x in np.asarray(norm.f(self.machine_free_time), dtype=float).tolist()],
+            "job_length_list": [job_length_list],
+            "op_pt_list": [op_pt_list],
+            "due_date_list": [due_dates_ppo],
+            "true_due_date_list": [due_dates_abs],
+            "candidate_free_time_abs": ready_times_abs,
+            "candidate_free_time_env": ready_times_env,
+            "candidate_ready_rel": ready_times_rel,
+            "jobs": jobs_payload,
+        }
+        return manifest
 
     def solve_current_batch_static(self, env: FJSPEnvForVariousOpNums, state) -> List[Dict]:
         rec = BatchScheduleRecorder(self._committed_jobs, self.M)
@@ -225,7 +323,7 @@ class GlobalTimelineOrchestrator:
         }
         return rec.to_rows()
 
-    def event_release_and_reschedule(self, t_e: float) -> Dict:
+    def event_release_and_reschedule(self, t_e: float, event_id: Optional[int] = None) -> Dict:
         self.t = float(t_e)
         self._release_count += 1 # [NEW] Incremental release count
         H_add = [dict(r) for r in self._last_full_rows if float(r["start"]) < self.t]
@@ -260,13 +358,27 @@ class GlobalTimelineOrchestrator:
                 js_b.meta["ready_at"] = float(inprog[0]["end"]) if inprog else max(float(js.meta.get("t_arrive", 0.0)), self.t)
                 jobs_new.append(js_b)
         
-        if not jobs_new: return {"event": "tick", "t": self.t}
+        if not jobs_new:
+            self.last_batch_manifest = None
+            self.last_batch_rows = []
+            return {"event": "tick", "t": self.t}
         
         jl, pt = self._build_batch(jobs_new); env = FJSPEnvForVariousOpNums(n_j=len(jobs_new), n_m=self.M)
         pt_scale = (float(configs.low) + float(configs.high)) / 2.0
         norm = _TimeNormalizer(self.t, pt_scale)
         due_dates_ppo = [norm.f(float(j.meta.get("due_date", 0.0))) for j in jobs_new]
         due_dates_abs = [float(j.meta.get("due_date", 0.0)) for j in jobs_new]
+
+        self.last_batch_manifest = self._build_last_batch_manifest(
+            jobs_new=jobs_new,
+            batch_time=self.t,
+            pt_scale=pt_scale,
+            jl=jl,
+            pt=pt,
+            due_dates_ppo=due_dates_ppo,
+            due_dates_abs=due_dates_abs,
+            event_id=event_id,
+        )
         
         state = env.set_initial_data(jl, pt, due_date_list=[due_dates_ppo], normalize_due_date=False, true_due_date_list=[due_dates_abs])
         env.true_mch_free_time[0,:] = self.machine_free_time; env.mch_free_time[0,:] = norm.f(self.machine_free_time)
@@ -275,6 +387,7 @@ class GlobalTimelineOrchestrator:
             env.true_candidate_free_time[0,i] = r_abs; env.candidate_free_time[0,i] = norm.f(r_abs)
             
         self._committed_jobs = jobs_new; rows = self.solve_current_batch_static(env, env.rebuild_state_from_current())
+        self.last_batch_rows = [dict(r) for r in rows]
         
         # Finalize
         self.machine_free_time = env.true_mch_free_time[0].astype(float).copy()

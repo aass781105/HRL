@@ -1,0 +1,15 @@
+gate_policy: cadence
+scheduler_type: PPO
+gate_cadence: 1
+ortools_total_solve_time_budget: 7200
+ppo_model_path: trained_network\SD2\llmk_range_td-w_20j.pth
+n_m: 5
+low: 1
+high: 99
+event_horizon: 100
+interarrival_mean: 25
+init_jobs: 10
+burst_size: 1
+event_seed: 303
+fast_mode: True
+

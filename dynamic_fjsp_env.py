@@ -106,6 +106,8 @@ class DynamicFJSPEnv:
         if self.initial_jobs > 0:
             init_cfg = deepcopy(self.config)
             setattr(init_cfg, "n_j", self.initial_jobs)
+            setattr(init_cfg, "op_per_job", 5)
+            setattr(init_cfg, "enable_op_mixture", False)
             job_length, op_pt, _ = SD2_instance_generator(init_cfg)
             initial_jobs_list = split_matrix_to_jobs(job_length, op_pt, base_job_id=0, t_arrive=0.0)
             self.buffer.extend(initial_jobs_list)

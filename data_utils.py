@@ -15,6 +15,22 @@ import numpy as np
 
 
 # [CHANGED] 支援注入 rng，移除對全域 np.random 的依賴
+def sample_job_lengths_with_mixture(n_j, rng, full_length=5):
+    """
+    Sample per-job operation counts using:
+    - 0.5 probability: op count = full_length
+    - 0.5 probability: uniform from {1, ..., full_length - 1}
+    """
+    n_j = int(n_j)
+    full_length = int(full_length)
+    if full_length <= 1:
+        return np.full(shape=(n_j,), fill_value=max(1, full_length), dtype=int)
+
+    choose_full = rng.random(n_j) < 0.5
+    sampled_short = rng.integers(1, full_length, size=n_j)
+    return np.where(choose_full, full_length, sampled_short).astype(int)
+
+
 def SD2_instance_generator(config, seed=None, rng=None, mode='uniform'):
     """
     :param config: 超參數
@@ -39,8 +55,12 @@ def SD2_instance_generator(config, seed=None, rng=None, mode='uniform'):
 
     low  = int(config.low)
     high = int(config.high)
-    n_op = int(n_j * op_per_job)
-    job_length = np.full(shape=(n_j,), fill_value=op_per_job, dtype=int)
+    enable_op_mixture = bool(getattr(config, "enable_op_mixture", True))
+    if int(op_per_job) == 5 and enable_op_mixture:
+        job_length = sample_job_lengths_with_mixture(n_j=n_j, rng=rng, full_length=5)
+    else:
+        job_length = np.full(shape=(n_j,), fill_value=op_per_job, dtype=int)
+    n_op = int(np.sum(job_length))
     
     if mode == 'realistic':
         # --- Realistic Generation (Mimic vdata) ---
@@ -218,6 +238,24 @@ def generate_due_dates(job_length, op_pt, tightness=1.2, due_date_mode='k', seed
         mean_pt = (float(configs.low) + float(configs.high)) / 2.0
         due_range = n_j * mean_pt
         return rng.uniform(-due_range, due_range, size=n_j)
+
+    if due_date_mode in ('range15', 'range2'):
+        # 1.5x wider than range: Uniform(-1.5*n_j*mean_pt, 1.5*n_j*mean_pt)
+        # Keep "range2" as backward-compatible alias.
+        from params import configs
+        mean_pt = (float(configs.low) + float(configs.high)) / 2.0
+        due_range = 1.5 * n_j * mean_pt
+        return rng.uniform(-due_range, due_range, size=n_j)
+
+    if due_date_mode == 'norm':
+        from params import configs
+
+        mean_pt = (float(configs.low) + float(configs.high)) / 2.0
+        a = int(op_pt.shape[1]) * mean_pt
+        # Instance-level parameters: all jobs in this instance share one mu/sigma pair.
+        mu = float(rng.uniform(-a / 2.0, a * 1.5))
+        sigma = float(rng.uniform(a / 2.0, a))
+        return rng.normal(loc=mu, scale=sigma, size=n_j)
 
     if due_date_mode == 'M':
         total_work = np.sum(job_work)

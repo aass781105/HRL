@@ -1,0 +1,7 @@
+eval_model_name: llmk_range15_30j
+ppo_model_path: trained_network\SD2\llmk_range15_30j.pth
+due_date_mode: range15
+val_due_date_mode: range15
+schedule_type: same
+n_j: 30
+vloss_coef: 0.01

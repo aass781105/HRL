@@ -1,0 +1,16 @@
+eval_model_name: llmk_range_adj
+ppo_model_path: trained_network\SD2\llmk_range_adj.pth
+due_date_mode: range15
+val_due_date_mode: range
+ll_td_mode: mean_pt
+schedule_type: same
+layer_fea_output_dim: [128,128,128]
+hidden_dim_actor: 1024
+hidden_dim_critic: 512
+vloss_coef: 0.05
+num_envs: 50
+minibatch_size: 2048
+reset_env_timestep: 50
+gae_lambda: 0.995
+gamma: 0.999
+k_epochs: 2

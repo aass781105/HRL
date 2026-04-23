@@ -104,13 +104,13 @@ def plot_reward_components(detailed_path: Path, output_path: Path, core_name: st
 
     # 2. Normalized Components (Dual Axis - FIXED SCALE)
     axes[1].set_title('Reward Components (Learning Signal Breakdown)')
-    ln3 = axes[1].plot(ep, mk_mean, color='green', label='Mk Gain (Norm)')
+    ln3 = axes[1].plot(ep, mk_mean, color='green', label='Mk Gain')
     axes[1].set_ylabel('Mk Gain Reward', color='green')
     axes[1].tick_params(axis='y', labelcolor='green')
     axes[1].grid(True, alpha=0.3)
     
     ax1_r = axes[1].twinx()
-    ln4 = ax1_r.plot(ep, td_mean, color='red', label='Td Penalty (Norm)')
+    ln4 = ax1_r.plot(ep, td_mean, color='red', label='Td Penalty')
     ax1_r.set_ylabel('Td Penalty Reward', color='red')
     ax1_r.tick_params(axis='y', labelcolor='red')
     
@@ -399,9 +399,8 @@ def plot_validation_breakdown(csv_path: Path, output_path: Path, core_name: str)
 def main():
     # 1. Construct dynamic log name
     model_name = configs.eval_model_name
-    # Assuming initial n_j=10, n_m=5 from configs default or current
-    # Note: train_curriculum uses 'self.initial_n_j' which defaults to 10 in Trainer.__init__
-    init_nj = 10 
+    # Use configured training size for log suffix (e.g., 30x5).
+    init_nj = int(getattr(configs, "n_j", 10))
     n_m = configs.n_m
     suffix = strToSuffix(configs.data_suffix)
     

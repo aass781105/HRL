@@ -1,0 +1,8 @@
+eval_model_name: llmk_range_td-w_20j
+ppo_model_path: trained_network\SD2\llmk_range_td-w_20j.pth
+due_date_mode: range
+val_due_date_mode: range
+schedule_type: same
+ll_td_mode: td_minus_workload_relu
+n_j: 20
+vloss_coef: 0.1

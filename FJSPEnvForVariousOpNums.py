@@ -257,6 +257,10 @@ class FJSPEnvForVariousOpNums:
                 [np.sum(self.true_op_mean_pt[k][self.job_first_op_id[k][i]:self.job_last_op_id[k][i] + 1])
                  for i in range(self.number_of_jobs)])
 
+        # Fixed per-job total workload (absolute scale) for reward normalization.
+        # Keep this constant across steps, unlike remaining-work tensors.
+        self.true_job_total_work = np.array(self.true_job_remain_work, dtype=np.float64)
+
         self.op_match_job_remain_work = np.array([np.repeat(self.job_remain_work[k], repeats=self.virtual_job_length[k])
                                                   for k in range(self.number_of_envs)])
         # [ADDED] Map true job remain work to operation dimension
@@ -438,6 +442,11 @@ class FJSPEnvForVariousOpNums:
         # [FIX] Correctly index candidate using incomplete_env_idx for row and chosen_job for column
         chosen_op = self.candidate[self.incomplete_env_idx, chosen_job]
 
+        # Snapshots before state transition (used by configurable TD reward modes).
+        pre_job_ready_time = self.true_candidate_free_time[self.incomplete_env_idx, chosen_job].copy()
+        pre_job_remain_work = self.true_op_match_job_remain_work[self.incomplete_env_idx, chosen_op].copy()
+        pre_job_tardiness = self.job_current_tardiness[self.incomplete_env_idx, chosen_job].copy()
+
         if (self.reverse_process_relation[self.incomplete_env_idx, chosen_op, chosen_mch]).any():
             print(f'FJSP_Env Error: Op {chosen_op} cannot be processed by Mch {chosen_mch}')
             sys.exit()
@@ -589,27 +598,65 @@ class FJSPEnvForVariousOpNums:
         # [REVERTED] Sparse Reward Logic
         # Calculate tardiness only at the completion of the job.
         
-        # Calculate tardiness for the chosen operation
+        # Calculate tardiness for the chosen operation (for incomplete envs only)
         # relevant_completion_times and relevant_due_dates are absolute times
-        tardiness = np.maximum(0, relevant_completion_times - relevant_due_dates)
-        
-        # Only apply if it is the last operation of the job
-        tardiness = tardiness * is_last_op
-        
-        # Update accumulated total tardiness
-        self.accumulated_tardiness[self.incomplete_env_idx] += tardiness
-        
-        alpha = float(getattr(configs, "tardiness_alpha", 1.0))
+        tardiness_local = np.maximum(0, relevant_completion_times - relevant_due_dates)
 
-        # [MODIFIED] Normalization using estimated makespan (mean_op_pt * n_j)
-        base_scale = self.mean_op_pt 
+        # Only apply if it is the last operation of the job
+        tardiness_local = tardiness_local * is_last_op
+
+        # Expand to full-env shape for stable reward arithmetic
+        tardiness = np.zeros(self.number_of_envs, dtype=np.float64)
+        tardiness[self.incomplete_env_idx] = tardiness_local
+
+        # Update accumulated total tardiness
+        self.accumulated_tardiness[self.incomplete_env_idx] += tardiness_local
         
-        # Linear Scalings
-        reward_td = - alpha * (tardiness / base_scale)
+        td_mode = str(getattr(configs, "ll_td_mode", "mean_pt")).strip().lower()
+        if td_mode == "workload":
+            # TD / job workload
+            chosen_job_workload = self.true_job_total_work[self.incomplete_env_idx, chosen_job]
+            base_scale = np.maximum(chosen_job_workload, 1e-6)
+            reward_td_local = -(tardiness_local / base_scale)
+        elif td_mode == "td_minus_workload_relu":
+            # TD = -max(0, tardiness - workload) / mean_pt
+            chosen_job_workload = self.true_job_total_work[self.incomplete_env_idx, chosen_job]
+            base_scale = max(float(self.mean_op_pt), 1e-6)
+            reward_td_local = -np.maximum(0.0, tardiness_local - chosen_job_workload) / base_scale
+        elif td_mode in ("tardiness_delta_mean_pt", "mean_pt_split_ops"):
+            # Per-op marginal tardiness increase for the selected job.
+            # This provides dense TD signal while preserving final total tardiness semantics.
+            base_scale = max(float(self.mean_op_pt), 1e-6)
+            current_job_tardiness = np.maximum(
+                0.0, self.true_candidate_free_time[self.incomplete_env_idx, chosen_job] - relevant_due_dates
+            )
+            delta_job_tardiness = np.maximum(0.0, current_job_tardiness - pre_job_tardiness)
+            self.job_current_tardiness[self.incomplete_env_idx, chosen_job] = current_job_tardiness
+            reward_td_local = -(delta_job_tardiness / base_scale)
+        elif td_mode == "slack_delta_mean_pt":
+            # Only penalize slack deterioration; no positive reward.
+            # Baseline completion target = pre_ready + pre_remaining_work.
+            base_scale = max(float(self.mean_op_pt), 1e-6)
+            slack_drop_local = np.maximum(0.0, relevant_completion_times - (pre_job_ready_time + pre_job_remain_work))
+            slack_drop_local = slack_drop_local * is_last_op
+            reward_td_local = -(slack_drop_local / base_scale)
+        else:
+            # Default: TD / mean_pt
+            base_scale = max(float(self.mean_op_pt), 1e-6)
+            reward_td_local = -(tardiness_local / base_scale)
+
+        # Linear scalings (build local then expand to full-env shape)
+        reward_td = np.zeros(self.number_of_envs, dtype=np.float64)
+        reward_td[self.incomplete_env_idx] = reward_td_local
         
-        # [MODIFIED] Total reward normalized by number of jobs 
-        # to prevent excessive signal dilution in larger problem scales (e.g., 30x5).
-        reward = (reward_mk + reward_td) / 10
+        # Final low-level reward composition with independent MK/TD coefficients.
+        mk_coef = float(getattr(configs, "ll_mk_coef", 1.0))
+        td_coef = float(getattr(configs, "ll_td_coef", 1.0))
+        reward_mk_weighted = mk_coef * reward_mk
+        reward_td_weighted = td_coef * reward_td
+        reward = (reward_mk_weighted + reward_td_weighted) / 10
+        reward_mk_step = reward_mk_weighted / 10.0
+        reward_td_step = reward_td_weighted / 10.0
 
         # self.state.update (...) already called above in timing block
         self.done_flag = self.done()
@@ -637,8 +684,10 @@ class FJSPEnvForVariousOpNums:
         
         info = {
             "scheduled_op_details": scheduled_op_details,
-            "reward_mk": reward_mk / np.sqrt(self.number_of_jobs), # Scale to match training
-            "reward_td": reward_td / np.sqrt(self.number_of_jobs), # Scale to match training
+            "reward_mk": reward_mk_weighted / np.sqrt(self.number_of_jobs), # Weighted + scaled
+            "reward_td": reward_td_weighted / np.sqrt(self.number_of_jobs), # Weighted + scaled
+            "reward_mk_step": reward_mk_step,
+            "reward_td_step": reward_td_step,
             # [ADDED] Raw values for debugging
             "raw_mk_gain": float(reward_mk[env_idx]), 
             "raw_local_tardiness": float(tardiness[env_idx]),
