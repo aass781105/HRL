@@ -2,6 +2,7 @@ import os
 import time
 import csv
 import json
+import sys
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -13,6 +14,43 @@ from global_env import GlobalTimelineOrchestrator, JobSpec
 from dynamic_job_stream import create_dynamic_world, sample_initial_jobs
 from model.gate_state import calculate_gate_state
 from gantt import plot_global_gantt
+from run_dynamic_ppo_cadence_export import build_job_spec, infer_n_machines, load_payload, validate_unique_job_ids
+
+
+ORTOOLS_DEFAULT_CONFIG = {
+    "gate_policy": "cadence",
+    "scheduler_type": "OR-Tools",
+    "gate_cadence": 10,
+    "ortools_subproblem_time_limit": 7200.0,
+    "ortools_total_solve_time_budget": 0.0,
+    "n_m": 5,
+    "low": 1,
+    "high": 99,
+    "event_horizon": 30,
+    "interarrival_mean": 25.0,
+    "arrival_mode": "uniform",
+    "interarrival_uniform_low": 30.0,
+    "interarrival_uniform_high": 80.0,
+    "init_jobs": 50,
+    "burst_size": 1,
+    "due_date_k_low": 1.2,
+    "due_date_k_high": 6.0,
+    "event_seed": 42,
+    "fast_mode": False,
+}
+
+
+def _cli_provided(name: str) -> bool:
+    flag = f"--{name}"
+    return any(arg == flag or arg.startswith(f"{flag}=") for arg in sys.argv[1:])
+
+
+def apply_default_ortools_config() -> None:
+    if str(getattr(configs, "config", "")).strip():
+        return
+    for name, value in ORTOOLS_DEFAULT_CONFIG.items():
+        if not _cli_provided(name):
+            setattr(configs, name, value)
 
 
 def scale_time(value: float, time_scale: int) -> int:
@@ -201,16 +239,28 @@ def solve_current_batch_ortools(
                 "duration": float(end_time - start_time),
             }
         )
-    total_tardiness = sum(
+    model_total_tardiness = sum(
         unscale_time(solver.Value(tardiness_vars[job_id]), time_scale)
         for job_id in tardiness_vars.keys()
     )
     makespan = unscale_time(solver.Value(makespan), time_scale)
+    job_finish: Dict[int, float] = {}
+    for row in rows:
+        jid = int(row["job"])
+        job_finish[jid] = max(job_finish.get(jid, 0.0), float(row["end"]))
+    total_tardiness = sum(
+        max(0.0, float(job_finish[job_id]) - float(job.meta.get("due_date", 0.0)))
+        for job in jobs
+        for job_id in [int(job.job_id)]
+        if job_id in job_finish
+    )
     solve_info = {
         "status": solver.StatusName(status),
         "solve_time_seconds": float(solve_wall_time),
         "solver_wall_time_seconds": float(solver.WallTime()),
         "makespan": float(makespan),
+        "model_total_tardiness": float(model_total_tardiness),
+        "model_objective_value": float(makespan + model_total_tardiness),
         "total_tardiness": float(total_tardiness),
         "objective_value": float(makespan + total_tardiness),
     }
@@ -314,20 +364,47 @@ def run_event_driven_ortools_cadence(
     time_scale = max(1, int(getattr(configs, "ortools_time_scale", 1)))
     subproblem_time_limit = float(getattr(configs, "ortools_subproblem_time_limit", 30.0))
     total_solve_time_budget = float(getattr(configs, "ortools_total_solve_time_budget", 0.0))
+    instance_json_path = str(getattr(configs, "instance_json", "") or "").strip()
+    replay_payload = None
+    replay_init_jobs_payload = []
+    replay_events_payload = []
 
-    rng, gen, orch = create_dynamic_world(
-        configs,
-        interarrival_mean=float(interarrival_mean),
-        burst_k=int(burst_k),
-        seed=seed,
-    )
     all_job_due_dates: Dict[int, float] = {}
+    if instance_json_path:
+        if not os.path.exists(instance_json_path):
+            raise FileNotFoundError(f"Configured instance_json not found: {instance_json_path}")
+        replay_payload = load_payload(instance_json_path)
+        validate_unique_job_ids(replay_payload)
+        n_m = infer_n_machines(replay_payload)
+        configs.n_m = int(n_m)
+        gen = None
+        orch = GlobalTimelineOrchestrator(int(n_m), job_generator=None, t0=0.0)
+        replay_init_jobs_payload = sorted(replay_payload.get("init_jobs", []), key=lambda x: int(x.get("job_id", 0)))
+        replay_events_payload = sorted(replay_payload.get("events", []), key=lambda x: int(x.get("event_id", 0)))
+        if int(max_events) > 0:
+            replay_events_payload = replay_events_payload[: int(max_events)]
+        for job_id, due in replay_payload.get("all_job_due_dates", {}).items():
+            all_job_due_dates[int(job_id)] = float(due)
+        if not all_job_due_dates:
+            for job in replay_payload.get("jobs", []):
+                all_job_due_dates[int(job.get("job_id", 0))] = float(job.get("due_date", 0.0))
+    else:
+        rng, gen, orch = create_dynamic_world(
+            configs,
+            interarrival_mean=float(interarrival_mean),
+            burst_k=int(burst_k),
+            seed=seed,
+        )
     reward_scale = (float(configs.low) + float(configs.high)) / 2.0
 
     suffix = f"ORTCadence_{cadence}"
     base_plot_dir = plot_global_dir or "plots/global"
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    safe_name = f"ortcad{cadence}"
+    if instance_json_path:
+        inst_name = os.path.splitext(os.path.basename(instance_json_path))[0]
+        safe_name = f"ortcad_{inst_name}_c{cadence}"
+    else:
+        safe_name = f"ortcad_seed{seed:03d}_c{cadence}"
     override_name = str(getattr(configs, "plot_run_name", "")).strip()
     if override_name:
         safe_name = override_name
@@ -386,6 +463,11 @@ def run_event_driven_ortools_cadence(
         "Objective_MK_Plus_TD",
         "Makespan",
         "Total_Tardiness",
+        "Model_Objective_MK_Plus_TD",
+        "Model_Total_Tardiness",
+        "Global_Objective_MK_Plus_TD",
+        "Global_Makespan",
+        "Global_Total_Tardiness",
         "Num_Committed_Jobs",
         "Num_Rows",
     ])
@@ -494,17 +576,76 @@ def run_event_driven_ortools_cadence(
             for r in (orch._global_rows + orch._last_full_rows)
         ]
 
+    def compute_rows_kpis(rows, due_dates: Dict[int, float], *, machine_free_time=None) -> Dict[str, float]:
+        job_finish: Dict[int, float] = {}
+        max_end = 0.0
+        for row in rows:
+            jid = int(row["job"])
+            end = float(row["end"])
+            job_finish[jid] = max(job_finish.get(jid, 0.0), end)
+            max_end = max(max_end, end)
+        if machine_free_time is not None and len(machine_free_time) > 0:
+            max_end = max(max_end, float(np.max(machine_free_time)))
+        total_td = sum(
+            max(0.0, float(job_finish[int(job_id)]) - float(due))
+            for job_id, due in due_dates.items()
+            if int(job_id) in job_finish
+        )
+        return {
+            "makespan": float(max_end),
+            "total_tardiness": float(total_td),
+            "objective_value": float(max_end + total_td),
+        }
+
+    def compute_global_kpis(orchestrator: GlobalTimelineOrchestrator) -> Dict[str, float]:
+        rows = list(orchestrator._global_rows) + list(orchestrator._last_full_rows)
+        return compute_rows_kpis(rows, all_job_due_dates, machine_free_time=getattr(orchestrator, "machine_free_time", None))
+
+    def write_ortools_release_log(
+        *,
+        event_id: int,
+        release_time: float,
+        time_limit: float,
+        solve_info: Dict,
+        num_committed_jobs: int,
+        num_rows: int,
+    ) -> None:
+        global_info = compute_global_kpis(orch)
+        ort_csv_writer.writerow([
+            int(event_id),
+            f"{float(release_time):.4f}",
+            f"{float(time_limit):.6f}",
+            solve_info.get("status", ""),
+            f"{float(solve_info.get('solve_time_seconds', 0.0)):.6f}",
+            f"{float(solve_info.get('solver_wall_time_seconds', 0.0)):.6f}",
+            f"{float(solve_info.get('objective_value', 0.0)):.4f}",
+            f"{float(solve_info.get('makespan', 0.0)):.4f}",
+            f"{float(solve_info.get('total_tardiness', 0.0)):.4f}",
+            f"{float(solve_info.get('model_objective_value', 0.0)):.4f}",
+            f"{float(solve_info.get('model_total_tardiness', 0.0)):.4f}",
+            f"{global_info['objective_value']:.4f}",
+            f"{global_info['makespan']:.4f}",
+            f"{global_info['total_tardiness']:.4f}",
+            int(num_committed_jobs),
+            int(num_rows),
+        ])
+
     release_count = 0
     plot_seq = 0
     steps_since_last_release = 0
     pending_raw_rows = []
     pending_obs_rows = []
 
-    init_jobs = sample_initial_jobs(configs, rng=rng, base_job_id=0, t_arrive=0.0)
+    if instance_json_path:
+        init_jobs = [build_job_spec(job, int(configs.n_m)) for job in replay_init_jobs_payload]
+        effective_max_events = len(replay_events_payload)
+    else:
+        init_jobs = sample_initial_jobs(configs, rng=rng, base_job_id=0, t_arrive=0.0)
+        effective_max_events = int(max_events)
     solve_budget = ORToolsSolveBudget(
         total_budget_seconds=total_solve_time_budget,
         planned_releases=compute_planned_release_count(
-            max_events=int(max_events),
+            max_events=int(effective_max_events),
             cadence=int(cadence),
             has_init_release=bool(init_jobs),
         ),
@@ -513,7 +654,8 @@ def run_event_driven_ortools_cadence(
         for job in init_jobs:
             all_job_due_dates[job.job_id] = float(job.meta.get("due_date", 0.0))
         orch.buffer.extend(init_jobs)
-        gen.bump_next_id(max((job.job_id for job in init_jobs), default=-1) + 1)
+        if gen is not None:
+            gen.bump_next_id(max((job.job_id for job in init_jobs), default=-1) + 1)
         init_time_limit = solve_budget.next_time_limit(subproblem_time_limit)
         init_result = event_release_and_reschedule_ortools(
             orch,
@@ -526,19 +668,14 @@ def run_event_driven_ortools_cadence(
         release_count += 1
         init_info = init_result.get("solve_info", {})
         solve_budget.record_release(init_info.get("solve_time_seconds", 0.0))
-        ort_csv_writer.writerow([
-            0,
-            f"{0.0:.4f}",
-            f"{float(init_time_limit):.6f}",
-            init_info.get("status", ""),
-            f"{float(init_info.get('solve_time_seconds', 0.0)):.6f}",
-            f"{float(init_info.get('solver_wall_time_seconds', 0.0)):.6f}",
-            f"{float(init_info.get('objective_value', 0.0)):.4f}",
-            f"{float(init_info.get('makespan', 0.0)):.4f}",
-            f"{float(init_info.get('total_tardiness', 0.0)):.4f}",
-            len(orch._committed_jobs),
-            len(init_result.get("rows", [])),
-        ])
+        write_ortools_release_log(
+            event_id=0,
+            release_time=0.0,
+            time_limit=init_time_limit,
+            solve_info=init_info,
+            num_committed_jobs=len(orch._committed_jobs),
+            num_rows=len(init_result.get("rows", [])),
+        )
         if not fast_mode:
             save_details(0.0, plot_seq + 1, "_INIT")
             plot_global_gantt(build_plot_rows(0.0), os.path.join(csv_dir, f"global_r{plot_seq:03d}_t0.png"), t_now=0.0, title="Initial")
@@ -546,17 +683,29 @@ def run_event_driven_ortools_cadence(
 
     stats = {"arrive": 0}
     t_now, t_prev = 0.0, 0.0
-    t_next = gen.sample_next_time(t_now)
-    while stats["arrive"] < int(max_events):
+    replay_event_idx = 0
+    t_next = (
+        float(replay_events_payload[0].get("time", 0.0))
+        if instance_json_path and replay_events_payload
+        else gen.sample_next_time(t_now)
+    )
+    while stats["arrive"] < int(effective_max_events):
         t_now = float(t_next)
         inter_arrival = t_now - t_prev
-        new_jobs = gen.generate_burst(t_now)
+        if instance_json_path:
+            event_payload = replay_events_payload[replay_event_idx]
+            new_jobs = [build_job_spec(job, int(configs.n_m)) for job in event_payload.get("jobs", [])]
+            event_id_for_log = int(event_payload.get("event_id", replay_event_idx + 1))
+            replay_event_idx += 1
+        else:
+            new_jobs = gen.generate_burst(t_now)
+            event_id_for_log = int(stats["arrive"] + 1)
         if new_jobs:
             for job in new_jobs:
                 all_job_due_dates[job.job_id] = float(job.meta.get("due_date", 0.0))
             orch.buffer.extend(new_jobs)
         stats["arrive"] += 1
-        is_last_step = bool(stats["arrive"] >= int(max_events))
+        is_last_step = bool(stats["arrive"] >= int(effective_max_events))
 
         raw_s = get_raw_state_info(orch, t_now)
         b_dict = {
@@ -602,32 +751,27 @@ def run_event_driven_ortools_cadence(
                 all_due=all_job_due_dates,
                 time_scale=time_scale,
                 time_limit=release_time_limit,
-                event_id=int(stats["arrive"]),
+                event_id=event_id_for_log,
             )
             release_count += 1
             steps_since_last_release = 0
             solve_info = result.get("solve_info", {})
             solve_budget.record_release(solve_info.get("solve_time_seconds", 0.0))
-            ort_csv_writer.writerow([
-                int(stats["arrive"]),
-                f"{t_now:.4f}",
-                f"{float(release_time_limit):.6f}",
-                solve_info.get("status", ""),
-                f"{float(solve_info.get('solve_time_seconds', 0.0)):.6f}",
-                f"{float(solve_info.get('solver_wall_time_seconds', 0.0)):.6f}",
-                f"{float(solve_info.get('objective_value', 0.0)):.4f}",
-                f"{float(solve_info.get('makespan', 0.0)):.4f}",
-                f"{float(solve_info.get('total_tardiness', 0.0)):.4f}",
-                len(orch._committed_jobs),
-                len(result.get("rows", [])),
-            ])
+            write_ortools_release_log(
+                event_id=event_id_for_log,
+                release_time=t_now,
+                time_limit=release_time_limit,
+                solve_info=solve_info,
+                num_committed_jobs=len(orch._committed_jobs),
+                num_rows=len(result.get("rows", [])),
+            )
             if not fast_mode:
                 save_details(t_now, plot_seq + 1)
                 plot_global_gantt(
                     build_plot_rows(t_now),
                     os.path.join(csv_dir, f"global_r{plot_seq:03d}_t{int(t_now):05d}.png"),
                     t_now=t_now,
-                    title=f"Event #{stats['arrive']}",
+                    title=f"Event #{event_id_for_log}",
                 )
                 plot_seq += 1
         else:
@@ -645,7 +789,14 @@ def run_event_driven_ortools_cadence(
         pending_obs_rows.append(obs_row)
 
         t_prev = t_now
-        t_next = float(gen.sample_next_time(t_now))
+        if instance_json_path:
+            t_next = (
+                float(replay_events_payload[replay_event_idx].get("time", t_now))
+                if replay_event_idx < len(replay_events_payload)
+                else t_now
+            )
+        else:
+            t_next = float(gen.sample_next_time(t_now))
 
     t_flush = float(t_next)
     while len(orch.buffer) > 0:
@@ -656,24 +807,19 @@ def run_event_driven_ortools_cadence(
             all_due=all_job_due_dates,
             time_scale=time_scale,
             time_limit=flush_time_limit,
-            event_id=int(max_events) + 1,
+            event_id=int(effective_max_events) + 1,
         )
         release_count += 1
         flush_info = flush_result.get("solve_info", {})
         solve_budget.record_release(flush_info.get("solve_time_seconds", 0.0))
-        ort_csv_writer.writerow([
-            int(max_events) + 1,
-            f"{t_flush:.4f}",
-            f"{float(flush_time_limit):.6f}",
-            flush_info.get("status", ""),
-            f"{float(flush_info.get('solve_time_seconds', 0.0)):.6f}",
-            f"{float(flush_info.get('solver_wall_time_seconds', 0.0)):.6f}",
-            f"{float(flush_info.get('objective_value', 0.0)):.4f}",
-            f"{float(flush_info.get('makespan', 0.0)):.4f}",
-            f"{float(flush_info.get('total_tardiness', 0.0)):.4f}",
-            len(orch._committed_jobs),
-            len(flush_result.get("rows", [])),
-        ])
+        write_ortools_release_log(
+            event_id=int(effective_max_events) + 1,
+            release_time=t_flush,
+            time_limit=flush_time_limit,
+            solve_info=flush_info,
+            num_committed_jobs=len(orch._committed_jobs),
+            num_rows=len(flush_result.get("rows", [])),
+        )
         if not fast_mode:
             save_details(t_flush, plot_seq + 1, "_FLUSH")
             plot_global_gantt(build_plot_rows(t_flush), os.path.join(csv_dir, f"global_r{plot_seq:03d}_FLUSH.png"), t_now=t_flush, title="FLUSH")
@@ -702,10 +848,12 @@ def run_event_driven_ortools_cadence(
 
     summary = {
         "policy": suffix,
+        "instance_json": instance_json_path,
+        "replay_mode": bool(instance_json_path),
         "event_seed": seed,
         "gate_cadence": cadence,
-        "event_horizon": int(max_events),
-        "init_jobs": int(getattr(configs, "init_jobs", 0)),
+        "event_horizon": int(effective_max_events),
+        "init_jobs": int(len(replay_init_jobs_payload)) if instance_json_path else int(getattr(configs, "init_jobs", 0)),
         "release_count": int(release_count),
         "makespan": float(final_mk),
         "total_tardiness": float(total_td),
@@ -717,11 +865,16 @@ def run_event_driven_ortools_cadence(
     }
     with open(os.path.join(csv_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
+    with open(os.path.join(csv_dir, "ortools_run_summary.csv"), "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(summary.keys()))
+        writer.writeheader()
+        writer.writerow(summary)
     print(f"[{suffix}] MK={final_mk:.2f} | TD={total_td:.2f} | Releases={release_count} | Output={csv_dir}")
     return final_mk, {"release_count": release_count, "total_tardiness": total_td}
 
 
 def main():
+    apply_default_ortools_config()
     print("-------------------- Dynamic FJSP OR-Tools Cadence --------------------")
     run_event_driven_ortools_cadence(
         max_events=int(configs.event_horizon),

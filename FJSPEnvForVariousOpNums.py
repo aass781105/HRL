@@ -30,25 +30,28 @@ class EnvState:
     device = torch.device(configs.device)
     initialized: bool = False
 
-    def _init_buffers(self, sz_b, N, M, J):
+    def _init_buffers(self, sz_b, N, M, J, op_fea_dim, mch_fea_dim, pair_fea_dim):
         dev = self.device
-        self.fea_j_tensor = torch.zeros((sz_b, N, 14), device=dev)
+        self.fea_j_tensor = torch.zeros((sz_b, N, op_fea_dim), device=dev)
         self.op_mask_tensor = torch.zeros((sz_b, N, 3), device=dev)
-        self.fea_m_tensor = torch.zeros((sz_b, M, 9), device=dev)
+        self.fea_m_tensor = torch.zeros((sz_b, M, mch_fea_dim), device=dev)
         self.mch_mask_tensor = torch.zeros((sz_b, M, M), device=dev)
         self.dynamic_pair_mask_tensor = torch.zeros((sz_b, J, M), device=dev, dtype=torch.bool)
         self.comp_idx_tensor = torch.zeros((sz_b, M, M, J), device=dev)
         self.candidate_tensor = torch.zeros((sz_b, J), device=dev, dtype=torch.long)
-        self.fea_pairs_tensor = torch.zeros((sz_b, J, M, 9), device=dev)
+        self.fea_pairs_tensor = torch.zeros((sz_b, J, M, pair_fea_dim), device=dev)
         self.fea_glo_tensor = torch.zeros((sz_b, 64), device=dev)
         self.initialized = True
 
     def update(self, fea_j, op_mask, fea_m, mch_mask, dynamic_pair_mask,
                comp_idx, candidate, fea_pairs, fea_glo=None, mode="train"):
         if not self.initialized:
-            sz_b, N, _ = fea_j.shape
-            M = fea_m.shape[1]; J = candidate.shape[1]
-            self._init_buffers(sz_b, N, M, J)
+            sz_b, N, op_fea_dim = fea_j.shape
+            M = fea_m.shape[1]
+            mch_fea_dim = fea_m.shape[2]
+            J = candidate.shape[1]
+            pair_fea_dim = fea_pairs.shape[3]
+            self._init_buffers(sz_b, N, M, J, op_fea_dim, mch_fea_dim, pair_fea_dim)
 
         self.fea_j_tensor.copy_(torch.from_numpy(fea_j))
         self.fea_m_tensor.copy_(torch.from_numpy(fea_m))
@@ -84,9 +87,21 @@ class FJSPEnvForVariousOpNums:
         self.old_state = EnvState()
 
         # feature dims (keep your original settings)
-        # Increment to 14 to include is_tardy flag
-        self.op_fea_dim = 14
+        # 14 legacy dims + tardiness/rank/gap/flexibility features.
+        self.op_fea_dim = 19
         self.mch_fea_dim = 9
+        self.pair_fea_dim = 8
+
+    def _scale_true_time(self, x):
+        return np.asarray(x, dtype=np.float64) / max(float(self.pt_scale), 1e-6)
+
+    def _signed_log1p_scaled(self, x):
+        scaled = self._scale_true_time(x)
+        return np.sign(scaled) * np.log1p(np.abs(scaled))
+
+    def _log1p_scaled(self, x):
+        scaled = self._scale_true_time(np.maximum(x, 0.0))
+        return np.log1p(scaled)
 
     # -------------------- static properties & init --------------------
 
@@ -117,8 +132,8 @@ class FJSPEnvForVariousOpNums:
         Args:
             job_length_list: List[np.ndarray]
             op_pt_list:      List[np.ndarray]
-            due_date_list:   Normalized or raw due dates used for state features.
-            normalize_due_date: If True, due_date_list will be normalized internally.
+            due_date_list:   Absolute due dates. Active PPO callers should pass raw values.
+            normalize_due_date: If True, due_date_list is normalized internally for state features.
             true_due_date_list: Absolute due dates used for Tardiness/Reward calculation.
             tightness:       Optional array/list of tightness factors (k) for reward normalization.
             release_time_list: Optional list of release times for each job (for dynamic scenarios).
@@ -321,7 +336,6 @@ class FJSPEnvForVariousOpNums:
         self.old_due_date = np.copy(self.due_date)
         self.old_true_due_date = np.copy(self.true_due_date)
         self.old_accumulated_tardiness = np.copy(self.accumulated_tardiness)
-        self.old_job_current_tardiness = np.copy(self.job_current_tardiness)
 
         # state: Avoid deepcopy of CUDA tensors
         self.state = EnvState()
@@ -354,7 +368,6 @@ class FJSPEnvForVariousOpNums:
         self.due_date = np.copy(self.old_due_date)
         self.true_due_date = np.copy(self.old_true_due_date)
         self.accumulated_tardiness = np.copy(self.old_accumulated_tardiness)
-        self.job_current_tardiness = np.copy(self.old_job_current_tardiness)
 
         # Rebuild all derived scheduling state from the restored base arrays.
         self.dynamic_pair_mask = np.copy(self.candidate_process_relation)
@@ -383,9 +396,6 @@ class FJSPEnvForVariousOpNums:
         self.done_flag = np.full(shape=(self.number_of_envs,), fill_value=0, dtype=bool)
         self.current_makespan = np.full(self.number_of_envs, float("-inf"))
         self.accumulated_tardiness = np.zeros(self.number_of_envs)
-        
-        # [NEW] Track cumulative tardiness (overflow) for each job to calculate marginal penalty
-        self.job_current_tardiness = np.zeros((self.number_of_envs, self.number_of_jobs))
 
         self.mch_queue = np.full(shape=[self.number_of_envs, self.number_of_machines,
                                         self.max_number_of_ops + 1], fill_value=-99, dtype=int)
@@ -445,7 +455,9 @@ class FJSPEnvForVariousOpNums:
         # Snapshots before state transition (used by configurable TD reward modes).
         pre_job_ready_time = self.true_candidate_free_time[self.incomplete_env_idx, chosen_job].copy()
         pre_job_remain_work = self.true_op_match_job_remain_work[self.incomplete_env_idx, chosen_op].copy()
-        pre_job_tardiness = self.job_current_tardiness[self.incomplete_env_idx, chosen_job].copy()
+        pre_job_tardiness = np.maximum(
+            0.0, self.true_candidate_free_time[self.incomplete_env_idx, chosen_job] - self.true_due_date[self.incomplete_env_idx, chosen_job]
+        )
 
         if (self.reverse_process_relation[self.incomplete_env_idx, chosen_op, chosen_mch]).any():
             print(f'FJSP_Env Error: Op {chosen_op} cannot be processed by Mch {chosen_mch}')
@@ -609,6 +621,10 @@ class FJSPEnvForVariousOpNums:
         tardiness = np.zeros(self.number_of_envs, dtype=np.float64)
         tardiness[self.incomplete_env_idx] = tardiness_local
 
+        current_job_tardiness = np.maximum(
+            0.0, self.true_candidate_free_time[self.incomplete_env_idx, chosen_job] - relevant_due_dates
+        )
+
         # Update accumulated total tardiness
         self.accumulated_tardiness[self.incomplete_env_idx] += tardiness_local
         
@@ -627,11 +643,7 @@ class FJSPEnvForVariousOpNums:
             # Per-op marginal tardiness increase for the selected job.
             # This provides dense TD signal while preserving final total tardiness semantics.
             base_scale = max(float(self.mean_op_pt), 1e-6)
-            current_job_tardiness = np.maximum(
-                0.0, self.true_candidate_free_time[self.incomplete_env_idx, chosen_job] - relevant_due_dates
-            )
             delta_job_tardiness = np.maximum(0.0, current_job_tardiness - pre_job_tardiness)
-            self.job_current_tardiness[self.incomplete_env_idx, chosen_job] = current_job_tardiness
             reward_td_local = -(delta_job_tardiness / base_scale)
         elif td_mode == "slack_delta_mean_pt":
             # Only penalize slack deterioration; no positive reward.
@@ -732,6 +744,60 @@ class FJSPEnvForVariousOpNums:
         # [NEW] Binary flag for tardiness
         feat_is_tardy = (feat_rem_time < 0).astype(float)
 
+        job_current_tardiness = np.maximum(0.0, self.true_candidate_free_time - self.true_due_date)
+        feat_job_current_tardiness = np.array([
+            np.repeat(self._log1p_scaled(job_current_tardiness[k]), repeats=self.virtual_job_length[k])
+            for k in range(self.number_of_envs)
+        ])
+
+        current_job_remain_work = self.op_match_job_remain_work[self.env_job_idx, self.candidate]
+        job_slack = (self.due_date - self.next_schedule_time[:, np.newaxis]) - current_job_remain_work
+        job_slack_rank = np.ones((self.number_of_envs, self.number_of_jobs), dtype=np.float32)
+        for k in range(self.number_of_envs):
+            active_jobs = np.where(~self.mask[k])[0]
+            if active_jobs.size == 0:
+                continue
+            order = active_jobs[np.argsort(job_slack[k, active_jobs])]
+            denom = max(order.size - 1, 1)
+            job_slack_rank[k, order] = np.arange(order.size, dtype=np.float32) / denom
+        feat_slack_rank = np.array([
+            np.repeat(job_slack_rank[k], repeats=self.virtual_job_length[k])
+            for k in range(self.number_of_envs)
+        ])
+
+        min_job_slack = np.min(np.where(self.mask, np.inf, job_slack), axis=1)
+        min_job_slack = np.where(np.isfinite(min_job_slack), min_job_slack, 0.0)
+        job_slack_gap_to_min = np.maximum(0.0, job_slack - min_job_slack[:, np.newaxis])
+        feat_slack_gap_to_min = np.array([
+            np.repeat(np.log1p(job_slack_gap_to_min[k]), repeats=self.virtual_job_length[k])
+            for k in range(self.number_of_envs)
+        ])
+
+        op_flex_counts = self.compatible_op.astype(np.float32)
+        remaining_flex_min = np.zeros((self.number_of_envs, self.number_of_jobs), dtype=np.float32)
+        remaining_flex_mean = np.zeros((self.number_of_envs, self.number_of_jobs), dtype=np.float32)
+        for k in range(self.number_of_envs):
+            for j in range(self.number_of_jobs):
+                start = int(self.candidate[k, j]) + 1
+                end = int(self.job_last_op_id[k, j]) + 1
+                if self.mask[k, j]:
+                    continue
+                if start >= end:
+                    remaining_flex_min[k, j] = 1.0
+                    remaining_flex_mean[k, j] = 1.0
+                    continue
+                flex = op_flex_counts[k, start:end] / max(float(self.number_of_machines), 1.0)
+                remaining_flex_min[k, j] = float(np.min(flex))
+                remaining_flex_mean[k, j] = float(np.mean(flex))
+        feat_remaining_flex_min = np.array([
+            np.repeat(remaining_flex_min[k], repeats=self.virtual_job_length[k])
+            for k in range(self.number_of_envs)
+        ])
+        feat_remaining_flex_mean = np.array([
+            np.repeat(remaining_flex_mean[k], repeats=self.virtual_job_length[k])
+            for k in range(self.number_of_envs)
+        ])
+
         self.fea_j = np.stack((self.op_scheduled_flag,
                                self.op_ct_lb,
                                self.op_min_pt,
@@ -745,7 +811,12 @@ class FJSPEnvForVariousOpNums:
                                feat_rem_time,
                                feat_slack,
                                feat_cr_log,
-                               feat_is_tardy), axis=2).astype(np.float32, copy=False)
+                               feat_is_tardy,
+                               feat_job_current_tardiness,
+                               feat_slack_rank,
+                               feat_slack_gap_to_min,
+                               feat_remaining_flex_min,
+                               feat_remaining_flex_mean), axis=2).astype(np.float32, copy=False)
 
         # [NEW] Store RAW features before normalization for debugging
         self.raw_fea_j = np.copy(self.fea_j)
@@ -764,31 +835,34 @@ class FJSPEnvForVariousOpNums:
         num_left_nodes = np.maximum(self.max_number_of_ops - num_delete_nodes, 1e-8)
 
         # [UPDATED] Feature Groups for Special Scaling
-        # f0: Raw, f7: Scale by M, f12-13: Raw, Others: Z-Score
+        # Keep signed due-date signals out of z-score so their sign still means
+        # early/late instead of just above/below the current batch average.
         fea_f0 = self.fea_j[:, :, 0:1]
         fea_f1_f6 = self.fea_j[:, :, 1:7]
         fea_f7 = self.fea_j[:, :, 7:8] / self.number_of_machines
-        fea_f8_f11 = self.fea_j[:, :, 8:12]
+        fea_f8_f9 = self.fea_j[:, :, 8:10]
+        fea_due_signed = np.sign(self.fea_j[:, :, 10:12]) * np.log1p(np.abs(self.fea_j[:, :, 10:12]))
         fea_raw_end = self.fea_j[:, :, 12:]
 
-        # Z-Score Group: 1-6, 8-11 (Total 10 dims)
-        z_raw = np.concatenate((fea_f1_f6, fea_f8_f11), axis=2)
+        # Z-Score Group: 1-6, 8-9 (Total 8 dims)
+        z_raw = np.concatenate((fea_f1_f6, fea_f8_f9), axis=2)
         z_mean = np.sum(z_raw, axis=1) / num_left_nodes
         
         # Masked Std
-        z_mask = np.concatenate((mask[:, :, 1:7], mask[:, :, 8:12]), axis=2)
+        z_mask = np.concatenate((mask[:, :, 1:7], mask[:, :, 8:10]), axis=2)
         temp = np.where(z_mask, z_mean[:, np.newaxis, :], z_raw)
         z_var = np.var(temp, axis=1)
         z_std = np.sqrt(z_var * self.max_number_of_ops / num_left_nodes)
         
         z_norm = (temp - z_mean[:, np.newaxis, :]) / (z_std[:, np.newaxis, :] + 1e-8)
         
-        # Re-assemble in correct order: 0 | 1-6 | 7 | 8-11 | 12-13
+        # Re-assemble in correct order: 0 | 1-6 | 7 | 8-9 | 10-11 | 12-18
         self.fea_j = np.concatenate((
             fea_f0, 
             z_norm[:, :, 0:6], 
             fea_f7, 
-            z_norm[:, :, 6:10], 
+            z_norm[:, :, 6:8],
+            fea_due_signed,
             fea_raw_end
         ), axis=2).astype(np.float32, copy=False)
 
@@ -796,7 +870,12 @@ class FJSPEnvForVariousOpNums:
         # [NEW] Option B: Global Pressure via Machine Features
         # Calculate Global Stats first
         raw_slacks = self.raw_fea_j[:, :, 11]
-        mask_unscheduled = (self.op_scheduled_flag == 0) # [FIXED] Use op_scheduled_flag
+        deleted_op_nodes = getattr(self, "deleted_op_nodes", np.zeros_like(self.mask_dummy_node, dtype=bool))
+        mask_unscheduled = (
+            (self.op_scheduled_flag == 0)
+            & (~self.mask_dummy_node)
+            & (~deleted_op_nodes.astype(bool))
+        )
 
         valid_counts = np.sum(mask_unscheduled, axis=1).astype(np.float32)
         safe_counts = np.maximum(valid_counts, 1.0)
@@ -847,19 +926,19 @@ class FJSPEnvForVariousOpNums:
         num_delete_mchs = num_delete_mchs[:, np.newaxis]
         num_left_mchs = np.maximum(self.number_of_machines - num_delete_mchs, 1e-8)
 
-        # [UPDATED] Protect Global Signals (Index 6, 7, 8) from Z-Score
-        fea_to_norm = self.fea_m[:, :, 0:6]
-        fea_keep_raw = self.fea_m[:, :, 6:9]
+        # [UPDATED] Protect tardiness ratio and global signals from Z-Score.
+        fea_to_norm = self.fea_m[:, :, 0:5]
+        fea_keep_raw = self.fea_m[:, :, 5:9]
 
         mean_fea_m = np.sum(fea_to_norm, axis=1) / num_left_mchs
-        temp = np.where(self.delete_mask_fea_m[:, :, 0:6], mean_fea_m[:, np.newaxis, :], fea_to_norm)
+        temp = np.where(self.delete_mask_fea_m[:, :, 0:5], mean_fea_m[:, np.newaxis, :], fea_to_norm)
         
         var_fea_m = np.var(temp, axis=1)
         std_fea_m = np.sqrt(var_fea_m * self.number_of_machines / num_left_mchs)
 
         fea_normalized = ((temp - mean_fea_m[:, np.newaxis, :]) / (std_fea_m[:, np.newaxis, :] + 1e-8))
         
-        # Concatenate back: [Normed(0-5), Raw(6-8)]
+        # Concatenate back: [Normed(0-4), Raw(5-8)]
         self.fea_m = np.concatenate((fea_normalized, fea_keep_raw), axis=2).astype(np.float32, copy=False)
 
     def construct_pair_features(self):
@@ -875,16 +954,16 @@ class FJSPEnvForVariousOpNums:
 
         mch_max_candidate_pt = np.max(self.candidate_pt, axis=1, keepdims=True) + 1e-8
 
-        pair_wait_time = self.op_waiting_time[self.env_job_idx, self.candidate][:, :, np.newaxis] + \
-                         self.mch_waiting_time[:, np.newaxis, :]
-
         chosen_job_remain_work = np.expand_dims(self.op_match_job_remain_work[self.env_job_idx, self.candidate],
                                                 axis=-1) + 1e-8
 
-        # [NEW] Estimated Lateness if Assigned
-        # pair_free_time: [E, J, M], candidate_pt: [E, J, M], due_date: [E, J]
-        # All are already normalized by scale
-        pair_est_lateness = np.maximum(0, self.pair_free_time + self.candidate_pt - self.due_date[:, :, np.newaxis])
+        true_candidate_pt = self.true_op_pt[self.env_job_idx, self.candidate]
+        true_candidate_ready = self.true_candidate_free_time[:, :, np.newaxis]
+        true_machine_ready = self.true_mch_free_time[:, np.newaxis, :]
+        true_pair_free_time = np.maximum(true_candidate_ready, true_machine_ready)
+        true_due_date = self.true_due_date[:, :, np.newaxis]
+        pair_est_lateness = np.maximum(0.0, true_pair_free_time + true_candidate_pt - true_due_date)
+
         self.fea_pairs = np.stack((self.candidate_pt,
                                    self.candidate_pt / chosen_op_max_pt,
                                    self.candidate_pt / mch_max_candidate_pt,
@@ -892,8 +971,7 @@ class FJSPEnvForVariousOpNums:
                                    self.candidate_pt / mch_max_remain_op_pt,
                                    self.candidate_pt / pair_max_pt,
                                    self.candidate_pt / chosen_job_remain_work,
-                                   pair_wait_time,
-                                   pair_est_lateness), axis=-1).astype(np.float32, copy=False)
+                                   self._log1p_scaled(pair_est_lateness)), axis=-1).astype(np.float32, copy=False)
         return self.fea_pairs
 
     # -------------------- masks / logic --------------------

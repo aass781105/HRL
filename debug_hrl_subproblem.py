@@ -47,14 +47,12 @@ def main():
     
     # 3. 初始化環境
     env = FJSPEnvForVariousOpNums(n_j, n_m)
-    due_dates_ppo = due_dates_abs / pt_scale
     
     # 初始化資料
     state = env.set_initial_data(
         job_length_list=[jl], 
         op_pt_list=[pt], 
-        due_date_list=[due_dates_ppo], 
-        normalize_due_date=False, 
+        due_date_list=[due_dates_abs], 
         true_due_date_list=[due_dates_abs]
     )
 

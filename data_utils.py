@@ -239,6 +239,29 @@ def generate_due_dates(job_length, op_pt, tightness=1.2, due_date_mode='k', seed
         due_range = n_j * mean_pt
         return rng.uniform(-due_range, due_range, size=n_j)
 
+    if due_date_mode == 'range3':
+        # Match the static 30/40/50 test set: one instance is either
+        # loose=[0,a], mixed=[-a,a], or tight=[-a,0], where a=n_j*mean_pt.
+        from params import configs
+        mean_pt = (float(configs.low) + float(configs.high)) / 2.0
+        due_range = n_j * mean_pt
+        ranges = ((0.0, due_range), (-due_range, due_range), (-due_range, 0.0))
+        idx = int(rng.integers(0, len(ranges))) if hasattr(rng, "integers") else int(rng.randint(0, len(ranges)))
+        low, high = ranges[idx]
+        return rng.uniform(low, high, size=n_j)
+
+    if due_date_mode in ('range3_loose', 'range3_mixed', 'range3_tight'):
+        from params import configs
+        mean_pt = (float(configs.low) + float(configs.high)) / 2.0
+        due_range = n_j * mean_pt
+        ranges = {
+            'range3_loose': (0.0, due_range),
+            'range3_mixed': (-due_range, due_range),
+            'range3_tight': (-due_range, 0.0),
+        }
+        low, high = ranges[due_date_mode]
+        return rng.uniform(low, high, size=n_j)
+
     if due_date_mode in ('range15', 'range2'):
         # 1.5x wider than range: Uniform(-1.5*n_j*mean_pt, 1.5*n_j*mean_pt)
         # Keep "range2" as backward-compatible alias.
@@ -257,6 +280,24 @@ def generate_due_dates(job_length, op_pt, tightness=1.2, due_date_mode='k', seed
         sigma = float(rng.uniform(a / 2.0, a))
         return rng.normal(loc=mu, scale=sigma, size=n_j)
 
+    if due_date_mode == 'dynamic_shift':
+        from params import configs
+
+        base_low = float(getattr(configs, "dynamic_due_base_low", 1.2))
+        base_high = float(getattr(configs, "dynamic_due_base_high", 2.0))
+        shift_per_job = float(getattr(configs, "dynamic_due_shift_per_job", 0.2))
+        ref_n_j = int(getattr(configs, "dynamic_due_ref_n_j", 10))
+        shift = shift_per_job * max(0, int(n_j) - ref_n_j)
+        low = base_low - shift
+        high = base_high - shift
+        if low > high:
+            low, high = high, low
+        factors = rng.uniform(low, high, size=int(n_j))
+        min_factor = getattr(configs, "dynamic_due_min_factor", None)
+        if min_factor is not None:
+            factors = np.maximum(factors, float(min_factor))
+        return job_work * factors
+
     if due_date_mode == 'M':
         total_work = np.sum(job_work)
         base = total_work / n_m
@@ -272,8 +313,13 @@ def generate_due_dates(job_length, op_pt, tightness=1.2, due_date_mode='k', seed
         else:
             return np.full(n_j, base * float(tightness))
 
-    # Default 'k' Mode (Individual) with Uniform Range [1.2, 2.0]
-    k_factors = rng.uniform(1.2, 2.0, size=int(n_j))
+    # Default 'k' Mode (Individual) with configurable workload multiplier range.
+    from params import configs
+    k_low = float(getattr(configs, "due_date_k_low", 1.2))
+    k_high = float(getattr(configs, "due_date_k_high", 6.0))
+    if k_low > k_high:
+        k_low, k_high = k_high, k_low
+    k_factors = rng.uniform(k_low, k_high, size=int(n_j))
     return job_work * k_factors
 
 

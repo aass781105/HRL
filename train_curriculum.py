@@ -72,7 +72,13 @@ class Trainer:
         val_due_mode_raw = str(getattr(configs, "val_due_date_mode", "") or "").strip()
         due_mode = val_due_mode_raw if val_due_mode_raw else train_due_mode
         print("-" * 25 + f"Generating Validation Suite (Mode: {mode} | Train Due: {train_due_mode} | Val Due: {due_mode})" + "-" * 25)
-        sizes = [10, 20, 30]
+        schedule_type = str(getattr(configs, "schedule_type", "")).lower()
+        if schedule_type == "u30_50":
+            sizes = [30, 40, 50]
+        elif schedule_type == "u10_50":
+            sizes = [10, 30, 50]
+        else:
+            sizes = [10, 20, 30]
         num_per_size = 50
         total_instances = len(sizes) * num_per_size
         
@@ -117,6 +123,15 @@ class Trainer:
 
         def sample_uniform_job_size(low, high, update_idx):
             rng = random.Random(int(self.config.seed_train) + 100000 + int(update_idx))
+            large_prob = float(getattr(configs, "mixed_size_large_prob", 0.0))
+            if large_prob > 0.0:
+                large_prob = min(max(large_prob, 0.0), 1.0)
+                small_high = min(int(getattr(configs, "mixed_size_small_max_n_j", 19)), high)
+                large_low = max(int(getattr(configs, "mixed_size_large_min_n_j", 20)), low)
+                if low <= small_high and large_low <= high:
+                    if rng.random() < large_prob:
+                        return rng.randint(large_low, high)
+                    return rng.randint(low, small_high)
             return rng.randint(low, high)
 
         def resolve_stage_job_size(stage_cfg, update_idx):
@@ -125,14 +140,32 @@ class Trainer:
             return stage_cfg["n_j"]
 
         # Supported schedules:
+        # - u10_30: sample n_j uniformly from [10, 30] at each reset.
         # - u10_50: sample n_j uniformly from [10, 50] at each reset.
+        # - u30_50: sample n_j uniformly from [30, 50] at each reset.
         # - otherwise: fixed n_j from configs.n_j.
-        if str(getattr(configs, "schedule_type", "")).lower() == "u10_50":
+        schedule_type = str(getattr(configs, "schedule_type", "")).lower()
+        mixed_size_hold_updates = max(1, int(getattr(configs, "mixed_size_hold_updates", 5)))
+        if schedule_type == "u10_30":
+            curriculum_schedule = [{
+                "n_j_range": (10, 30),
+                "reset_step": mixed_size_hold_updates,
+                "duration": int(getattr(configs, "max_updates", 1000)),
+                "stage_label": f"JU10_30_Uniform_{str(getattr(configs, 'due_date_mode', 'k')).upper()}",
+            }]
+        elif schedule_type == "u10_50":
             curriculum_schedule = [{
                 "n_j_range": (10, 50),
-                "reset_step": 1,
+                "reset_step": mixed_size_hold_updates,
                 "duration": int(getattr(configs, "max_updates", 1000)),
                 "stage_label": f"JU10_50_Uniform_{str(getattr(configs, 'due_date_mode', 'k')).upper()}",
+            }]
+        elif schedule_type == "u30_50":
+            curriculum_schedule = [{
+                "n_j_range": (30, 50),
+                "reset_step": mixed_size_hold_updates,
+                "duration": int(getattr(configs, "max_updates", 1000)),
+                "stage_label": f"JU30_50_Uniform_{str(getattr(configs, 'due_date_mode', 'k')).upper()}",
             }]
         else:
             fixed_n_j = int(getattr(configs, "n_j", self.initial_n_j))
@@ -180,8 +213,22 @@ class Trainer:
                 dataset_job_length, dataset_op_pt, dataset_due_date = self.sample_training_instances(i_update)
                 self.env = FJSPEnvForVariousOpNums(n_j=configs.n_j, n_m=configs.n_m)
                 state = self.env.set_initial_data(dataset_job_length, dataset_op_pt, dataset_due_date, true_due_date_list=dataset_due_date)
+            elif (
+                str(getattr(configs, "due_date_mode", "k")) == "range3_hold"
+                and i_update % max(1, int(getattr(configs, "due_setting_hold_updates", 10))) == 0
+            ):
+                tqdm.write(
+                    f"Resampled due setting at update {i_update+1} "
+                    f"(n_j={configs.n_j}, due={self.resolve_training_due_mode(i_update)})"
+                )
+                dataset_job_length, dataset_op_pt, dataset_due_date = self.sample_training_instances(i_update)
+                self.env = FJSPEnvForVariousOpNums(n_j=configs.n_j, n_m=configs.n_m)
+                state = self.env.set_initial_data(dataset_job_length, dataset_op_pt, dataset_due_date, true_due_date_list=dataset_due_date)
             else:
                 state = self.env.reset()
+
+            current_due_mode = self.resolve_training_due_mode(i_update)
+            self.ppo.vloss_coef = self.resolve_vloss_coef(current_due_mode)
 
             # Sawtooth LR
             peak_lr = configs.lr * (0.95 ** current_stage_idx)
@@ -197,6 +244,7 @@ class Trainer:
             all_mk_rewards, all_td_rewards = [], []
             td_mode_rollout = str(getattr(configs, "ll_td_mode", "mean_pt")).strip().lower()
             use_legacy_split_redistribution = (td_mode_rollout == "mean_pt_split_ops_legacy")
+            reward_seq_raw_np = []
 
             while True:
                 self.memory.push(state)
@@ -233,7 +281,8 @@ class Trainer:
                 all_mk_rewards.extend(info['reward_mk'].flatten()); all_td_rewards.extend(info['reward_td'].flatten())
                 ep_rewards += reward
                 self.memory.done_seq.append(torch.from_numpy(done).to(device))
-                self.memory.reward_seq.append(torch.from_numpy(reward).to(device))
+                reward_seq_raw_np.append(np.asarray(reward, dtype=np.float32))
+                self.memory.reward_seq.append(torch.from_numpy(np.asarray(reward, dtype=np.float32)).to(device))
                 self.memory.action_seq.append(full_actions.squeeze(-1))
                 self.memory.log_probs.append(full_logprobs.squeeze(-1))
                 self.memory.val_seq.append(full_vals.squeeze(1))
@@ -290,6 +339,13 @@ class Trainer:
                 self.memory.reward_seq = [torch.from_numpy(rewards_mat[t].astype(np.float32)).to(device) for t in range(T)]
                 ep_rewards = np.sum(rewards_mat, axis=0)
                 all_td_rewards = td_new_mat.reshape(-1).tolist()
+            elif bool(getattr(configs, "ll_reward_norm_by_size", False)) and len(self.memory.reward_seq) > 0:
+                rewards_mat = np.stack(reward_seq_raw_np, axis=0).astype(np.float32)
+                mean_r = float(np.mean(rewards_mat))
+                std_r = float(np.std(rewards_mat))
+                rewards_norm = (rewards_mat - mean_r) / (std_r + 1e-8)
+                self.memory.reward_seq = [torch.from_numpy(rewards_norm[t].astype(np.float32)).to(device) for t in range(rewards_norm.shape[0])]
+                ep_rewards = np.sum(rewards_norm, axis=0)
 
             # Clear rollout metadata buffers for next update.
             if hasattr(self, "_rollout_jobs_seq"):
@@ -298,7 +354,16 @@ class Trainer:
                 self._rollout_td_step_seq.clear()
 
             loss, v_loss, p_loss = self.ppo.update(self.memory)
-            v_term_abs = abs(float(v_loss) * float(getattr(configs, "vloss_coef", 1.0)))
+            critic_diag = getattr(self.ppo, "last_critic_stats", {})
+            err_mean = float(critic_diag.get("error_mean", 0.0))
+            err_std = float(critic_diag.get("error_std", 0.0))
+            over_delta_ratio = float(critic_diag.get("over_delta_ratio", 0.0))
+            delta_threshold = float(critic_diag.get("delta_threshold", 1.0))
+            policy_diag = getattr(self.ppo, "last_policy_stats", {})
+            entropy = float(policy_diag.get("entropy", 0.0))
+            clip_frac = float(policy_diag.get("clip_frac", 0.0))
+            adv_std = float(policy_diag.get("adv_std", 0.0))
+            v_term_abs = abs(float(v_loss) * float(getattr(self.ppo, "vloss_coef", getattr(configs, "vloss_coef", 1.0))))
             p_term_abs = abs(float(p_loss) * float(getattr(configs, "ploss_coef", 1.0)))
             vp_den = v_term_abs + p_term_abs + 1e-8
             v_share_loss = v_term_abs / vp_den
@@ -332,7 +397,21 @@ class Trainer:
                 np.mean(self.env.current_makespan),
                 np.mean(self.env.accumulated_tardiness)
             ])
-            self.loss_log.append([i_update, loss, v_loss, p_loss, v_share_loss, p_share_loss])
+            self.loss_log.append([
+                i_update,
+                loss,
+                v_loss,
+                p_loss,
+                v_share_loss,
+                p_share_loss,
+                err_mean,
+                err_std,
+                delta_threshold,
+                over_delta_ratio,
+                entropy,
+                clip_frac,
+                adv_std
+            ])
 
             if (i_update + 1) % self.validate_timestep == 0:
                 # Get per-size validation results
@@ -369,9 +448,10 @@ class Trainer:
                 tqdm.write(
                     f'Update {i_update+1}/{self.max_updates} | '
                     f'R: {avg_reward:.2f} | Loss: {loss:.4f} | V-Loss: {v_loss:.4f} | '
-                    f'Vshare: {v_share_loss*100:5.1f}% | Pshare: {p_share_loss*100:5.1f}% | '
-                    f'MK_r: {mk_mean:.4f} ({mk_share*100:5.1f}%) | '
-                    f'TD_r: {td_mean:.4f} ({td_share*100:5.1f}%) | '
+                    f'>d{delta_threshold:.0f}: {over_delta_ratio*100:4.1f}% | '
+                    f'Vshare: {v_share_loss*100:5.1f}% | '
+                    f'Ent: {entropy:.3f} | Clip: {clip_frac*100:4.1f}% | AdvStd: {adv_std:.3f} | '
+                    f'TD%: {td_share*100:5.1f}% | '
                     f'Vali MK: {overall_ms_mean:.1f} | Vali TD: {overall_td_mean:.1f} | Best TD: {self.record:.1f}'
                 )
             else:
@@ -379,9 +459,10 @@ class Trainer:
                 tqdm.write(
                     f'Update {i_update+1}/{self.max_updates} | '
                     f'R: {avg_reward:.2f} | Loss: {loss:.4f} | V-Loss: {v_loss:.4f} | '
-                    f'Vshare: {v_share_loss*100:5.1f}% | Pshare: {p_share_loss*100:5.1f}% | '
-                    f'MK_r: {mk_mean:.4f} ({mk_share*100:5.1f}%) | '
-                    f'TD_r: {td_mean:.4f} ({td_share*100:5.1f}%)'
+                    f'>d{delta_threshold:.0f}: {over_delta_ratio*100:4.1f}% | '
+                    f'Vshare: {v_share_loss*100:5.1f}% | '
+                    f'Ent: {entropy:.3f} | Clip: {clip_frac*100:4.1f}% | AdvStd: {adv_std:.3f} | '
+                    f'TD%: {td_share*100:5.1f}%'
                 )
 
         self.train_et = time.time()
@@ -403,6 +484,36 @@ class Trainer:
         with open(f'{log_path_base}valiquality_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.validation_log)))
         with open(f'{log_path_base}valitardiness_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.validation_tardiness_log)))
         with open(f'{log_path_base}loss_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.loss_log)))
+        if hasattr(self, "train_st") and hasattr(self, "train_et"):
+            train_seconds = float(self.train_et - self.train_st)
+            avg_seconds_per_update = train_seconds / max(1, int(self.max_updates))
+            train_time_log = {
+                "model_name": self.model_name,
+                "log_model_name": log_model_name,
+                "max_updates": int(self.max_updates),
+                "train_seconds": train_seconds,
+                "train_minutes": train_seconds / 60.0,
+                "train_hours": train_seconds / 3600.0,
+                "avg_seconds_per_update": avg_seconds_per_update,
+                "start_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.train_st)),
+                "end_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.train_et)),
+            }
+            with open(f'{log_path_base}train_time_{log_model_name}.txt', 'w') as f:
+                f.write(str(to_native(train_time_log)))
+            train_time_entry = (
+                "\n" + "=" * 80 + "\n"
+                f"model_name: {train_time_log['model_name']}\n"
+                f"log_model_name: {train_time_log['log_model_name']}\n"
+                f"max_updates: {train_time_log['max_updates']}\n"
+                f"start_time: {train_time_log['start_time']}\n"
+                f"end_time: {train_time_log['end_time']}\n"
+                f"train_seconds: {train_time_log['train_seconds']:.3f}\n"
+                f"train_minutes: {train_time_log['train_minutes']:.3f}\n"
+                f"train_hours: {train_time_log['train_hours']:.3f}\n"
+                f"avg_seconds_per_update: {train_time_log['avg_seconds_per_update']:.3f}\n"
+            )
+            with open('train_time.txt', 'a', encoding='utf-8') as f:
+                f.write(train_time_entry)
         
         # [ALIGNED] Save breakdown log as .txt
         if hasattr(self, 'validation_breakdown_log') and self.validation_breakdown_log:
@@ -450,7 +561,7 @@ class Trainer:
 
     def sample_training_instances(self, i_update):
         dataset_JobLength, dataset_OpPT, dataset_DueDate = [], [], []
-        due_mode = str(getattr(configs, "due_date_mode", "k"))
+        due_mode = self.resolve_training_due_mode(i_update)
         # [UPDATED] 100% Uniform for consistency
         for i in range(self.num_envs):
             instance_seed = self.config.seed_train + i_update * self.num_envs + i
@@ -460,12 +571,30 @@ class Trainer:
             dataset_JobLength.append(JobLength); dataset_OpPT.append(OpPT); dataset_DueDate.append(DueDate)
         return dataset_JobLength, dataset_OpPT, dataset_DueDate
 
+    def resolve_training_due_mode(self, i_update):
+        due_mode = str(getattr(configs, "due_date_mode", "k"))
+        if due_mode == "range3_hold":
+            hold = max(1, int(getattr(configs, "due_setting_hold_updates", 10)))
+            due_modes = ("range3_loose", "range3_mixed", "range3_tight")
+            return due_modes[(int(i_update) // hold) % len(due_modes)]
+        return due_mode
+
+    def resolve_vloss_coef(self, due_mode):
+        if not bool(getattr(configs, "ll_due_vloss_coef", False)):
+            return float(getattr(configs, "vloss_coef", 0.1))
+        mode = str(due_mode or "").lower()
+        if "loose" in mode:
+            return float(getattr(configs, "ll_vloss_coef_loose", getattr(configs, "vloss_coef", 0.1)))
+        if "tight" in mode:
+            return float(getattr(configs, "ll_vloss_coef_tight", getattr(configs, "vloss_coef", 0.1)))
+        return float(getattr(configs, "ll_vloss_coef_mixed", getattr(configs, "vloss_coef", 0.1)))
+
     def validate_envs_with_various_op_nums(self, batches):
         self.ppo.policy.eval()
         results_per_batch = []
         for batch in batches:
             temp_env = FJSPEnvForVariousOpNums(n_j=batch['n_j'], n_m=self.fixed_n_m)
-            state = temp_env.set_initial_data(batch['jl'], batch['pt'], batch['dd'], true_due_date_list=batch['dd'], normalize_due_date=False)
+            state = temp_env.set_initial_data(batch['jl'], batch['pt'], batch['dd'], true_due_date_list=batch['dd'])
             while True:
                 with torch.no_grad():
                     batch_idx = ~torch.from_numpy(temp_env.done_flag)
@@ -473,7 +602,10 @@ class Trainer:
                         pi, _ = self.ppo.policy(fea_j=state.fea_j_tensor[batch_idx], op_mask=state.op_mask_tensor[batch_idx], candidate=state.candidate_tensor[batch_idx],
                                                 fea_m=state.fea_m_tensor[batch_idx], mch_mask=state.mch_mask_tensor[batch_idx], comp_idx=state.comp_idx_tensor[batch_idx],
                                                 dynamic_pair_mask=state.dynamic_pair_mask_tensor[batch_idx], fea_pairs=state.fea_pairs_tensor[batch_idx])
-                        action = greedy_select_action(pi)
+                        if str(getattr(configs, "eval_action_selection", "greedy")).lower() == "sample":
+                            action, _ = sample_action(pi)
+                        else:
+                            action = greedy_select_action(pi)
                         state, _, done, _ = temp_env.step(action.cpu().numpy())
                     else: break
                 if done.all(): break
@@ -490,7 +622,21 @@ class Trainer:
         return results_per_batch
 
     def save_model(self):
-        torch.save(self.ppo.policy.state_dict(), f'./trained_network/{self.config.data_source}/{self.model_name}.pth')
+        save_dir = os.path.join(".", "trained_network", self.config.data_source)
+        os.makedirs(save_dir, exist_ok=True)
+        target_path = os.path.join(save_dir, f"{self.model_name}.pth")
+        tmp_path = os.path.join(save_dir, f"{self.model_name}.tmp.pth")
+        fallback_path = os.path.join(save_dir, f"{self.model_name}_{time.strftime('%Y%m%d_%H%M%S')}.pth")
+
+        torch.save(self.ppo.policy.state_dict(), tmp_path)
+        try:
+            os.replace(tmp_path, target_path)
+        except OSError as exc:
+            os.replace(tmp_path, fallback_path)
+            print(
+                f"[WARN] Could not replace checkpoint '{target_path}' ({exc}). "
+                f"Saved fallback checkpoint to '{fallback_path}'."
+            )
 
 def main():
     setup_seed(configs.seed_train)

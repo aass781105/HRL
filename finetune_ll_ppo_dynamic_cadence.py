@@ -1,7 +1,7 @@
 import argparse
 import json
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -9,24 +9,26 @@ import torch
 from common_utils import greedy_select_action, sample_action
 from dynamic_job_stream import create_dynamic_world, sample_initial_jobs, register_initial_jobs
 from FJSPEnvForVariousOpNums import FJSPEnvForVariousOpNums
-from model.PPO import Memory, PPO_initialize
+from model.PPO_finetune import Memory, PPO_initialize
 from params import configs
 
 # ---- Local defaults (edit here directly) ----
-DEFAULT_CADENCES = "1,3,5"
-DEFAULT_NUM_DYNAMIC_INSTANCES = 30
-DEFAULT_VAL_CADENCE = 3
+DEFAULT_CADENCES = "1"
+DEFAULT_NUM_DYNAMIC_INSTANCES = 12
+DEFAULT_VAL_CADENCE = 1
 DEFAULT_VAL_SEED = 42
-DEFAULT_VAL_NUM_ENVS = 3
+DEFAULT_VAL_NUM_ENVS = 1
 DEFAULT_SAVE_NAME = "llmk1_dynft_best.pth"
 DEFAULT_FT_EPS_CLIP = 0.05
 DEFAULT_FT_K_EPOCHS = 1
 DEFAULT_FT_VLOSS_COEF = 0.01
 DEFAULT_FT_ENTLOSS_COEF = 0.01
-DEFAULT_UPDATE_EVERY_INSTANCES = 3
-DEFAULT_FIXED_TRAIN_CADENCE = False
-DEFAULT_RANDOMIZE_TRAIN_CADENCE = True
-DEFAULT_MULTI_CAD_VAL = True
+DEFAULT_FT_CRITIC_LOSS = "huber"
+DEFAULT_UPDATE_EVERY_INSTANCES = 1
+DEFAULT_FIXED_TRAIN_CADENCE = True
+DEFAULT_RANDOMIZE_TRAIN_CADENCE = False
+DEFAULT_MULTI_CAD_VAL = False
+DEFAULT_FIXED_TRAIN_SEED = True
 DEFAULT_TRAIN_EPISODES_PER_INSTANCE = 1
 DEFAULT_VALIDATE_EVERY_EPISODES = 3
 DEFAULT_DIFFERENT_POLICY_SEED_PER_LOCAL_EP = True
@@ -60,15 +62,20 @@ def _parse_cadences(value: str) -> List[int]:
 def _build_env_from_manifest(manifest: Dict, n_m: int):
     jl = np.asarray(manifest["job_length_list"][0], dtype=np.int32)
     pt = np.asarray(manifest["op_pt_list"][0], dtype=np.float64)
-    due_ppo = np.asarray(manifest["due_date_list"][0], dtype=np.float64)
     due_abs = np.asarray(manifest["true_due_date_list"][0], dtype=np.float64)
+    batch_time = float(manifest.get("batch_time_abs", 0.0))
+    due_state = np.asarray(
+        [float(job.get("due_date_rel", float(due_abs[i]) - batch_time)) for i, job in enumerate(manifest.get("jobs", []))],
+        dtype=np.float64,
+    )
+    if due_state.shape[0] != due_abs.shape[0]:
+        due_state = np.asarray(manifest.get("due_date_list", [due_abs - batch_time])[0], dtype=np.float64)
 
     env = FJSPEnvForVariousOpNums(n_j=int(len(jl)), n_m=int(n_m))
     state = env.set_initial_data(
         job_length_list=[jl],
         op_pt_list=[pt],
-        due_date_list=[due_ppo],
-        normalize_due_date=False,
+        due_date_list=[due_state],
         true_due_date_list=[due_abs],
     )
 
@@ -81,25 +88,8 @@ def _build_env_from_manifest(manifest: Dict, n_m: int):
     return env, state
 
 
-def _state_shape_key(state) -> Tuple:
-    return (
-        tuple(state.fea_j_tensor.shape[1:]),
-        tuple(state.op_mask_tensor.shape[1:]),
-        tuple(state.fea_m_tensor.shape[1:]),
-        tuple(state.mch_mask_tensor.shape[1:]),
-        tuple(state.dynamic_pair_mask_tensor.shape[1:]),
-        tuple(state.comp_idx_tensor.shape[1:]),
-        tuple(state.candidate_tensor.shape[1:]),
-        tuple(state.fea_pairs_tensor.shape[1:]),
-    )
-
-
-def _collect_one_batch_rollout(ppo, manifest: Dict, n_m: int, device: torch.device, memory_buckets: Dict[Tuple, Memory]):
+def _collect_one_batch_rollout(ppo, manifest: Dict, n_m: int, device: torch.device, memory: Memory):
     env, state = _build_env_from_manifest(manifest, n_m)
-    key = _state_shape_key(state)
-    if key not in memory_buckets:
-        memory_buckets[key] = Memory(gamma=configs.gamma, gae_lambda=configs.gae_lambda)
-    memory = memory_buckets[key]
     reward_sum = 0.0
 
     while True:
@@ -162,7 +152,7 @@ def _run_dynamic_episode(
     cadence: int,
     seed: int,
     train_mode: bool,
-    memory_buckets: Optional[Dict[Tuple, Memory]] = None,
+    memory: Optional[Memory] = None,
     policy_seed: Optional[int] = None,
 ):
     rng, gen, orch = create_dynamic_world(
@@ -203,10 +193,10 @@ def _run_dynamic_episode(
             result = orch.event_release_and_reschedule(t_now, event_id=event_idx)
             if result.get("event") == "batch_finalized" and orch.last_batch_manifest:
                 if train_mode:
-                    if memory_buckets is None:
-                        raise RuntimeError("memory_buckets must be provided in train_mode=True")
+                    if memory is None:
+                        raise RuntimeError("memory must be provided in train_mode=True")
                     r_sum = _collect_one_batch_rollout(
-                        ppo, orch.last_batch_manifest, int(configs.n_m), torch.device(configs.device), memory_buckets
+                        ppo, orch.last_batch_manifest, int(configs.n_m), torch.device(configs.device), memory
                     )
                     batch_rewards.append(r_sum)
                 else:
@@ -219,10 +209,10 @@ def _run_dynamic_episode(
         result = orch.event_release_and_reschedule(float(orch.t), event_id=int(configs.event_horizon) + 1)
         if result.get("event") == "batch_finalized" and orch.last_batch_manifest:
             if train_mode:
-                if memory_buckets is None:
-                    raise RuntimeError("memory_buckets must be provided in train_mode=True")
+                if memory is None:
+                    raise RuntimeError("memory must be provided in train_mode=True")
                 r_sum = _collect_one_batch_rollout(
-                    ppo, orch.last_batch_manifest, int(configs.n_m), torch.device(configs.device), memory_buckets
+                    ppo, orch.last_batch_manifest, int(configs.n_m), torch.device(configs.device), memory
                 )
                 batch_rewards.append(r_sum)
             else:
@@ -291,6 +281,7 @@ def main():
     configs.k_epochs = int(DEFAULT_FT_K_EPOCHS)
     configs.vloss_coef = float(DEFAULT_FT_VLOSS_COEF)
     configs.entloss_coef = float(DEFAULT_FT_ENTLOSS_COEF)
+    configs.ll_critic_loss = str(DEFAULT_FT_CRITIC_LOSS)
     ppo = PPO_initialize()
     model_path = str(getattr(configs, "ppo_model_path", "") or "").strip()
     if not model_path or not os.path.exists(model_path):
@@ -318,9 +309,7 @@ def main():
 
     base_seed = int(getattr(configs, "event_seed", 42))
     val_seed_end = val_seed + val_num_envs - 1
-    train_seed_start = base_seed
-    if max(train_seed_start, val_seed) <= min(train_seed_start + num_instances - 1, val_seed_end):
-        train_seed_start = val_seed_end + 1
+    train_seed_start = val_seed if bool(DEFAULT_FIXED_TRAIN_SEED) else base_seed
     cadence_rng = np.random.default_rng(train_seed_start + 9973)
     best_val_obj = float("inf")
     history = []
@@ -334,13 +323,15 @@ def main():
     )
     print(
         f"finetune_lr={finetune_lr:.6g} | eps_clip={configs.eps_clip} | k_epochs={configs.k_epochs} | "
-        f"vloss_coef={configs.vloss_coef} | entloss_coef={configs.entloss_coef}"
+        f"vloss_coef={configs.vloss_coef} | entloss_coef={configs.entloss_coef} | "
+        f"critic_loss={getattr(configs, 'll_critic_loss', 'mse')}"
     )
     print(
         f"update_every_instances={int(DEFAULT_UPDATE_EVERY_INSTANCES)} | "
         f"fixed_train_cadence={bool(DEFAULT_FIXED_TRAIN_CADENCE)} | "
         f"randomize_train_cadence={bool(DEFAULT_RANDOMIZE_TRAIN_CADENCE)} | "
         f"multi_cad_val={bool(DEFAULT_MULTI_CAD_VAL)} | "
+        f"fixed_train_seed={bool(DEFAULT_FIXED_TRAIN_SEED)} | "
         f"train_eps_per_instance={int(DEFAULT_TRAIN_EPISODES_PER_INSTANCE)} | "
         f"validate_every_eps={int(DEFAULT_VALIDATE_EVERY_EPISODES)} | "
         f"diff_policy_seed_per_local_ep={bool(DEFAULT_DIFFERENT_POLICY_SEED_PER_LOCAL_EP)}"
@@ -350,7 +341,7 @@ def main():
     print(f"validation aggregation: {val_num_envs} envs per cadence, objective = mean(0.5*MK + 0.5*TD)")
     print("-" * 30)
 
-    train_memory_buckets: Dict[Tuple, Memory] = {}
+    train_memory = Memory(gamma=configs.gamma, gae_lambda=configs.gae_lambda)
     pending_instances = 0
     last_update_loss = 0.0
     last_update_v = 0.0
@@ -359,9 +350,8 @@ def main():
     last_grad_actor = 0.0
     last_grad_critic = 0.0
     last_grad_ratio = 0.0
-    last_update_total_states = 0
-    last_update_num_buckets = 0
-    last_update_bucket_state_sizes = []
+    last_update_total_steps = 0
+    last_update_num_subproblems = 0
 
     # Baseline validation before any fine-tuning update.
     ppo.policy.eval()
@@ -394,7 +384,7 @@ def main():
             cadence = int(cadence_rng.choice(cadence_set))
         else:
             cadence = int(cadence_set[i % len(cadence_set)])
-        train_seed = train_seed_start + i
+        train_seed = train_seed_start if bool(DEFAULT_FIXED_TRAIN_SEED) else (train_seed_start + i)
         instance_rewards = []
         instance_losses = []
         instance_vs = []
@@ -414,7 +404,7 @@ def main():
                 cadence,
                 train_seed,
                 train_mode=True,
-                memory_buckets=train_memory_buckets,
+                memory=train_memory,
                 policy_seed=policy_seed,
             )
             pending_instances += 1
@@ -422,32 +412,18 @@ def main():
 
             did_update = False
             if pending_instances >= int(DEFAULT_UPDATE_EVERY_INSTANCES):
-                bucket_losses = []
-                bucket_state_sizes = []
-                total_states = 0
-                for mem in train_memory_buckets.values():
-                    if len(mem.reward_seq) == 0:
-                        continue
-                    steps = len(mem.reward_seq)
-                    envs = int(mem.reward_seq[0].shape[0]) if steps > 0 else 0
-                    states_in_bucket = int(steps * envs)
-                    bucket_state_sizes.append(states_in_bucket)
-                    total_states += states_in_bucket
-                    l, v, p = ppo.update(mem)
-                    bucket_losses.append((float(l), float(v), float(p)))
-                    mem.clear_memory()
-                if bucket_losses:
-                    last_update_loss = float(np.mean([x[0] for x in bucket_losses]))
-                    last_update_v = float(np.mean([x[1] for x in bucket_losses]))
-                    last_update_p = float(np.mean([x[2] for x in bucket_losses]))
+                if len(train_memory.reward_seq) > 0:
+                    last_update_total_steps = int(train_memory.num_states())
+                    last_update_num_subproblems = int(train_memory.num_subproblems())
+                    l, v, p = ppo.update(train_memory)
+                    last_update_loss = float(l)
+                    last_update_v = float(v)
+                    last_update_p = float(p)
                     g = getattr(ppo, "last_grad_stats", {}) or {}
                     last_grad_shared = float(g.get("shared_grad_norm", 0.0))
                     last_grad_actor = float(g.get("actor_grad_norm", 0.0))
                     last_grad_critic = float(g.get("critic_grad_norm", 0.0))
                     last_grad_ratio = float(g.get("critic_actor_ratio", 0.0))
-                    last_update_total_states = int(total_states)
-                    last_update_num_buckets = int(len(bucket_state_sizes))
-                    last_update_bucket_state_sizes = list(bucket_state_sizes)
                     instance_losses.append(last_update_loss)
                     instance_vs.append(last_update_v)
                     instance_ps.append(last_update_p)
@@ -455,6 +431,7 @@ def main():
                     instance_grad_actor.append(last_grad_actor)
                     instance_grad_critic.append(last_grad_critic)
                     instance_grad_ratio.append(last_grad_ratio)
+                    train_memory.clear_memory()
                 pending_instances = 0
                 did_update = True
 
@@ -490,11 +467,6 @@ def main():
             avg_ga = float(np.mean(instance_grad_actor)) if instance_grad_actor else float(last_grad_actor)
             avg_gc = float(np.mean(instance_grad_critic)) if instance_grad_critic else float(last_grad_critic)
             avg_gr = float(np.mean(instance_grad_ratio)) if instance_grad_ratio else float(last_grad_ratio)
-            bucket_sizes = list(last_update_bucket_state_sizes)
-            bucket_sizes_sorted = sorted(bucket_sizes)
-            bucket_min = int(bucket_sizes_sorted[0]) if bucket_sizes_sorted else 0
-            bucket_med = int(bucket_sizes_sorted[len(bucket_sizes_sorted) // 2]) if bucket_sizes_sorted else 0
-            bucket_max = int(bucket_sizes_sorted[-1]) if bucket_sizes_sorted else 0
 
             row = {
                 "instance_idx": i + 1,
@@ -512,9 +484,8 @@ def main():
                 "grad_actor_norm": avg_ga,
                 "grad_critic_norm": avg_gc,
                 "grad_critic_actor_ratio": avg_gr,
-                "update_total_states": int(last_update_total_states),
-                "update_num_buckets": int(last_update_num_buckets),
-                "update_bucket_state_sizes": bucket_sizes,
+                "update_total_steps": int(last_update_total_steps),
+                "update_num_subproblems": int(last_update_num_subproblems),
                 "val_seed": val_seed,
                 "val_cadence": val_cadence,
                 "val_num_envs": val_num_envs,
@@ -535,30 +506,19 @@ def main():
                 f"[EP {episode_counter:03d}] inst={i+1:03d}/{num_instances} cad={cadence} seed={train_seed} | "
                 f"train(loss={avg_loss:.4f}, v={avg_v:.4f}, p={avg_p:.4f}) | "
                 f"grad(shared={avg_gs:.3e}, actor={avg_ga:.3e}, critic={avg_gc:.3e}, c/a={avg_gr:.2f}) | "
-                f"update(states={last_update_total_states}, buckets={last_update_num_buckets}, "
-                f"b[min/med/max]={bucket_min}/{bucket_med}/{bucket_max}) | "
                 f"val(MK={val_mk:.3f}, TD={val_td:.3f}, Obj={val_obj:.3f}){per_cad_line} | bestObj={best_val_obj:.3f}"
             )
 
     # Flush remaining collected rollouts (if any) so all train data contributes.
-    has_pending_memory = any(len(mem.reward_seq) > 0 for mem in train_memory_buckets.values())
+    has_pending_memory = len(train_memory.reward_seq) > 0
     if pending_instances > 0 and has_pending_memory:
-        bucket_losses = []
-        for mem in train_memory_buckets.values():
-            if len(mem.reward_seq) == 0:
-                continue
-            l, v, p = ppo.update(mem)
-            bucket_losses.append((float(l), float(v), float(p)))
-            mem.clear_memory()
-        if bucket_losses:
-            flush_loss = float(np.mean([x[0] for x in bucket_losses]))
-            flush_v = float(np.mean([x[1] for x in bucket_losses]))
-            flush_p = float(np.mean([x[2] for x in bucket_losses]))
-        else:
-            flush_loss = flush_v = flush_p = 0.0
+        flush_steps = int(train_memory.num_states())
+        flush_subproblems = int(train_memory.num_subproblems())
+        flush_loss, flush_v, flush_p = ppo.update(train_memory)
+        train_memory.clear_memory()
         print(
             f"[Flush Update] pending_instances={pending_instances} | "
-            f"loss={flush_loss:.4f}, v={flush_v:.4f}, p={flush_p:.4f}"
+            f"loss={float(flush_loss):.4f}, v={float(flush_v):.4f}, p={float(flush_p):.4f}"
         )
 
     summary = {

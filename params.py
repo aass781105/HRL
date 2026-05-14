@@ -73,16 +73,22 @@ parser.add_argument('--data_type', type=str, default="test", help='Generated dat
 # ============================
 # PPO Network Architecture
 # ============================
-parser.add_argument('--fea_j_input_dim', type=int, default=14, help='Dimension of operation raw feature vectors')
+parser.add_argument('--fea_j_input_dim', type=int, default=19, help='Dimension of operation raw feature vectors')
 parser.add_argument('--fea_m_input_dim', type=int, default=9, help='Dimension of machine raw feature vectors')
+parser.add_argument('--fea_pair_input_dim', type=int, default=8, help='Dimension of pair raw feature vectors')
 parser.add_argument('--dropout_prob', type=float, default=0.0, help='Dropout rate (1 - keep probability).')
 parser.add_argument('--layer_fea_output_dim', nargs='+', type=int, default=[64, 64, 64], help='List of output dimensions for each layer of the Feature Encoder')
+parser.add_argument('--separate_actor_critic_encoder', type=str2bool, default=False, help='Use separate feature encoders for actor and critic in the low-level PPO.')
 
 # Actor-Critic Details
 parser.add_argument('--num_mlp_layers_actor', type=int, default=3, help='Number of layers in Actor network')
 parser.add_argument('--hidden_dim_actor', type=int, default=512, help='Hidden dimension of Actor network')
 parser.add_argument('--num_mlp_layers_critic', type=int, default=3, help='Number of layers in Critic network')
 parser.add_argument('--hidden_dim_critic', type=int, default=256, help='Hidden dimension of Critic network')
+parser.add_argument('--critic_size_context_max_n_j', type=float, default=30.0, help='Training max job count used to scale critic-only size context n_j/max_n_j')
+parser.add_argument('--critic_due_context', type=str2bool, default=False, help='Append due-setting one-hot context to critic input when available.')
+parser.add_argument('--multi_critic_split_n_j', type=int, default=20, help='Use small critic for n_j below this split and large critic otherwise.')
+parser.add_argument('--multi_critic_large_split_n_j', type=int, default=26, help='Use mid critic below this split and large critic from this n_j onward.')
 
 
 # ============================
@@ -97,7 +103,11 @@ parser.add_argument('--lr_end', type=float, default=1e-4, help='Final learning r
 parser.add_argument('--gamma', type=float, default=1, help='Discount factor used in training')
 parser.add_argument('--k_epochs', type=int, default=4, help='Update frequency of each episode')
 parser.add_argument('--eps_clip', type=float, default=0.2, help='Clip parameter')
-parser.add_argument('--vloss_coef', type=float, default=1, help='Critic loss coefficient')
+parser.add_argument('--vloss_coef', type=float, default=0.1, help='Critic loss coefficient')
+parser.add_argument('--ll_due_vloss_coef', type=str2bool, default=False, help='Use due-setting-specific low-level critic loss coefficients when due_date_mode=range3_hold.')
+parser.add_argument('--ll_vloss_coef_loose', type=float, default=0.1, help='Low-level vloss_coef used for range3_loose when ll_due_vloss_coef is enabled.')
+parser.add_argument('--ll_vloss_coef_mixed', type=float, default=0.075, help='Low-level vloss_coef used for range3_mixed when ll_due_vloss_coef is enabled.')
+parser.add_argument('--ll_vloss_coef_tight', type=float, default=0.05, help='Low-level vloss_coef used for range3_tight when ll_due_vloss_coef is enabled.')
 parser.add_argument('--ploss_coef', type=float, default=1, help='Policy loss coefficient')
 parser.add_argument('--entloss_coef', type=float, default=0.03, help='Entropy loss coefficient')
 parser.add_argument('--tau', type=float, default=0, help='Policy soft update coefficient')
@@ -113,7 +123,10 @@ parser.add_argument('--minibatch_size', type=int, default=1024, help='Batch size
 # ============================
 parser.add_argument('--seed_test', type=int, default=50, help='Seed for testing heuristics')
 parser.add_argument('--eval_seed', type=int, default=42, help='Seed for dynamic evaluation')
-parser.add_argument('--eval_runs_per_instance', type=int, default=1, help='Number of runs per test instance')
+parser.add_argument('--instance_json', type=str, default='', help='Fixed dynamic instance JSON path for replay/evaluation')
+parser.add_argument('--dynamic_instance_dir', type=str, default='dynamic_instances', help='Directory for exported fixed dynamic instance JSON files')
+parser.add_argument('--eval_runs_per_instance', type=int, default=10, help='Number of runs per test instance')
+parser.add_argument('--main_sample_runs', type=int, default=-1, help='Number of sample runs for main.py dynamic evaluation. If <=0, use eval_runs_per_instance.')
 parser.add_argument('--eval_num_instances', type=int, default=10, help='Number of test instances to evaluate')
 parser.add_argument('--test_data', nargs='+', default=['Hurink_vdata'], help='List of data for testing')
 parser.add_argument('--test_mode', type=str2bool, default=False, help='Whether using the sampling strategy in testing')
@@ -128,6 +141,9 @@ parser.add_argument('--eval_model_name', type=str, default="llmk1000", help='用
 # ============================
 parser.add_argument('--event_horizon', type=float, default=100.0, help='事件驅動模式的模擬事件上限')
 parser.add_argument('--interarrival_mean', type=float, default=25, help='Poisson interarrival_mean')
+parser.add_argument('--arrival_mode', type=str, default='exponential', choices=['exponential', 'uniform'], help='Arrival interval sampling mode for dynamic jobs.')
+parser.add_argument('--interarrival_uniform_low', type=float, default=10.0, help='Lower bound of uniform inter-arrival interval when arrival_mode=uniform.')
+parser.add_argument('--interarrival_uniform_high', type=float, default=50.0, help='Upper bound of uniform inter-arrival interval when arrival_mode=uniform.')
 parser.add_argument('--init_jobs', type=int, default= 10, help='初始工單數')
 parser.add_argument('--burst_size', type=int, default=1, help='每次生成工單數')
 parser.add_argument('--event_seed', type=int, default=42, help='事件驅動到達過程的亂數種子（Exponential 間隔）')
@@ -139,12 +155,24 @@ parser.add_argument('--fast_mode', type=str2bool, default=False, help='是否開
 # ============================
 parser.add_argument('--curriculum_cycle', type=int, default=250, help='Updates per curriculum stage')
 parser.add_argument('--tardiness_dilution_power', type=float, default=1, help='Beta factor for tardiness dilution')
-parser.add_argument('--schedule_type', type=str, default='same', choices=['s2', 's3', 'same', 'u10_50'], help='Type of curriculum schedule to use')
-parser.add_argument('--due_date_mode', type=str, default='range', choices=['k', 'M', 'range', 'range15', 'range2', 'norm'], help='Due date generation mode: k (Individual), M (Common), range (uniform symmetric range), range15 (1.5x wider than range), norm (normal with random mean). range2 is kept as a backward-compatible alias.')
-parser.add_argument('--val_due_date_mode', type=str, default='range', choices=['', 'k', 'M', 'range', 'range15', 'range2', 'norm'], help='Validation due date mode override. Empty string means using due_date_mode.')
+parser.add_argument('--schedule_type', type=str, default='same', choices=['s2', 's3', 'same', 'u10_30', 'u10_50', 'u30_50'], help='Type of curriculum schedule to use')
+parser.add_argument('--mixed_size_hold_updates', type=int, default=5, help='Updates to keep one sampled mixed-size n_j before resampling for u10_30/u10_50 schedules')
+parser.add_argument('--mixed_size_large_prob', type=float, default=0.0, help='If >0, sample mixed sizes from small/large ranges with this probability for the large range.')
+parser.add_argument('--mixed_size_small_max_n_j', type=int, default=19, help='Upper n_j bound for the small range when mixed_size_large_prob > 0.')
+parser.add_argument('--mixed_size_large_min_n_j', type=int, default=20, help='Lower n_j bound for the large range when mixed_size_large_prob > 0.')
+parser.add_argument('--due_setting_hold_updates', type=int, default=10, help='Updates to keep one due setting when due_date_mode=range3_hold.')
+parser.add_argument('--due_date_mode', type=str, default='range', choices=['k', 'M', 'range', 'range3', 'range3_hold', 'range3_loose', 'range3_mixed', 'range3_tight', 'range15', 'range2', 'norm', 'dynamic_shift'], help='Due date generation mode: k (Individual), M (Common), range (uniform symmetric range), range3 (randomly choose tight/mixed/loose range per instance), range3_hold (training code cycles one due setting for several updates), range3_loose/mixed/tight (fixed range3 sub-mode), range15 (1.5x wider than range), norm (normal with random mean), dynamic_shift (workload factor shifted tighter by n_j). range2 is kept as a backward-compatible alias.')
+parser.add_argument('--val_due_date_mode', type=str, default='range', choices=['', 'k', 'M', 'range', 'range3', 'range3_loose', 'range3_mixed', 'range3_tight', 'range15', 'range2', 'norm', 'dynamic_shift'], help='Validation due date mode override. Empty string means using due_date_mode.')
 parser.add_argument('--m_value', type=float, default=0.6, help='M-value used for Common Due Date (Static Curriculum Only)')
-parser.add_argument('--due_date_tightness', type=float, default=1.2, help='Tightness base factor (k). Current logic uses U[1.2, 2.0] for individual due dates.')
+parser.add_argument('--due_date_tightness', type=float, default=1.2, help='Legacy tightness base factor. k-mode now uses due_date_k_low/high.')
+parser.add_argument('--due_date_k_low', type=float, default=1.2, help='Lower bound of workload multiplier k for individual due dates.')
+parser.add_argument('--due_date_k_high', type=float, default=6.0, help='Upper bound of workload multiplier k for individual due dates.')
 parser.add_argument('--due_date_noise', type=float, default=0.0, help='Multiplicative noise level for due dates')
+parser.add_argument('--dynamic_due_base_low', type=float, default=1.2, help='Base lower workload factor for dynamic_shift due dates.')
+parser.add_argument('--dynamic_due_base_high', type=float, default=2.0, help='Base upper workload factor for dynamic_shift due dates.')
+parser.add_argument('--dynamic_due_shift_per_job', type=float, default=0.2, help='Factor shift subtracted per job above dynamic_due_ref_n_j for dynamic_shift due dates.')
+parser.add_argument('--dynamic_due_ref_n_j', type=int, default=10, help='Reference job count with no due-factor shift for dynamic_shift due dates.')
+parser.add_argument('--dynamic_due_min_factor', type=float, default=None, help='Optional lower clamp for dynamic_shift due factors. None leaves factors unclamped.')
 
 # ============================
 # Unified Scheduling Controller
@@ -161,7 +189,7 @@ parser.add_argument('--gate_policy', type=str, default='ppo',
                     help='High-level gate policy: ppo=actor-critic, cadence=fixed event release cadence, slack_threshold=release when buffer min slack is below threshold')
 parser.add_argument('--gate_cadence', type=int, default=5, help='當 gate_policy=cadence 時，每隔幾個到達事件釋放一次緩衝區')
 parser.add_argument('--buffer_slack_release_threshold', type=float, default=0.0, help='When gate_policy=slack_threshold, release if current buffer min slack is below this threshold')
-parser.add_argument('--eval_action_selection', type=str, default='greedy',
+parser.add_argument('--eval_action_selection', type=str, default='sample',
                     choices=['sample', 'greedy'],
                     help='sample or greedy')
 parser.add_argument('--ppo_gate_model_path', type=str, default=r"ppo_ckpt\ppo_gate_latest.pth", help='PPO gate 推論權重路徑（.pth）')
@@ -178,6 +206,9 @@ parser.add_argument('--ll_td_coef', type=float, default=1.0, help='Low-level PPO
 parser.add_argument('--ll_td_mode', type=str, default='mean_pt', choices=['mean_pt', 'workload', 'slack_delta_mean_pt', 'tardiness_delta_mean_pt', 'mean_pt_split_ops', 'td_minus_workload_relu'],
                     help='Low-level TD reward mode: mean_pt=TD/mean_pt, workload=TD/job_workload, slack_delta_mean_pt=negative slack-drop / mean_pt (only at job completion), tardiness_delta_mean_pt=per-op marginal tardiness increase / mean_pt, td_minus_workload_relu=-max(0, tardiness-workload). mean_pt_split_ops is kept as alias to tardiness_delta_mean_pt.')
 parser.add_argument('--stability_scale', type=float, default=0.0, help='決策穩定性懲罰 (Action 1 的額外扣分)。設為 0 代表純效能模式。')
+parser.add_argument('--ll_vtarget_norm', type=str2bool, default=False, help='Normalize low-level PPO value targets per-env trajectory before critic loss.')
+parser.add_argument('--ll_critic_loss', type=str, default='mse', choices=['mse', 'huber'], help='Critic loss type for low-level PPO.')
+parser.add_argument('--ll_reward_norm_by_size', type=str2bool, default=False, help='Normalize low-level PPO step rewards by running mean/std tracked separately for each n_j.')
 parser.add_argument('--buffer_penalty_coef', type=float, default=0.0, help='Coefficient for buffer tardiness penalty')
 parser.add_argument('--stability_mode', type=str, default='immediate_all', choices=['immediate_all', 'free_threshold'], help='Stability reward mode: immediate_all = current per-release penalty; free_threshold = releases are free until stability_free_releases, then penalize via terminal or redistribution.')
 parser.add_argument('--stability_terminal_only', type=str2bool, default=False, help='If true, apply stability penalty only once at episode end using agent-chosen release count.')
@@ -203,6 +234,9 @@ parser.add_argument('--plot_run_name', type=str, default='', help='Optional run-
 # External Solvers
 # ============================
 parser.add_argument('--max_solve_time', type=int, default=1800, help='The maximum solving time of OR-Tools')
+parser.add_argument('--ortools_subproblem_time_limit', type=float, default=30.0, help='OR-Tools time limit per dynamic subproblem/release, in seconds')
+parser.add_argument('--ortools_total_solve_time_budget', type=float, default=0.0, help='Total OR-Tools solve-time budget. <=0 means use per-subproblem limit directly')
+parser.add_argument('--ortools_time_scale', type=int, default=1, help='Scale factor used to convert continuous times to CP-SAT integer times')
 
 # PPO Gate Training Hyperparameters
 parser.add_argument('--ppo_gate_num_layers', type=int, default=3, help='Number of hidden layers in PPO gate')

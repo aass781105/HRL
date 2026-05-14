@@ -1,0 +1,17 @@
+{
+  "policy": "ORTCadence_10",
+  "instance_json": "dynamic_instances\\dynamic_seed42_init50_h30_U30_80_due12_80.json",
+  "replay_mode": true,
+  "event_seed": 42,
+  "gate_cadence": 10,
+  "event_horizon": 30,
+  "init_jobs": 50,
+  "release_count": 4,
+  "makespan": 2542.0,
+  "total_tardiness": 2193.960246716362,
+  "subproblem_time_limit": 7200.0,
+  "total_solve_time_budget": 0.0,
+  "remaining_solve_time_budget": 0.0,
+  "time_scale": 1,
+  "output_dir": "plots/global\\20260512_043253_ortools_dynamic_seed42_init50_h30_U30_80_due12_8"
+}

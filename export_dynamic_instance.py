@@ -19,12 +19,15 @@ from params import configs
 
 
 def default_output_path() -> str:
+    instance_json = str(getattr(configs, "instance_json", "") or "").strip()
+    if instance_json:
+        return instance_json
     name = (
         f"dynamic_instance_seed{int(getattr(configs, 'event_seed', 42))}"
         f"_h{int(getattr(configs, 'event_horizon', 0))}"
         f"_k{int(getattr(configs, 'burst_size', 1))}.json"
     )
-    return os.path.join("evaluation_results", name)
+    return os.path.join(str(getattr(configs, "dynamic_instance_dir", "dynamic_instances")), name)
 
 
 def main():

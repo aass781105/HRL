@@ -396,6 +396,86 @@ def plot_validation_breakdown(csv_path: Path, output_path: Path, core_name: str)
     plt.close(fig)
     print(f"✅ 驗證細分趨勢圖已輸出：{output_path}")
 
+
+def plot_training_diagnostics(loss_data, output_path: Path, core_name: str):
+    """
+    Reads loss_*.txt rows:
+    [update, loss, v_loss, p_loss, vshare, pshare, err_mean, err_std,
+     delta, over_delta_ratio, entropy, clip_frac, adv_std]
+    """
+    if not loss_data or len(loss_data[0]) < 10:
+        print("Diagnostic loss data not found.")
+        return
+
+    steps = [x[0] for x in loss_data]
+    vshare = [100.0 * x[4] for x in loss_data] if len(loss_data[0]) >= 5 else []
+    pshare = [100.0 * x[5] for x in loss_data] if len(loss_data[0]) >= 6 else []
+    err_mean = [x[6] for x in loss_data] if len(loss_data[0]) >= 7 else []
+    err_std = [x[7] for x in loss_data] if len(loss_data[0]) >= 8 else []
+    delta_vals = [x[8] for x in loss_data] if len(loss_data[0]) >= 9 else []
+    over_delta_pct = [100.0 * x[9] for x in loss_data]
+    entropy = [x[10] for x in loss_data] if len(loss_data[0]) >= 11 else []
+    clip_pct = [100.0 * x[11] for x in loss_data] if len(loss_data[0]) >= 12 else []
+    adv_std = [x[12] for x in loss_data] if len(loss_data[0]) >= 13 else []
+
+    fig, axes = plt.subplots(4, 1, figsize=(12, 18), sharex=True)
+    fig.suptitle(f"Training Diagnostics: {core_name}", fontsize=16)
+
+    delta_label = f">{delta_vals[0]:g}" if delta_vals else ">d"
+    axes[0].plot(steps, over_delta_pct, color="#8c564b", linewidth=LINE_WIDTH, label=f"|critic error| {delta_label} (%)")
+    axes[0].set_title("Critic Large-Error Ratio")
+    axes[0].set_ylabel("Percent")
+    axes[0].legend(loc="upper right")
+    axes[0].grid(True, linestyle="--", alpha=0.5)
+
+    if vshare and pshare:
+        axes[1].plot(steps, vshare, color="orange", linewidth=LINE_WIDTH, label="Vshare")
+        axes[1].plot(steps, pshare, color="purple", linewidth=LINE_WIDTH, linestyle="--", label="Pshare")
+        axes[1].set_title("Loss Contribution Share")
+        axes[1].set_ylabel("Percent")
+        axes[1].legend(loc="upper right")
+        axes[1].grid(True, linestyle="--", alpha=0.5)
+    else:
+        axes[1].set_title("Vshare/Pshare Data Not Found")
+
+    if err_mean and err_std:
+        axes[2].plot(steps, err_mean, color="#1f77b4", linewidth=LINE_WIDTH, label="Critic Error Mean")
+        axes[2].plot(steps, err_std, color="#d62728", linewidth=LINE_WIDTH, linestyle="--", label="Critic Error Std")
+        axes[2].axhline(0.0, color="black", linewidth=0.8, alpha=0.5)
+        axes[2].set_title("Critic Error Distribution")
+        axes[2].set_ylabel("Error")
+        axes[2].legend(loc="upper right")
+        axes[2].grid(True, linestyle="--", alpha=0.5)
+    else:
+        axes[2].set_title("Critic Error Mean/Std Data Not Found")
+
+    if entropy or clip_pct or adv_std:
+        if entropy:
+            axes[3].plot(steps, entropy, color="#2ca02c", linewidth=LINE_WIDTH, label="Entropy")
+        if adv_std:
+            axes[3].plot(steps, adv_std, color="#17becf", linewidth=LINE_WIDTH, linestyle="-.", label="AdvStd")
+        axes[3].set_title("Policy Update Health")
+        axes[3].set_ylabel("Entropy / AdvStd")
+        axes[3].grid(True, linestyle="--", alpha=0.5)
+        if clip_pct:
+            ax3_r = axes[3].twinx()
+            ax3_r.plot(steps, clip_pct, color="#ff7f0e", linewidth=LINE_WIDTH, linestyle="--", label="ClipFrac (%)")
+            ax3_r.set_ylabel("ClipFrac (%)", color="#ff7f0e")
+            ax3_r.tick_params(axis="y", labelcolor="#ff7f0e")
+            lines_l, labels_l = axes[3].get_legend_handles_labels()
+            lines_r, labels_r = ax3_r.get_legend_handles_labels()
+            axes[3].legend(lines_l + lines_r, labels_l + labels_r, loc="upper right")
+        else:
+            axes[3].legend(loc="upper right")
+    else:
+        axes[3].set_title("Policy Diagnostics Data Not Found")
+
+    axes[3].set_xlabel("Updates")
+    plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+    print(f"✅ Diagnostics plot saved: {output_path}")
+
 def main():
     # 1. Construct dynamic log name
     model_name = configs.eval_model_name
@@ -427,9 +507,10 @@ def main():
     out_dir = Path(OUTPUT_PLOT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # [ADDED] Plot Comparison Analysis (New 3-Subplot Chart)
+    # Comparison plot was removed because it duplicated validation content in analysis.
     comp_analysis_path = out_dir / f"comparison_{CORE_NAME}.png"
-    plot_comparison_analysis(log_dir, comp_analysis_path, log_file_suffix, CORE_NAME)
+    if comp_analysis_path.exists():
+        comp_analysis_path.unlink()
 
     # [ADDED] Plot Detailed Reward Components
     if detailed_path.exists():
@@ -570,6 +651,10 @@ def main():
     plt.savefig(out_path, dpi=200)
     plt.close()
     print(f"✅ 進階分析圖已輸出：{out_path}")
+
+    if loss_data:
+        diag_path = out_dir / f"diagnostics_{CORE_NAME}.png"
+        plot_training_diagnostics(loss_data, diag_path, CORE_NAME)
 
 if __name__ == "__main__":
     main()

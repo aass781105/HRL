@@ -63,13 +63,11 @@ def simulate_dynamic_subproblem():
 
     # 3. 初始化靜態環境
     env = FJSPEnvForVariousOpNums(n_j=n_j, n_m=n_m)
-    due_dates_ppo = due_dates_abs / pt_scale
     
     state = env.set_initial_data(
         job_length_list=[np.array(jl)], 
         op_pt_list=[pt], 
-        due_date_list=[np.array(due_dates_ppo)], 
-        normalize_due_date=False, 
+        due_date_list=[np.array(due_dates_abs)], 
         true_due_date_list=[np.array(due_dates_abs)]
     )
 

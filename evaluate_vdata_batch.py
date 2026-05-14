@@ -18,7 +18,6 @@ def evaluate_vdata():
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     configs.device = str(device)
-    pt_scale = (float(configs.low) + float(configs.high)) / 2.0
 
     # 搜尋所有目標模型 (SAME, S2, S3 * Seed 1,2,3)
     strategies = ['same', 's2', 's3']
@@ -77,12 +76,11 @@ def evaluate_vdata():
             
             # Apply fixed k=1.2
             due_dates_abs = job_work * 1.2
-            due_dates_ppo = due_dates_abs / pt_scale
 
             env = FJSPEnvForVariousOpNums(n_j=n_j, n_m=n_m)
             # [FIXED] Wrap all list parameters in lists to match multi-env logic
             state = env.set_initial_data(job_length_list=[jl], op_pt_list=[pt], 
-                                         due_date_list=[due_dates_ppo], normalize_due_date=False, 
+                                         due_date_list=[due_dates_abs],
                                          true_due_date_list=[due_dates_abs])
 
             done = False

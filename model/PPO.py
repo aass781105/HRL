@@ -92,7 +92,7 @@ class Memory:
                t_Compete_m_seq, t_candidate_seq, t_pairMessage_seq, \
                t_action_seq, t_reward_seq, t_val_seq, t_done_seq, t_logprobs_seq
 
-    def get_gae_advantages(self):
+    def get_gae_advantages(self, normalize_vtarget=False):
         """
             Compute the generalized advantage estimates
         :return: advantage sequences, state value sequence
@@ -117,13 +117,17 @@ class Memory:
         t_advantage_seq = torch.stack(advantage_seq, dim=0).transpose(0, 1).to(torch.float32)
 
         # [sz_b, N]
-        v_target_seq = (t_advantage_seq + self.t_old_val_seq).flatten(0, 1)
+        v_target_seq = t_advantage_seq + self.t_old_val_seq
+
+        if normalize_vtarget:
+            v_target_seq = (v_target_seq - v_target_seq.mean(dim=1, keepdim=True)) \
+                           / (v_target_seq.std(dim=1, keepdim=True) + 1e-8)
 
         # normalization
         t_advantage_seq = (t_advantage_seq - t_advantage_seq.mean(dim=1, keepdim=True)) \
                           / (t_advantage_seq.std(dim=1, keepdim=True) + 1e-8)
 
-        return t_advantage_seq.flatten(0, 1), v_target_seq
+        return t_advantage_seq.flatten(0, 1), v_target_seq.flatten(0, 1)
 
 
 class PPO:
@@ -143,6 +147,8 @@ class PPO:
         self.vloss_coef = config.vloss_coef
         self.entloss_coef = config.entloss_coef
         self.minibatch_size = config.minibatch_size
+        self.normalize_vtarget = bool(getattr(config, "ll_vtarget_norm", False))
+        self.critic_loss_type = str(getattr(config, "ll_critic_loss", "mse")).strip().lower()
 
         self.policy = DANIEL(config)
         self.policy_old = deepcopy(self.policy)
@@ -151,12 +157,20 @@ class PPO:
 
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.lr)
         self.V_loss_2 = nn.MSELoss()
+        self.huber_delta = 1.0
+        self.V_loss_huber = nn.HuberLoss(delta=self.huber_delta)
         self.device = torch.device(config.device)
         self.last_grad_stats = {
             "shared_grad_norm": 0.0,
             "actor_grad_norm": 0.0,
             "critic_grad_norm": 0.0,
             "critic_actor_ratio": 0.0,
+        }
+        self.last_critic_stats = {
+            "delta_threshold": self.huber_delta,
+            "over_delta_ratio": 0.0,
+            "error_mean": 0.0,
+            "error_std": 0.0,
         }
 
     @staticmethod
@@ -177,7 +191,7 @@ class PPO:
 
         t_data = memory.transpose_data()
 
-        t_advantage_seq, v_target_seq = memory.get_gae_advantages()
+        t_advantage_seq, v_target_seq = memory.get_gae_advantages(normalize_vtarget=self.normalize_vtarget)
 
         full_batch_size = len(t_data[-1])
         num_batch = np.ceil(full_batch_size / self.minibatch_size)
@@ -189,6 +203,13 @@ class PPO:
         grad_shared_epochs = 0.0
         grad_actor_epochs = 0.0
         grad_critic_epochs = 0.0
+        err_mean_epochs = 0.0
+        err_std_epochs = 0.0
+        over_delta_ratio_epochs = 0.0
+        entropy_epochs = 0.0
+        clip_frac_epochs = 0.0
+        adv_std_epochs = 0.0
+        huber_delta = self.huber_delta
 
         for _ in range(self.k_epochs):
 
@@ -217,16 +238,26 @@ class PPO:
                                         fea_pairs=t_data[7][start_idx:end_idx][valid_rows])
 
                 action_batch = t_data[8][start_idx: end_idx][valid_rows]
-                logprobs, ent_loss = eval_actions(pis, action_batch)
+                logprobs, entropy = eval_actions(pis, action_batch)
                 ratios = torch.exp(logprobs - t_data[12][start_idx: end_idx][valid_rows].detach())
 
                 advantages = t_advantage_seq[start_idx: end_idx][valid_rows]
+                entropy_epochs += float(entropy.detach().item())
+                clip_frac_epochs += float(((ratios < 1 - self.eps_clip) | (ratios > 1 + self.eps_clip)).float().mean().item())
+                adv_std_epochs += float(advantages.detach().std(unbiased=False).item())
                 surr1 = ratios * advantages
                 surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
 
-                v_loss = self.V_loss_2(vals.squeeze(1), v_target_seq[start_idx: end_idx][valid_rows])
+                if self.critic_loss_type == "huber":
+                    v_loss = self.V_loss_huber(vals.squeeze(1), v_target_seq[start_idx: end_idx][valid_rows])
+                else:
+                    v_loss = self.V_loss_2(vals.squeeze(1), v_target_seq[start_idx: end_idx][valid_rows])
+                critic_errors = (vals.squeeze(1) - v_target_seq[start_idx: end_idx][valid_rows]).detach()
+                err_mean_epochs += float(critic_errors.mean().item())
+                err_std_epochs += float(critic_errors.std(unbiased=False).item())
+                over_delta_ratio_epochs += float((critic_errors.abs() > huber_delta).float().mean().item())
                 p_loss = - torch.min(surr1, surr2)
-                ent_loss = - ent_loss.clone()
+                ent_loss = - entropy.clone()
                 loss = self.vloss_coef * v_loss + self.ploss_coef * p_loss + self.entloss_coef * ent_loss
 
                 self.optimizer.zero_grad()
@@ -234,7 +265,11 @@ class PPO:
                 v_loss_epochs += v_loss.mean().detach()
                 p_loss_epochs += p_loss.mean().detach()
                 loss.mean().backward()
-                grad_shared_epochs += self._module_grad_l2_norm(self.policy.feature_exact)
+                feature_grad = self._module_grad_l2_norm(self.policy.feature_exact)
+                critic_feature = getattr(self.policy, "critic_feature_exact", None)
+                if critic_feature is not None:
+                    feature_grad += self._module_grad_l2_norm(critic_feature)
+                grad_shared_epochs += feature_grad
                 grad_actor_epochs += self._module_grad_l2_norm(self.policy.actor)
                 grad_critic_epochs += self._module_grad_l2_norm(self.policy.critic)
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
@@ -251,6 +286,17 @@ class PPO:
                 "critic_grad_norm": 0.0,
                 "critic_actor_ratio": 0.0,
             }
+            self.last_critic_stats = {
+                "delta_threshold": huber_delta,
+                "over_delta_ratio": 0.0,
+                "error_mean": 0.0,
+                "error_std": 0.0,
+            }
+            self.last_policy_stats = {
+                "entropy": 0.0,
+                "clip_frac": 0.0,
+                "adv_std": 0.0,
+            }
             return 0.0, 0.0, 0.0
 
         avg_shared = float(grad_shared_epochs) / num_effective_updates
@@ -262,6 +308,17 @@ class PPO:
             "actor_grad_norm": avg_actor,
             "critic_grad_norm": avg_critic,
             "critic_actor_ratio": float(ratio),
+        }
+        self.last_critic_stats = {
+            "delta_threshold": huber_delta,
+            "over_delta_ratio": float(over_delta_ratio_epochs) / num_effective_updates,
+            "error_mean": float(err_mean_epochs) / num_effective_updates,
+            "error_std": float(err_std_epochs) / num_effective_updates,
+        }
+        self.last_policy_stats = {
+            "entropy": float(entropy_epochs) / num_effective_updates,
+            "clip_frac": float(clip_frac_epochs) / num_effective_updates,
+            "adv_std": float(adv_std_epochs) / num_effective_updates,
         }
 
         return float(loss_epochs) / num_effective_updates, float(v_loss_epochs) / num_effective_updates, float(p_loss_epochs) / num_effective_updates

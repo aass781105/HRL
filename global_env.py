@@ -87,12 +87,21 @@ class EventBurstGenerator:
         setattr(self.cfg, "op_per_job", 5)
         setattr(self.cfg, "enable_op_mixture", False)
         self.interarrival_mean = float(interarrival_mean)
+        self.arrival_mode = str(getattr(base_config, "arrival_mode", "exponential")).strip().lower()
+        self.interarrival_uniform_low = float(getattr(base_config, "interarrival_uniform_low", 10.0))
+        self.interarrival_uniform_high = float(getattr(base_config, "interarrival_uniform_high", 50.0))
+        if self.interarrival_uniform_low > self.interarrival_uniform_high:
+            self.interarrival_uniform_low, self.interarrival_uniform_high = self.interarrival_uniform_high, self.interarrival_uniform_low
         self.rng = rng or np.random.default_rng()
         self.k_sampler = k_sampler or (lambda _rng: 1)
         self._next_id = self._initial_id = int(starting_job_id)
 
     def sample_next_time(self, t_now: float) -> float:
-        return float(t_now + self.rng.exponential(self.interarrival_mean))
+        if self.arrival_mode == "uniform":
+            interval = self.rng.uniform(self.interarrival_uniform_low, self.interarrival_uniform_high)
+        else:
+            interval = self.rng.exponential(self.interarrival_mean)
+        return float(t_now + max(float(interval), 0.0))
 
     def generate_burst(self, t_event: float) -> List[JobSpec]:
         K = int(self.k_sampler(self.rng))
@@ -186,7 +195,7 @@ class GlobalTimelineOrchestrator:
         pt_scale: float,
         jl,
         pt,
-        due_dates_ppo,
+        due_dates_state_abs,
         due_dates_abs,
         event_id: Optional[int] = None,
     ) -> Dict:
@@ -196,7 +205,7 @@ class GlobalTimelineOrchestrator:
         job_length_list = [int(x) for x in np.asarray(jl[0], dtype=int).tolist()] if jl else []
         op_pt_list = np.asarray(pt[0], dtype=float).tolist() if pt else []
         due_dates_abs = [float(x) for x in due_dates_abs]
-        due_dates_ppo = [float(x) for x in due_dates_ppo]
+        due_dates_state_abs = [float(x) for x in due_dates_state_abs]
         ready_times_abs = [float(js.meta.get("ready_at", batch_time)) for js in jobs_new]
         ready_times_rel = [float(x - batch_time) for x in ready_times_abs]
         ready_times_env = [float(norm.f(x)) for x in ready_times_abs]
@@ -260,7 +269,7 @@ class GlobalTimelineOrchestrator:
             "machine_free_time_env": [float(x) for x in np.asarray(norm.f(self.machine_free_time), dtype=float).tolist()],
             "job_length_list": [job_length_list],
             "op_pt_list": [op_pt_list],
-            "due_date_list": [due_dates_ppo],
+            "due_date_list": [due_dates_state_abs],
             "true_due_date_list": [due_dates_abs],
             "candidate_free_time_abs": ready_times_abs,
             "candidate_free_time_env": ready_times_env,
@@ -292,10 +301,20 @@ class GlobalTimelineOrchestrator:
                         fea_m=state.fea_m_tensor, mch_mask=state.mch_mask_tensor, comp_idx=state.comp_idx_tensor,
                         dynamic_pair_mask=state.dynamic_pair_mask_tensor, fea_pairs=state.fea_pairs_tensor
                     )
-                    act = int(pi.argmax(dim=1).item())
+                    if str(getattr(configs, "eval_action_selection", "greedy")).lower() == "sample":
+                        action_tensor, _ = sample_action(pi)
+                        act = int(action_tensor.item())
+                    else:
+                        act = int(pi.argmax(dim=1).item())
                 _sync_cuda_for_profile()
                 t_fwd_sum += (time.perf_counter() - tfwd0)
             else:
+                if self.method in ("OR-TOOLS", "ORTOOLS", "OR_TOOLS"):
+                    raise RuntimeError(
+                        "scheduler_type=OR-Tools is not supported by the generic heuristic/PPO orchestrator path. "
+                        "Use run_dynamic_ortools_cadence.py for OR-Tools cadence scheduling, or set scheduler_type "
+                        "to PPO/SPT/MWKR/FIFO for this path."
+                    )
                 from common_utils import heuristic_select_action
                 act = heuristic_select_action(self.method, env)
             
@@ -366,8 +385,8 @@ class GlobalTimelineOrchestrator:
         jl, pt = self._build_batch(jobs_new); env = FJSPEnvForVariousOpNums(n_j=len(jobs_new), n_m=self.M)
         pt_scale = (float(configs.low) + float(configs.high)) / 2.0
         norm = _TimeNormalizer(self.t, pt_scale)
-        due_dates_ppo = [norm.f(float(j.meta.get("due_date", 0.0))) for j in jobs_new]
         due_dates_abs = [float(j.meta.get("due_date", 0.0)) for j in jobs_new]
+        due_dates_state_rel = [float(due - self.t) for due in due_dates_abs]
 
         self.last_batch_manifest = self._build_last_batch_manifest(
             jobs_new=jobs_new,
@@ -375,12 +394,12 @@ class GlobalTimelineOrchestrator:
             pt_scale=pt_scale,
             jl=jl,
             pt=pt,
-            due_dates_ppo=due_dates_ppo,
+            due_dates_state_abs=due_dates_state_rel,
             due_dates_abs=due_dates_abs,
             event_id=event_id,
         )
         
-        state = env.set_initial_data(jl, pt, due_date_list=[due_dates_ppo], normalize_due_date=False, true_due_date_list=[due_dates_abs])
+        state = env.set_initial_data(jl, pt, due_date_list=[due_dates_state_rel], true_due_date_list=[due_dates_abs])
         env.true_mch_free_time[0,:] = self.machine_free_time; env.mch_free_time[0,:] = norm.f(self.machine_free_time)
         for i, js_b in enumerate(jobs_new):
             r_abs = float(js_b.meta.get("ready_at", self.t))

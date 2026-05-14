@@ -4,10 +4,13 @@ import glob
 import json
 import os
 import sys
+import time
 from typing import Dict, List
 
 import numpy as np
+import torch
 
+from gantt import plot_global_gantt
 from global_env import GlobalTimelineOrchestrator, JobSpec, OperationSpec
 from params import configs
 
@@ -15,7 +18,7 @@ from params import configs
 def parse_args():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--instance_json", type=str, default=str(getattr(configs, "instance_json", "") or ""))
-    parser.add_argument("--output_dir", type=str, default=os.path.join("evaluation_results", "dynamic_ppo_cadence_export"))
+    parser.add_argument("--output_dir", type=str, default=str(getattr(configs, "plot_global_dir", "plots/global")))
     parser.add_argument("--name", type=str, default="")
     parser.add_argument("--cadence", type=int, default=int(getattr(configs, "gate_cadence", 1)))
     args, remaining = parser.parse_known_args()
@@ -164,13 +167,30 @@ def write_schedule_csv(path: str, rows: List[Dict]):
             )
 
 
-def main():
-    args = parse_args()
-    instance_json_path = resolve_instance_json_path(args.instance_json)
-    print(f"[INFO] Using instance_json: {instance_json_path}")
-    payload = load_payload(instance_json_path)
-    validate_unique_job_ids(payload)
+def _mean_std(values: List[float]):
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return 0.0, 0.0
+    return float(arr.mean()), float(arr.std(ddof=0))
 
+
+def make_unique_output_dir(base_dir: str, env_name: str) -> str:
+    base_path = os.path.join(base_dir, env_name)
+    if not os.path.exists(base_path):
+        return base_path
+    return f"{base_path}_{time.strftime('%Y%m%d_%H%M%S')}"
+
+
+def run_once(
+    args,
+    payload: Dict,
+    instance_json_path: str,
+    *,
+    run_idx: int,
+    sample_seed: int,
+    output_dir: str,
+    write_outputs: bool,
+) -> Dict:
     cadence = max(1, int(args.cadence))
     jobs_payload = sorted(payload.get("jobs", []), key=lambda x: int(x.get("job_id", 0)))
     init_jobs_payload = sorted(payload.get("init_jobs", []), key=lambda x: int(x.get("job_id", 0)))
@@ -180,6 +200,11 @@ def main():
     configs.n_m = int(n_m)
     configs.scheduler_type = "PPO"
     ensure_model_path()
+    configs._active_eval_env_seed = int(getattr(configs, "event_seed", 42))
+    configs._active_eval_sample_seed = int(sample_seed)
+    torch.manual_seed(int(sample_seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(sample_seed))
 
     batch_jobs_due_dates = {int(job.get("job_id", 0)): float(job.get("due_date", 0.0)) for job in jobs_payload}
 
@@ -188,10 +213,39 @@ def main():
     schedule_rows: List[Dict] = []
     manifest_rows: List[Dict] = []
     batch_summary_rows: List[Dict] = []
+    release_log_rows: List[Dict] = []
     release_count = 0
+    plot_seq = 0
+
+    def compute_rows_kpis(rows, due_dates: Dict[int, float]) -> Dict[str, float]:
+        job_finish: Dict[int, float] = {}
+        max_end = 0.0
+        for row in rows:
+            jid = int(row["job"])
+            end = float(row["end"])
+            job_finish[jid] = max(job_finish.get(jid, 0.0), end)
+            max_end = max(max_end, end)
+        total_td = sum(
+            max(0.0, float(job_finish.get(int(job_id), 0.0)) - float(due))
+            for job_id, due in due_dates.items()
+            if int(job_id) in job_finish
+        )
+        return {
+            "makespan": float(max_end),
+            "total_tardiness": float(total_td),
+            "objective_value": float(max_end + total_td),
+        }
+
+    def compute_global_kpis() -> Dict[str, float]:
+        rows = list(getattr(orch, "_global_rows", [])) + list(getattr(orch, "_last_full_rows", []))
+        info = compute_rows_kpis(rows, batch_jobs_due_dates)
+        if getattr(orch, "machine_free_time", None) is not None and len(orch.machine_free_time) > 0:
+            info["makespan"] = max(info["makespan"], float(np.max(orch.machine_free_time)))
+            info["objective_value"] = info["makespan"] + info["total_tardiness"]
+        return info
 
     def record_release(result: Dict, batch_label: str):
-        nonlocal release_count
+        nonlocal release_count, plot_seq
         manifest = getattr(orch, "last_batch_manifest", None)
         if not manifest:
             return
@@ -200,6 +254,24 @@ def main():
         manifest["batch_label"] = batch_label
         manifest["num_rows"] = int(len(result.get("rows", [])))
         manifest_rows.append(manifest)
+        rows = result.get("rows", [])
+        sub_info = compute_rows_kpis(rows, batch_jobs_due_dates)
+        global_info = compute_global_kpis()
+        release_log_rows.append(
+            {
+                "Event_ID": "" if manifest.get("event_id") is None else int(manifest.get("event_id")),
+                "Release_Type": str(batch_label).upper(),
+                "Release_Time": float(manifest.get("batch_time_abs", 0.0)),
+                "Objective_MK_Plus_TD": float(sub_info["objective_value"]),
+                "Makespan": float(sub_info["makespan"]),
+                "Total_Tardiness": float(sub_info["total_tardiness"]),
+                "Global_Objective_MK_Plus_TD": float(global_info["objective_value"]),
+                "Global_Makespan": float(global_info["makespan"]),
+                "Global_Total_Tardiness": float(global_info["total_tardiness"]),
+                "Num_Committed_Jobs": int(len(getattr(orch, "_committed_jobs", []))),
+                "Num_Rows": int(len(rows)),
+            }
+        )
         batch_summary_rows.append(
             {
                 "batch_label": batch_label,
@@ -236,6 +308,59 @@ def main():
                     "Tardiness": tardiness,
                 }
             )
+        if write_outputs:
+            os.makedirs(output_dir, exist_ok=True)
+            t_abs = float(manifest.get("batch_time_abs", 0.0))
+            label = "_INIT" if str(batch_label).lower() == "init" else ""
+            details_path = os.path.join(output_dir, f"details_r{release_count:03d}_t{int(t_abs):05d}{label}.csv")
+            detail_rows = []
+            for row in rows:
+                jid = int(row["job"])
+                op_id = int(row["op"])
+                due_date = float(batch_jobs_due_dates.get(jid, 0.0))
+                detail_rows.append(
+                    {
+                        "job": jid,
+                        "op": op_id,
+                        "machine": int(row["machine"]),
+                        "start": float(row["start"]),
+                        "end": float(row["end"]),
+                        "duration": float(row["duration"]),
+                        "arrive_time": float(next((job["t_arrive_abs"] for job in manifest.get("jobs", []) if int(job["job_id"]) == jid), 0.0)),
+                        "due_date": due_date,
+                        "tardiness": max(0.0, float(row["end"]) - due_date),
+                    }
+                )
+            with open(details_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["job", "op", "machine", "start", "end", "duration", "arrive_time", "due_date", "tardiness"],
+                )
+                writer.writeheader()
+                writer.writerows(detail_rows)
+
+            global_plot_rows = []
+            for grow in list(getattr(orch, "_global_rows", [])) + list(getattr(orch, "_last_full_rows", [])):
+                gid = int(grow["job"])
+                global_plot_rows.append(
+                    {
+                        "job": gid,
+                        "op": int(grow["op"]),
+                        "machine": int(grow["machine"]),
+                        "start": float(grow["start"]),
+                        "end": float(grow["end"]),
+                        "duration": float(grow["duration"]),
+                        "due_date": float(batch_jobs_due_dates.get(gid, 0.0)),
+                    }
+                )
+            gantt_name = f"global_r{plot_seq:03d}_t0.png" if plot_seq == 0 else f"global_r{plot_seq:03d}_t{int(t_abs):05d}.png"
+            plot_global_gantt(
+                global_plot_rows,
+                os.path.join(output_dir, gantt_name),
+                t_now=t_abs,
+                title=f"PPO Replay cad{cadence} {batch_label}",
+            )
+            plot_seq += 1
 
     init_jobs = [build_job_spec(job, n_m) for job in init_jobs_payload]
     if init_jobs:
@@ -273,49 +398,89 @@ def main():
     total_tardiness = float(final_stats["tardiness"])
     objective_value = 0.5 * makespan + 0.5 * total_tardiness
 
-    output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
-    base_name = args.name or f"ppo_cadence_{cadence:02d}_{os.path.splitext(os.path.basename(instance_json_path))[0]}"
+    stem = os.path.splitext(os.path.basename(instance_json_path))[0]
+    run_prefix = f"cad{cadence}"
+    base_name = f"{run_prefix}_run{run_idx + 1:02d}_s{sample_seed}"
     manifest_jsonl = os.path.join(output_dir, f"{base_name}_batch_manifests.jsonl")
     summary_csv = os.path.join(output_dir, f"{base_name}_batch_summary.csv")
     schedule_csv = os.path.join(output_dir, f"{base_name}_schedule.csv")
+    release_log_csv = os.path.join(output_dir, f"{run_prefix}_ppo_release_log.csv")
+    gantt_png = os.path.join(output_dir, "global_r000_t0.png")
     summary_json = os.path.join(output_dir, f"{base_name}_summary.json")
 
-    write_jsonl(manifest_jsonl, manifest_rows)
-    write_schedule_csv(schedule_csv, schedule_rows)
-    with open(summary_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "batch_label",
-                "event_id",
-                "batch_time_abs",
-                "n_jobs",
-                "n_ops",
-                "job_ids",
-                "due_dates_abs",
-                "due_dates_rel",
-            ],
-        )
-        writer.writeheader()
-        for row in batch_summary_rows:
-            writer.writerow(
-                {
-                    "batch_label": row["batch_label"],
-                    "event_id": "" if row["event_id"] is None else int(row["event_id"]),
-                    "batch_time_abs": f"{float(row['batch_time_abs']):.10f}",
-                    "n_jobs": int(row["n_jobs"]),
-                    "n_ops": int(row["n_ops"]),
-                    "job_ids": json.dumps(row["job_ids"], ensure_ascii=False),
-                    "due_dates_abs": json.dumps(row["due_dates_abs"], ensure_ascii=False),
-                    "due_dates_rel": json.dumps(row["due_dates_rel"], ensure_ascii=False),
-                }
+    if write_outputs:
+        os.makedirs(output_dir, exist_ok=True)
+        write_jsonl(manifest_jsonl, manifest_rows)
+        write_schedule_csv(schedule_csv, schedule_rows)
+        with open(release_log_csv, "w", newline="", encoding="utf-8-sig") as f:
+            fieldnames = [
+                "Event_ID",
+                "Release_Type",
+                "Release_Time",
+                "Objective_MK_Plus_TD",
+                "Makespan",
+                "Total_Tardiness",
+                "Global_Objective_MK_Plus_TD",
+                "Global_Makespan",
+                "Global_Total_Tardiness",
+                "Num_Committed_Jobs",
+                "Num_Rows",
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in release_log_rows:
+                writer.writerow(
+                    {
+                        "Event_ID": row["Event_ID"],
+                        "Release_Type": row["Release_Type"],
+                        "Release_Time": f"{float(row['Release_Time']):.4f}",
+                        "Objective_MK_Plus_TD": f"{float(row['Objective_MK_Plus_TD']):.4f}",
+                        "Makespan": f"{float(row['Makespan']):.4f}",
+                        "Total_Tardiness": f"{float(row['Total_Tardiness']):.4f}",
+                        "Global_Objective_MK_Plus_TD": f"{float(row['Global_Objective_MK_Plus_TD']):.4f}",
+                        "Global_Makespan": f"{float(row['Global_Makespan']):.4f}",
+                        "Global_Total_Tardiness": f"{float(row['Global_Total_Tardiness']):.4f}",
+                        "Num_Committed_Jobs": int(row["Num_Committed_Jobs"]),
+                        "Num_Rows": int(row["Num_Rows"]),
+                    }
+                )
+        with open(summary_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "batch_label",
+                    "event_id",
+                    "batch_time_abs",
+                    "n_jobs",
+                    "n_ops",
+                    "job_ids",
+                    "due_dates_abs",
+                    "due_dates_rel",
+                ],
             )
+            writer.writeheader()
+            for row in batch_summary_rows:
+                writer.writerow(
+                    {
+                        "batch_label": row["batch_label"],
+                        "event_id": "" if row["event_id"] is None else int(row["event_id"]),
+                        "batch_time_abs": f"{float(row['batch_time_abs']):.10f}",
+                        "n_jobs": int(row["n_jobs"]),
+                        "n_ops": int(row["n_ops"]),
+                        "job_ids": json.dumps(row["job_ids"], ensure_ascii=False),
+                        "due_dates_abs": json.dumps(row["due_dates_abs"], ensure_ascii=False),
+                        "due_dates_rel": json.dumps(row["due_dates_rel"], ensure_ascii=False),
+                    }
+                )
 
     summary = {
         "instance_json": instance_json_path,
         "solver": "low_level_ppo_cadence_export",
         "ppo_model_path": str(getattr(configs, "ppo_model_path", "")),
+        "ppo_model_name": os.path.splitext(os.path.basename(str(getattr(configs, "ppo_model_path", ""))))[0],
+        "run": int(run_idx + 1),
+        "sample_seed": int(sample_seed),
+        "eval_action_selection": str(getattr(configs, "eval_action_selection", "greedy")),
         "cadence": int(cadence),
         "num_jobs_total": int(len(jobs_payload)),
         "num_events": int(len(events_payload)),
@@ -325,20 +490,181 @@ def main():
         "total_tardiness": total_tardiness,
         "objective": "0.5*MK + 0.5*TD",
         "objective_value": objective_value,
-        "manifest_jsonl": manifest_jsonl,
-        "summary_csv": summary_csv,
-        "schedule_csv": schedule_csv,
+        "details_written": bool(write_outputs),
+        "manifest_jsonl": manifest_jsonl if write_outputs else "",
+        "summary_json": summary_json if write_outputs else "",
+        "summary_csv": summary_csv if write_outputs else "",
+        "schedule_csv": schedule_csv if write_outputs else "",
+        "release_log_csv": release_log_csv if write_outputs else "",
+        "gantt_png": gantt_png if write_outputs else "",
     }
-    with open(summary_json, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
+    if write_outputs:
+        with open(summary_json, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
 
     print(f"Instance JSON: {instance_json_path}")
-    print(f"Summary: {summary_json}")
-    print(f"Manifests: {manifest_jsonl}")
-    print(f"Schedule: {schedule_csv}")
+    if write_outputs:
+        print(f"Summary: {summary_json}")
+        print(f"Manifests: {manifest_jsonl}")
+        print(f"Schedule: {schedule_csv}")
+        print(f"Release log: {release_log_csv}")
+        print(f"Gantt: {gantt_png}")
     print(
-        f"Cadence={cadence} | Batches={len(manifest_rows)} | "
+        f"Run {run_idx + 1:02d} | sample_seed={sample_seed} | Cadence={cadence} | Batches={len(manifest_rows)} | "
         f"MK={makespan:.4f} | TD={total_tardiness:.4f}"
+    )
+    return summary
+
+
+def main():
+    args = parse_args()
+    instance_json_path = resolve_instance_json_path(args.instance_json)
+    print(f"[INFO] Using instance_json: {instance_json_path}")
+    payload = load_payload(instance_json_path)
+    validate_unique_job_ids(payload)
+
+    eval_runs = int(getattr(configs, "main_sample_runs", 1))
+    if eval_runs <= 0:
+        eval_runs = 1
+
+    cadence = max(1, int(args.cadence))
+    stem = os.path.splitext(os.path.basename(instance_json_path))[0]
+    run_name = args.name or f"ppo_cadence_{cadence:02d}_{stem}"
+    env_output_name = args.name or stem
+    output_dir = make_unique_output_dir(args.output_dir, env_output_name)
+    os.makedirs(output_dir, exist_ok=True)
+
+    base_seed = int(getattr(configs, "event_seed", 42))
+    run_rows = []
+    for run_idx in range(eval_runs):
+        sample_seed = base_seed + run_idx
+        write_outputs = bool(run_idx == eval_runs - 1)
+        summary = run_once(
+            args,
+            payload,
+            instance_json_path,
+            run_idx=run_idx,
+            sample_seed=sample_seed,
+            output_dir=output_dir,
+            write_outputs=write_outputs,
+        )
+        run_rows.append(summary)
+
+    mk_mean, mk_std = _mean_std([float(row["makespan"]) for row in run_rows])
+    td_mean, td_std = _mean_std([float(row["total_tardiness"]) for row in run_rows])
+    obj_mean, obj_std = _mean_std([float(row["objective_value"]) for row in run_rows])
+    rel_mean, rel_std = _mean_std([float(row["num_batches_recorded"]) for row in run_rows])
+
+    sample_csv_path = os.path.join(output_dir, "sample_runs_summary.csv")
+    with open(sample_csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        fieldnames = [
+            "run",
+            "ppo_model_name",
+            "ppo_model_path",
+            "instance_json",
+            "sample_seed",
+            "eval_action_selection",
+            "cadence",
+            "makespan",
+            "total_tardiness",
+            "obj",
+            "release_count",
+            "summary_json",
+            "schedule_csv",
+            "batch_summary_csv",
+            "manifest_jsonl",
+            "release_log_csv",
+            "gantt_png",
+            "details_written",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in run_rows:
+            writer.writerow(
+                {
+                    "run": int(row["run"]),
+                    "ppo_model_name": row["ppo_model_name"],
+                    "ppo_model_path": row["ppo_model_path"],
+                    "instance_json": row["instance_json"],
+                    "sample_seed": int(row["sample_seed"]),
+                    "eval_action_selection": row["eval_action_selection"],
+                    "cadence": int(row["cadence"]),
+                    "makespan": f"{float(row['makespan']):.6f}",
+                    "total_tardiness": f"{float(row['total_tardiness']):.6f}",
+                    "obj": f"{float(row['objective_value']):.6f}",
+                    "release_count": int(row["num_batches_recorded"]),
+                    "summary_json": row["summary_json"],
+                    "schedule_csv": row["schedule_csv"],
+                    "batch_summary_csv": row["summary_csv"],
+                    "manifest_jsonl": row["manifest_jsonl"],
+                    "release_log_csv": row["release_log_csv"],
+                    "gantt_png": row["gantt_png"],
+                    "details_written": int(bool(row["details_written"])),
+                }
+            )
+        common = {
+            "run": "MEAN",
+            "ppo_model_name": run_rows[0]["ppo_model_name"] if run_rows else "",
+            "ppo_model_path": run_rows[0]["ppo_model_path"] if run_rows else "",
+            "instance_json": instance_json_path,
+            "sample_seed": "",
+            "eval_action_selection": str(getattr(configs, "eval_action_selection", "greedy")),
+            "cadence": int(cadence),
+            "summary_json": "",
+            "schedule_csv": "",
+            "batch_summary_csv": "",
+            "manifest_jsonl": "",
+            "release_log_csv": "",
+            "gantt_png": "",
+            "details_written": "",
+        }
+        writer.writerow({
+            **common,
+            "makespan": f"{mk_mean:.6f}",
+            "total_tardiness": f"{td_mean:.6f}",
+            "obj": f"{obj_mean:.6f}",
+            "release_count": f"{rel_mean:.6f}",
+        })
+        writer.writerow({
+            **common,
+            "run": "STD",
+            "makespan": f"{mk_std:.6f}",
+            "total_tardiness": f"{td_std:.6f}",
+            "obj": f"{obj_std:.6f}",
+            "release_count": f"{rel_std:.6f}",
+        })
+
+    aggregate_json = os.path.join(output_dir, "aggregate_summary.json")
+    with open(aggregate_json, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "instance_json": instance_json_path,
+                "solver": "low_level_ppo_cadence_export",
+                "ppo_model_path": str(getattr(configs, "ppo_model_path", "")),
+                "ppo_model_name": os.path.splitext(os.path.basename(str(getattr(configs, "ppo_model_path", ""))))[0],
+                "eval_runs": int(eval_runs),
+                "eval_action_selection": str(getattr(configs, "eval_action_selection", "greedy")),
+                "cadence": int(cadence),
+                "makespan_mean": mk_mean,
+                "makespan_std": mk_std,
+                "total_tardiness_mean": td_mean,
+                "total_tardiness_std": td_std,
+                "objective_mean": obj_mean,
+                "objective_std": obj_std,
+                "release_count_mean": rel_mean,
+                "release_count_std": rel_std,
+                "sample_runs_summary_csv": sample_csv_path,
+            },
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    print(f"Sample run CSV: {sample_csv_path}")
+    print(f"Aggregate summary: {aggregate_json}")
+    print(
+        f"Sample runs={eval_runs} | MK mean/std={mk_mean:.3f}/{mk_std:.3f} | "
+        f"TD mean/std={td_mean:.3f}/{td_std:.3f} | Obj mean/std={obj_mean:.3f}/{obj_std:.3f}"
     )
 
 

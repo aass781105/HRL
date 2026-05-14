@@ -22,18 +22,46 @@ from dynamic_job_stream import create_dynamic_world, register_initial_jobs, samp
 
 # -----------------------------------------------------------------------------
 
-def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float, burst_K: int = 1, plot_global_dir: Optional[str] = None):
+def _mean_std(values: List[float]):
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return 0.0, 0.0
+    return float(arr.mean()), float(arr.std(ddof=0))
+
+
+def run_event_driven_until_nevents(
+    *,
+    max_events: int,
+    interarrival_mean: float,
+    burst_K: int = 1,
+    plot_global_dir: Optional[str] = None,
+    write_outputs: bool = True,
+    seed_override: Optional[int] = None,
+    sample_seed_override: Optional[int] = None,
+    aggregate_prior: Optional[Dict[str, List[float]]] = None,
+):
     # [FAST MODE] Skip heavy I/O tasks if enabled
-    FAST_MODE = getattr(configs, "fast_mode", True)
+    FAST_MODE = getattr(configs, "fast_mode", True) or (not write_outputs)
     all_sim_job_stats = [] # Store {due_date, slack}
 
-    seed = int(getattr(configs, "event_seed", 42))
+    seed = int(getattr(configs, "event_seed", 42) if seed_override is None else seed_override)
+    sample_seed = int(seed if sample_seed_override is None else sample_seed_override)
+    configs._active_eval_env_seed = seed
+    configs._active_eval_sample_seed = sample_seed
+    torch.manual_seed(sample_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(sample_seed)
     rng, gen, orch = create_dynamic_world(
         configs,
         interarrival_mean=float(interarrival_mean),
         burst_k=int(burst_K),
         seed=seed,
     )
+    # create_dynamic_world seeds torch with env_seed for reproducible instances.
+    # Reset torch afterwards so policy sampling can vary independently per run.
+    torch.manual_seed(sample_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(sample_seed)
     
     gate_policy = str(getattr(configs, "gate_policy", "ppo")).lower()
     is_ppo = (gate_policy == "ppo")
@@ -155,14 +183,26 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
     if override_name:
         safe_name = override_name
     safe_name = safe_name.replace(" ", "_")[:48]
-    run_dir_name = f"{timestamp}_{safe_name}"
-    csv_dir = os.path.join(base_plot_dir, run_dir_name)
-    os.makedirs(csv_dir, exist_ok=True)
+    event_seed = seed
+    csv_dir = None
+    raw_csv_file = None
+    raw_csv_writer = None
+    obs_csv_file = None
+    obs_csv_writer = None
+    release_csv_file = None
+    release_csv_writer = None
+    if write_outputs:
+        run_dir_name = f"{timestamp}_{safe_name}_seed{event_seed:03d}"
+        csv_dir = os.path.join(base_plot_dir, run_dir_name)
+        os.makedirs(csv_dir, exist_ok=True)
     csv_prefix = safe_name
-    raw_csv_file = open(os.path.join(csv_dir, f"{csv_prefix}_raw_state.csv"), "w", newline="", encoding="utf-8")
-    raw_csv_writer = csv.writer(raw_csv_file)
-    obs_csv_file = open(os.path.join(csv_dir, f"{csv_prefix}_agent_state.csv"), "w", newline="", encoding="utf-8")
-    obs_csv_writer = csv.writer(obs_csv_file)
+    if write_outputs:
+        raw_csv_file = open(os.path.join(csv_dir, f"{csv_prefix}_raw_state.csv"), "w", newline="", encoding="utf-8")
+        raw_csv_writer = csv.writer(raw_csv_file)
+        obs_csv_file = open(os.path.join(csv_dir, f"{csv_prefix}_agent_state.csv"), "w", newline="", encoding="utf-8")
+        obs_csv_writer = csv.writer(obs_csv_file)
+        release_csv_file = open(os.path.join(csv_dir, f"{csv_prefix}_ppo_release_log.csv"), "w", newline="", encoding="utf-8")
+        release_csv_writer = csv.writer(release_csv_file)
 
     raw_headers = [
         "Event_ID", "Time", "Inter_Arrival", "Action", "Action_Str",
@@ -177,6 +217,9 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
         "Reward_Total", "Reward_Stab", "Reward_Buffer", "Reward_Shaping", "Reward_Terminal", "Reward_Flush",
         "Phi_Before", "Phi_After", "Agent_Final_TD", "TD_Gap_vs_Baseline_Cadence",
         "Final_Makespan", "Final_Tardiness", "Release_Count",
+        "Eval_Runs", "Makespan_Mean", "Makespan_Std",
+        "Tardiness_Mean", "Tardiness_Std", "Obj_Mean", "Obj_Std",
+        "Release_Count_Mean", "Release_Count_Std",
     ]
     obs_headers = [
         "Event_ID", "Time", "Inter_Arrival", "Action", "Action_Str",
@@ -193,10 +236,27 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
         "Reward_Total", "Reward_Stab", "Reward_Buffer", "Reward_Shaping", "Reward_Terminal", "Reward_Flush",
         "Phi_Before", "Phi_After", "Agent_Final_TD", "TD_Gap_vs_Baseline_Cadence",
         "Final_Makespan", "Final_Tardiness", "Release_Count",
+        "Eval_Runs", "Makespan_Mean", "Makespan_Std",
+        "Tardiness_Mean", "Tardiness_Std", "Obj_Mean", "Obj_Std",
+        "Release_Count_Mean", "Release_Count_Std",
     ]
     obs_csv_order = [0, 1, 2, 15, 10, 3, 17, 4, 5, 6, 12, 14, 9, 7, 8, 13, 11, 16, 18, 19, 20, 21]
-    raw_csv_writer.writerow(raw_headers)
-    obs_csv_writer.writerow(obs_headers)
+    if write_outputs:
+        raw_csv_writer.writerow(raw_headers)
+        obs_csv_writer.writerow(obs_headers)
+        release_csv_writer.writerow([
+            "Event_ID",
+            "Release_Type",
+            "Release_Time",
+            "Objective_MK_Plus_TD",
+            "Makespan",
+            "Total_Tardiness",
+            "Global_Objective_MK_Plus_TD",
+            "Global_Makespan",
+            "Global_Total_Tardiness",
+            "Num_Committed_Jobs",
+            "Num_Rows",
+        ])
 
     release_count, plot_seq = 0, 0
     total_cumulative_reward = 0.0
@@ -332,9 +392,56 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
             for r in (orch._global_rows + orch._last_full_rows)
         ]
 
+    def compute_rows_kpis(rows, due_dates: Dict[int, float]) -> Dict[str, float]:
+        job_finish: Dict[int, float] = {}
+        max_end = 0.0
+        for row in rows:
+            jid = int(row["job"])
+            end = float(row["end"])
+            job_finish[jid] = max(job_finish.get(jid, 0.0), end)
+            max_end = max(max_end, end)
+        total_td = sum(
+            max(0.0, float(job_finish.get(int(job_id), 0.0)) - float(due))
+            for job_id, due in due_dates.items()
+            if int(job_id) in job_finish
+        )
+        return {
+            "makespan": float(max_end),
+            "total_tardiness": float(total_td),
+            "objective_value": float(max_end + total_td),
+        }
+
+    def compute_global_kpis() -> Dict[str, float]:
+        rows = list(orch._global_rows) + list(orch._last_full_rows)
+        info = compute_rows_kpis(rows, all_job_due_dates)
+        if getattr(orch, "machine_free_time", None) is not None and len(orch.machine_free_time) > 0:
+            info["makespan"] = max(info["makespan"], float(np.max(orch.machine_free_time)))
+            info["objective_value"] = info["makespan"] + info["total_tardiness"]
+        return info
+
+    def write_release_log(event_id: int, release_type: str, release_time: float, rows) -> None:
+        if not write_outputs:
+            return
+        sub_info = compute_rows_kpis(rows, all_job_due_dates)
+        global_info = compute_global_kpis()
+        release_csv_writer.writerow([
+            int(event_id),
+            str(release_type),
+            f"{float(release_time):.4f}",
+            f"{sub_info['objective_value']:.4f}",
+            f"{sub_info['makespan']:.4f}",
+            f"{sub_info['total_tardiness']:.4f}",
+            f"{global_info['objective_value']:.4f}",
+            f"{global_info['makespan']:.4f}",
+            f"{global_info['total_tardiness']:.4f}",
+            len(getattr(orch, "_committed_jobs", [])),
+            len(rows),
+        ])
+
     init_jobs = sample_initial_jobs(configs, rng=rng, base_job_id=0, t_arrive=0.0)
     if init_jobs:
         release_count += register_initial_jobs(orch, gen, init_jobs, all_job_due_dates, t0=0.0)
+        write_release_log(0, "INIT", 0.0, getattr(orch, "last_batch_rows", []))
         collect_subproblem_stats(orch._committed_jobs, 0.0) # [STATS: INITIAL SUBPROBLEM]
         raw_s0 = get_raw_state_info(orch, 0.0)
         if not FAST_MODE:
@@ -404,8 +511,9 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
 
         actual_td_logged = 0.0
         if act == 1:
-            orch.event_release_and_reschedule(t_now)
+            release_result = orch.event_release_and_reschedule(t_now)
             release_count += 1
+            write_release_log(int(stats["arrive"]), "EVENT", t_now, release_result.get("rows", getattr(orch, "last_batch_rows", [])))
             steps_since_last_release = 0
             collect_subproblem_stats(orch._committed_jobs, t_now) # [STATS: DYNAMIC SUBPROBLEM]
             actual_td_after = orch.get_total_tardiness_estimate(all_job_due_dates)
@@ -457,8 +565,9 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
         done = bool(stats["arrive"] >= int(max_events))
         if done:
             while len(orch.buffer) > 0:
-                orch.event_release_and_reschedule(t_next_future)
+                flush_result = orch.event_release_and_reschedule(t_next_future)
                 release_count += 1
+                write_release_log(int(max_events) + 1, "FLUSH", t_next_future, flush_result.get("rows", getattr(orch, "last_batch_rows", [])))
                 collect_subproblem_stats(orch._committed_jobs, t_next_future)
                 if not FAST_MODE:
                     save_details(orch, plot_seq+1, t_next_future, "_FLUSH")
@@ -543,6 +652,27 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
 
     final_stats = orch.get_final_kpi_stats(all_job_due_dates)
     total_td, final_mk = float(final_stats["tardiness"]), float(final_stats["makespan"])
+    prior_mk = list((aggregate_prior or {}).get("makespan", []))
+    prior_td = list((aggregate_prior or {}).get("tardiness", []))
+    prior_release = list((aggregate_prior or {}).get("release_count", []))
+    all_mk = prior_mk + [final_mk]
+    all_td = prior_td + [total_td]
+    all_obj = [0.5 * mk + 0.5 * td for mk, td in zip(all_mk, all_td)]
+    mk_mean, mk_std = _mean_std(all_mk)
+    td_mean, td_std = _mean_std(all_td)
+    obj_mean, obj_std = _mean_std(all_obj)
+    release_mean, release_std = _mean_std(prior_release + [float(release_count)])
+    aggregate_tail = [
+        len(prior_mk) + 1,
+        f"{mk_mean:.2f}",
+        f"{mk_std:.2f}",
+        f"{td_mean:.2f}",
+        f"{td_std:.2f}",
+        f"{obj_mean:.2f}",
+        f"{obj_std:.2f}",
+        f"{release_mean:.2f}",
+        f"{release_std:.2f}",
+    ]
     total_stab_penalty = compute_total_stability_penalty(release_count)
     if stability_mode in ("immediate_all_terminal", "free_threshold_terminal", "free_threshold_distributed") and abs(total_stab_penalty) > 1e-12:
         if stability_mode in ("immediate_all_terminal", "free_threshold_terminal") and len(pending_raw_rows) > 0:
@@ -561,26 +691,36 @@ def run_event_driven_until_nevents(*, max_events: int, interarrival_mean: float,
                     rows[idx][-12] = f"{reward_stab:.4f}"
     for row in pending_raw_rows:
         total_cumulative_reward += float(row[-13])
-        raw_csv_writer.writerow(row)
-    for row in pending_obs_rows:
-        obs_csv_writer.writerow(row)
+        if write_outputs:
+            raw_csv_writer.writerow(row + [""] * 9)
+    if write_outputs:
+        for row in pending_obs_rows:
+            obs_csv_writer.writerow(row + [""] * 9)
     
     # [DISABLED] Skip summary boxplots
     # plot_simulation_summary_stats(all_sim_job_stats, csv_dir)
 
-    raw_summary = ["END", f"{t_now:.2f}", "", "", "SUMMARY"] + [""] * 18 + [
-        f"{total_td:.2f}", f"{total_cumulative_reward:.4f}", "", "", "", "", "",
-        "", "", "", f"{final_mk:.2f}", f"{total_td:.2f}", release_count
+    summary_common_tail = [
+        "", "", "", "", "", "", "",
+        f"{total_td:.2f}",
+        f"{total_cumulative_reward:.4f}",
+        "", "", "", "", "",
+        "", "",
+        f"{total_td:.2f}",
+        "",
+        f"{final_mk:.2f}",
+        f"{total_td:.2f}",
+        release_count,
     ]
-    obs_summary = ["END", f"{t_now:.2f}", "", "", "SUMMARY"] + [""] * 18 + [
-        f"{total_td:.2f}", f"{total_cumulative_reward:.4f}", "", "", "", "", "",
-        "", "", "", f"{final_mk:.2f}", f"{total_td:.2f}", release_count
-    ]
-    raw_csv_writer.writerow(raw_summary)
-    obs_csv_writer.writerow(obs_summary)
-    raw_csv_file.close()
-    obs_csv_file.close()
-    return final_mk, {"release_count": release_count, "total_tardiness": total_td}
+    raw_summary = ["END", f"{t_now:.2f}", "", "", "SUMMARY"] + [""] * 19 + summary_common_tail + aggregate_tail
+    obs_summary = ["END", f"{t_now:.2f}", "", "", "SUMMARY"] + [""] * 22 + summary_common_tail + aggregate_tail
+    if write_outputs:
+        raw_csv_writer.writerow(raw_summary)
+        obs_csv_writer.writerow(obs_summary)
+        raw_csv_file.close()
+        obs_csv_file.close()
+        release_csv_file.close()
+    return final_mk, {"release_count": release_count, "total_tardiness": total_td, "output_dir": csv_dir}
 
 def main():
     os.environ["CUDA_VISIBLE_DEVICES"] = str(getattr(configs, "device_id", ""))
@@ -588,13 +728,124 @@ def main():
     
     # [FIXED] Dynamic output naming based on actual policy
     plot_dir = getattr(configs, "plot_global_dir", "plots/global")
-    
-    mk, stats = run_event_driven_until_nevents(
-        max_events=int(configs.event_horizon), 
-        interarrival_mean=configs.interarrival_mean, 
-        burst_K=configs.burst_size, 
-        plot_global_dir=plot_dir
+    main_sample_runs = int(getattr(configs, "main_sample_runs", -1))
+    eval_runs = main_sample_runs if main_sample_runs > 0 else int(getattr(configs, "eval_runs_per_instance", 10))
+    eval_runs = max(1, eval_runs)
+    base_seed = int(getattr(configs, "event_seed", 42))
+    ppo_model_path = str(getattr(configs, "ppo_model_path", "") or "")
+    ppo_model_name = os.path.splitext(os.path.basename(ppo_model_path))[0] if ppo_model_path else ""
+    previous_action_selection = str(getattr(configs, "eval_action_selection", "greedy"))
+    configs.eval_action_selection = "sample"
+
+    makespans: List[float] = []
+    tardiness_values: List[float] = []
+    release_counts: List[float] = []
+    run_records = []
+    output_dir = None
+
+    try:
+        for run_idx in range(eval_runs):
+            sample_seed = base_seed + run_idx
+            write_outputs = (run_idx == eval_runs - 1)
+            aggregate_prior = {
+                "makespan": makespans,
+                "tardiness": tardiness_values,
+                "release_count": release_counts,
+            }
+            mk, stats = run_event_driven_until_nevents(
+                max_events=int(configs.event_horizon),
+                interarrival_mean=configs.interarrival_mean,
+                burst_K=configs.burst_size,
+                plot_global_dir=plot_dir,
+                write_outputs=write_outputs,
+                seed_override=base_seed,
+                sample_seed_override=sample_seed,
+                aggregate_prior=aggregate_prior,
+            )
+            makespans.append(float(mk))
+            tardiness_values.append(float(stats["total_tardiness"]))
+            release_counts.append(float(stats["release_count"]))
+            obj = 0.5 * float(mk) + 0.5 * float(stats["total_tardiness"])
+            run_records.append({
+                "run": run_idx + 1,
+                "ppo_model_name": ppo_model_name,
+                "ppo_model_path": ppo_model_path,
+                "env_seed": base_seed,
+                "sample_seed": sample_seed,
+                "makespan": float(mk),
+                "total_tardiness": float(stats["total_tardiness"]),
+                "obj": obj,
+                "release_count": int(stats["release_count"]),
+            })
+            if stats.get("output_dir"):
+                output_dir = stats["output_dir"]
+            print(
+                f"Run {run_idx + 1:02d}/{eval_runs} env_seed={base_seed} sample_seed={sample_seed} | "
+                f"MK={float(mk):.3f}, TD={float(stats['total_tardiness']):.3f}, "
+                f"Releases={int(stats['release_count'])}"
+            )
+    finally:
+        configs.eval_action_selection = previous_action_selection
+
+    mk_mean, mk_std = _mean_std(makespans)
+    td_mean, td_std = _mean_std(tardiness_values)
+    obj_values = [0.5 * mk + 0.5 * td for mk, td in zip(makespans, tardiness_values)]
+    obj_mean, obj_std = _mean_std(obj_values)
+    release_mean, release_std = _mean_std(release_counts)
+    if output_dir is None:
+        output_dir = plot_dir
+        os.makedirs(output_dir, exist_ok=True)
+    sample_csv_path = os.path.join(output_dir, "sample_runs_summary.csv")
+    with open(sample_csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "run", "ppo_model_name", "ppo_model_path", "env_seed", "sample_seed",
+                "makespan", "total_tardiness", "obj", "release_count"
+            ],
+        )
+        writer.writeheader()
+        for row in run_records:
+            writer.writerow({
+                "run": row["run"],
+                "ppo_model_name": row["ppo_model_name"],
+                "ppo_model_path": row["ppo_model_path"],
+                "env_seed": row["env_seed"],
+                "sample_seed": row["sample_seed"],
+                "makespan": f"{row['makespan']:.6f}",
+                "total_tardiness": f"{row['total_tardiness']:.6f}",
+                "obj": f"{row['obj']:.6f}",
+                "release_count": row["release_count"],
+            })
+        writer.writerow({
+            "run": "mean",
+            "ppo_model_name": ppo_model_name,
+            "ppo_model_path": ppo_model_path,
+            "env_seed": base_seed,
+            "sample_seed": "",
+            "makespan": f"{mk_mean:.6f}",
+            "total_tardiness": f"{td_mean:.6f}",
+            "obj": f"{obj_mean:.6f}",
+            "release_count": f"{release_mean:.6f}",
+        })
+        writer.writerow({
+            "run": "std",
+            "ppo_model_name": ppo_model_name,
+            "ppo_model_path": ppo_model_path,
+            "env_seed": base_seed,
+            "sample_seed": "",
+            "makespan": f"{mk_std:.6f}",
+            "total_tardiness": f"{td_std:.6f}",
+            "obj": f"{obj_std:.6f}",
+            "release_count": f"{release_std:.6f}",
+        })
+    print(
+        f"\nSample x{eval_runs} | "
+        f"MK mean/std: {mk_mean:.3f}/{mk_std:.3f}, "
+        f"TD mean/std: {td_mean:.3f}/{td_std:.3f}, "
+        f"Obj mean/std: {obj_mean:.3f}/{obj_std:.3f}, "
+        f"Releases mean/std: {release_mean:.3f}/{release_std:.3f}"
     )
-    print(f"\nMakespan: {mk:.3f}, Tardiness: {stats['total_tardiness']:.3f}, Releases: {stats['release_count']}")
+    print(f"Sample run CSV: {sample_csv_path}")
 
 if __name__ == "__main__": main()

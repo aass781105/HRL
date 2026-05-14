@@ -1,0 +1,15 @@
+{
+  "policy": "ORTCadence_3",
+  "event_seed": 44,
+  "gate_cadence": 3,
+  "event_horizon": 20,
+  "init_jobs": 5,
+  "release_count": 8,
+  "makespan": 854.0,
+  "total_tardiness": 18.735667783826187,
+  "subproblem_time_limit": 7200.0,
+  "total_solve_time_budget": 0.0,
+  "remaining_solve_time_budget": 0.0,
+  "time_scale": 1,
+  "output_dir": "plots/global\\20260423_195643_ortcad3"
+}

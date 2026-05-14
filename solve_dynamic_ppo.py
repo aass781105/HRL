@@ -206,14 +206,11 @@ def main():
     ppo.policy.eval()
 
     env = FJSPEnvForVariousOpNums(n_j=n_j, n_m=n_m)
-    pt_scale = (float(configs.low) + float(configs.high)) / 2.0
-    due_dates_ppo = due_dates_abs / pt_scale
 
     state = env.set_initial_data(
         job_length_list=[jl],
         op_pt_list=[pt],
-        due_date_list=[due_dates_ppo],
-        normalize_due_date=False,
+        due_date_list=[due_dates_abs],
         true_due_date_list=[due_dates_abs],
         release_time_list=[release_times],
     )
