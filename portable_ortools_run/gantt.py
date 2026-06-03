@@ -91,12 +91,21 @@ def plot_global_gantt(global_rows: List[Dict], save_path: str, *,
         ax.set_yticks(range(len(machines))); ax.set_yticklabels([f"M{m}" for m in machines])
         _plot_rows(ax, global_rows, machines_order=machines, alpha=0.85, linestyle="-", edge="none", lw=0.0, highlight_op=4)
 
+        has_phase_info = any("phase" in r for r in global_rows)
+        active_due_jobs = {
+            int(r["job"])
+            for r in global_rows
+            if str(r.get("phase", "")).lower() == "newplan"
+        }
         due_dates = {}
         for r in global_rows:
             if "due_date" not in r:
                 continue
+            job_id = int(r["job"])
+            if has_phase_info and job_id not in active_due_jobs:
+                continue
             try:
-                due_dates[int(r["job"])] = float(r["due_date"])
+                due_dates[job_id] = float(r["due_date"])
             except Exception:
                 continue
 

@@ -113,6 +113,13 @@ def build_job_spec(job_payload: Dict, n_m: int) -> JobSpec:
     return JobSpec(job_id=int(job_payload.get("job_id", 0)), operations=operations, meta=meta)
 
 
+def get_payload_arrive_time(payload: Dict, job_id: int) -> float:
+    for job in payload.get("jobs", []) or []:
+        if int(job.get("job_id", -1)) == int(job_id):
+            return float(job.get("arrive_time", job.get("t_arrive_abs", 0.0)))
+    return 0.0
+
+
 def ensure_model_path() -> str:
     model_path = str(getattr(configs, "ppo_model_path", "") or "").strip()
     if not model_path:
@@ -214,6 +221,7 @@ def run_once(
     manifest_rows: List[Dict] = []
     batch_summary_rows: List[Dict] = []
     release_log_rows: List[Dict] = []
+    previous_release_job_ids = set()
     release_count = 0
     plot_seq = 0
 
@@ -233,7 +241,7 @@ def run_once(
         return {
             "makespan": float(max_end),
             "total_tardiness": float(total_td),
-            "objective_value": float(max_end + total_td),
+            "objective_value": float(0.5 * max_end + 0.5 * total_td),
         }
 
     def compute_global_kpis() -> Dict[str, float]:
@@ -241,11 +249,11 @@ def run_once(
         info = compute_rows_kpis(rows, batch_jobs_due_dates)
         if getattr(orch, "machine_free_time", None) is not None and len(orch.machine_free_time) > 0:
             info["makespan"] = max(info["makespan"], float(np.max(orch.machine_free_time)))
-            info["objective_value"] = info["makespan"] + info["total_tardiness"]
+            info["objective_value"] = 0.5 * info["makespan"] + 0.5 * info["total_tardiness"]
         return info
 
     def record_release(result: Dict, batch_label: str):
-        nonlocal release_count, plot_seq
+        nonlocal release_count, plot_seq, previous_release_job_ids
         manifest = getattr(orch, "last_batch_manifest", None)
         if not manifest:
             return
@@ -255,6 +263,8 @@ def run_once(
         manifest["num_rows"] = int(len(result.get("rows", [])))
         manifest_rows.append(manifest)
         rows = result.get("rows", [])
+        current_job_ids = {int(row["job"]) for row in rows}
+        repeated_job_ids = sorted(current_job_ids & previous_release_job_ids)
         sub_info = compute_rows_kpis(rows, batch_jobs_due_dates)
         global_info = compute_global_kpis()
         release_log_rows.append(
@@ -262,16 +272,20 @@ def run_once(
                 "Event_ID": "" if manifest.get("event_id") is None else int(manifest.get("event_id")),
                 "Release_Type": str(batch_label).upper(),
                 "Release_Time": float(manifest.get("batch_time_abs", 0.0)),
-                "Objective_MK_Plus_TD": float(sub_info["objective_value"]),
+                "Objective_0p5MK_0p5TD": float(sub_info["objective_value"]),
                 "Makespan": float(sub_info["makespan"]),
                 "Total_Tardiness": float(sub_info["total_tardiness"]),
-                "Global_Objective_MK_Plus_TD": float(global_info["objective_value"]),
+                "Global_Objective_0p5MK_0p5TD": float(global_info["objective_value"]),
                 "Global_Makespan": float(global_info["makespan"]),
                 "Global_Total_Tardiness": float(global_info["total_tardiness"]),
                 "Num_Committed_Jobs": int(len(getattr(orch, "_committed_jobs", []))),
                 "Num_Rows": int(len(rows)),
+                "Subproblem_Job_Count": int(len(current_job_ids)),
+                "Repeated_Job_Count": int(len(repeated_job_ids)),
+                "Repeated_Job_IDs": ";".join(str(job_id) for job_id in repeated_job_ids),
             }
         )
+        previous_release_job_ids = current_job_ids
         batch_summary_rows.append(
             {
                 "batch_label": batch_label,
@@ -302,7 +316,7 @@ def run_once(
                     "Start": float(row["start"]),
                     "End": float(row["end"]),
                     "Duration": float(row["duration"]),
-                    "Arrive_Time": float(next((job["t_arrive_abs"] for job in manifest.get("jobs", []) if int(job["job_id"]) == job_id), 0.0)),
+                    "Arrive_Time": float(next((job.get("arrive_time", job.get("t_arrive_abs", 0.0)) for job in manifest.get("jobs", []) if int(job["job_id"]) == job_id), 0.0)),
                     "Due_Date": due_date,
                     "Is_Last_Op": is_last_op,
                     "Tardiness": tardiness,
@@ -313,11 +327,39 @@ def run_once(
             t_abs = float(manifest.get("batch_time_abs", 0.0))
             label = "_INIT" if str(batch_label).lower() == "init" else ""
             details_path = os.path.join(output_dir, f"details_r{release_count:03d}_t{int(t_abs):05d}{label}.csv")
+            unique_rows = {}
+
+            def row_status(row):
+                return "History" if float(row["start"]) < t_abs else "NewPlan"
+
+            def should_replace(existing, new_row):
+                if existing is None:
+                    return True
+                _, existing_status = existing
+                new_status = row_status(new_row)
+                if existing_status == "History" and new_status == "NewPlan":
+                    return False
+                if existing_status == "NewPlan" and new_status == "History":
+                    return True
+                return True
+
+            for row in list(getattr(orch, "_global_rows", [])):
+                key = (int(row["job"]), int(row["op"]))
+                if should_replace(unique_rows.get(key), row):
+                    unique_rows[key] = (dict(row), row_status(row))
+            for row in list(getattr(orch, "_last_full_rows", [])):
+                key = (int(row["job"]), int(row["op"]))
+                if should_replace(unique_rows.get(key), row):
+                    unique_rows[key] = (dict(row), row_status(row))
+
+            job_max_op = {}
+            for jid, op_id in unique_rows.keys():
+                job_max_op[jid] = max(job_max_op.get(jid, -1), op_id)
+
             detail_rows = []
-            for row in rows:
-                jid = int(row["job"])
-                op_id = int(row["op"])
+            for (jid, op_id), (row, status) in sorted(unique_rows.items()):
                 due_date = float(batch_jobs_due_dates.get(jid, 0.0))
+                is_last_op = bool(op_id == job_max_op[jid])
                 detail_rows.append(
                     {
                         "job": jid,
@@ -326,15 +368,16 @@ def run_once(
                         "start": float(row["start"]),
                         "end": float(row["end"]),
                         "duration": float(row["duration"]),
-                        "arrive_time": float(next((job["t_arrive_abs"] for job in manifest.get("jobs", []) if int(job["job_id"]) == jid), 0.0)),
+                        "arrive_time": get_payload_arrive_time(payload, jid),
+                        "status": status,
                         "due_date": due_date,
-                        "tardiness": max(0.0, float(row["end"]) - due_date),
+                        "tardiness": max(0.0, float(row["end"]) - due_date) if is_last_op else 0.0,
                     }
                 )
             with open(details_path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.DictWriter(
                     f,
-                    fieldnames=["job", "op", "machine", "start", "end", "duration", "arrive_time", "due_date", "tardiness"],
+                    fieldnames=["job", "op", "machine", "start", "end", "duration", "arrive_time", "status", "due_date", "tardiness"],
                 )
                 writer.writeheader()
                 writer.writerows(detail_rows)
@@ -350,6 +393,7 @@ def run_once(
                         "start": float(grow["start"]),
                         "end": float(grow["end"]),
                         "duration": float(grow["duration"]),
+                        "phase": "history" if float(grow["start"]) < t_abs else "newplan",
                         "due_date": float(batch_jobs_due_dates.get(gid, 0.0)),
                     }
                 )
@@ -417,14 +461,17 @@ def run_once(
                 "Event_ID",
                 "Release_Type",
                 "Release_Time",
-                "Objective_MK_Plus_TD",
+                "Objective_0p5MK_0p5TD",
                 "Makespan",
                 "Total_Tardiness",
-                "Global_Objective_MK_Plus_TD",
+                "Global_Objective_0p5MK_0p5TD",
                 "Global_Makespan",
                 "Global_Total_Tardiness",
                 "Num_Committed_Jobs",
                 "Num_Rows",
+                "Subproblem_Job_Count",
+                "Repeated_Job_Count",
+                "Repeated_Job_IDs",
             ]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -434,14 +481,17 @@ def run_once(
                         "Event_ID": row["Event_ID"],
                         "Release_Type": row["Release_Type"],
                         "Release_Time": f"{float(row['Release_Time']):.4f}",
-                        "Objective_MK_Plus_TD": f"{float(row['Objective_MK_Plus_TD']):.4f}",
+                        "Objective_0p5MK_0p5TD": f"{float(row['Objective_0p5MK_0p5TD']):.4f}",
                         "Makespan": f"{float(row['Makespan']):.4f}",
                         "Total_Tardiness": f"{float(row['Total_Tardiness']):.4f}",
-                        "Global_Objective_MK_Plus_TD": f"{float(row['Global_Objective_MK_Plus_TD']):.4f}",
+                        "Global_Objective_0p5MK_0p5TD": f"{float(row['Global_Objective_0p5MK_0p5TD']):.4f}",
                         "Global_Makespan": f"{float(row['Global_Makespan']):.4f}",
                         "Global_Total_Tardiness": f"{float(row['Global_Total_Tardiness']):.4f}",
                         "Num_Committed_Jobs": int(row["Num_Committed_Jobs"]),
                         "Num_Rows": int(row["Num_Rows"]),
+                        "Subproblem_Job_Count": int(row["Subproblem_Job_Count"]),
+                        "Repeated_Job_Count": int(row["Repeated_Job_Count"]),
+                        "Repeated_Job_IDs": str(row["Repeated_Job_IDs"]),
                     }
                 )
         with open(summary_csv, "w", newline="", encoding="utf-8") as f:

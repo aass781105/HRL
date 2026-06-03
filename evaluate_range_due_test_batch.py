@@ -16,7 +16,7 @@ from ortools_gantt import plot_ortools_gantt_with_due_dates
 from params import configs
 
 
-BASE_DIR = "or_instances_uniform_test_30_50"
+BASE_DIR = "or_instances_uniform_test_30_50_due_scaled"
 
 
 def parse_scale(scale_name: str):
@@ -336,8 +336,15 @@ def evaluate_range_due_test(base_dir=BASE_DIR):
     gantt_dir = os.path.join(output_dir, "gantt")
     os.makedirs(schedule_dir, exist_ok=True)
     os.makedirs(gantt_dir, exist_ok=True)
+
+    def compact_instance_id(instance_name):
+        match = re.search(r"_(\d+)$", str(instance_name))
+        return match.group(1) if match else str(instance_name)[-12:]
+
     for payload in schedule_payloads:
-        safe_name = f"{payload['scale']}_{payload['instance']}_best_run{payload['best_run']:02d}"
+        # Keep per-instance artifact names short; Windows can raise FileNotFoundError
+        # when the full path exceeds the legacy MAX_PATH limit.
+        safe_name = f"{payload['scale']}_i{compact_instance_id(payload['instance'])}_r{payload['best_run']:02d}"
         schedule_csv = os.path.join(schedule_dir, f"{safe_name}_schedule.csv")
         gantt_png = os.path.join(gantt_dir, f"{safe_name}_gantt.png")
         schedule_df = pd.DataFrame(payload["rows"])

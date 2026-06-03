@@ -1,0 +1,17 @@
+{
+  "policy": "ORTCadence_20",
+  "instance_json": "dynamic_instances\\dynamic_seed42_init50_h80_U20_50_due20_80_seed2.json",
+  "replay_mode": true,
+  "event_seed": 2,
+  "gate_cadence": 20,
+  "event_horizon": 80,
+  "init_jobs": 50,
+  "release_count": 5,
+  "makespan": 3918.0,
+  "total_tardiness": 8636.376037389922,
+  "subproblem_time_limit": 7200.0,
+  "total_solve_time_budget": 0.0,
+  "remaining_solve_time_budget": 0.0,
+  "time_scale": 1,
+  "output_dir": "plots/global\\20260516_040547_ortcad_dynamic_seed42_init50_h80_U20_50_due20_80"
+}

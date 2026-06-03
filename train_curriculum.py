@@ -103,7 +103,7 @@ class Trainer:
 
     def train(self):
         setup_seed(self.config.seed_train)
-        self.log, self.detailed_log, self.validation_log, self.validation_tardiness_log, self.loss_log = [], [], [], [], []
+        self.log, self.detailed_log, self.validation_log, self.validation_tardiness_log, self.validation_obj_log, self.loss_log = [], [], [], [], [], []
         self.record = float('inf')
 
         print("-" * 25 + "Training Setting" + "-" * 25)
@@ -243,7 +243,12 @@ class Trainer:
             ep_mk_gain, ep_td_penalty = 0.0, 0.0
             all_mk_rewards, all_td_rewards = [], []
             td_mode_rollout = str(getattr(configs, "ll_td_mode", "mean_pt")).strip().lower()
-            use_legacy_split_redistribution = (td_mode_rollout == "mean_pt_split_ops_legacy")
+            use_terminal_split_redistribution = td_mode_rollout in (
+                "terminal_split_ops_equal",
+                "terminal_split_ops_pt",
+                "terminal_split_ops_exp",
+                "terminal_split_ops_job_ct_delta",
+            )
             reward_seq_raw_np = []
 
             while True:
@@ -276,6 +281,23 @@ class Trainer:
                 full_logprobs[batch_idx] = action_logprob_valid
                 full_vals[batch_idx] = vals_valid
 
+                # Capture selected op processing times before env.step advances candidates.
+                rollout_op_pt_np = None
+                rollout_op_ct_np = None
+                if use_terminal_split_redistribution:
+                    action_np = full_actions.squeeze(-1).detach().cpu().numpy().astype(np.int64)
+                    active_mask_np = batch_idx.detach().cpu().numpy().astype(bool)
+                    active_env_ids = np.where(active_mask_np)[0]
+                    rollout_op_pt_np = np.zeros(self.num_envs, dtype=np.float64)
+                    rollout_op_ct_np = np.zeros(self.num_envs, dtype=np.float64)
+                    if active_env_ids.size > 0:
+                        chosen_jobs_active = action_np[active_env_ids] // self.env.number_of_machines
+                        chosen_mchs_active = action_np[active_env_ids] % self.env.number_of_machines
+                        chosen_ops_active = self.env.candidate[active_env_ids, chosen_jobs_active]
+                        rollout_op_pt_np[active_env_ids] = self.env.true_op_pt[
+                            active_env_ids, chosen_ops_active, chosen_mchs_active
+                        ]
+
                 state, reward, done, info = self.env.step(actions=full_actions.cpu().numpy())
                 ep_mk_gain += np.mean(info['reward_mk']); ep_td_penalty += np.mean(info['reward_td'])
                 all_mk_rewards.extend(info['reward_mk'].flatten()); all_td_rewards.extend(info['reward_td'].flatten())
@@ -286,28 +308,38 @@ class Trainer:
                 self.memory.action_seq.append(full_actions.squeeze(-1))
                 self.memory.log_probs.append(full_logprobs.squeeze(-1))
                 self.memory.val_seq.append(full_vals.squeeze(1))
-                # Record rollout metadata for TD redistribution mode.
-                if use_legacy_split_redistribution:
+                # Record rollout metadata for terminal TD redistribution modes.
+                if use_terminal_split_redistribution:
                     if not hasattr(self, "_rollout_jobs_seq"):
                         self._rollout_jobs_seq = []
                         self._rollout_active_seq = []
                         self._rollout_td_step_seq = []
+                        self._rollout_op_pt_seq = []
+                        self._rollout_op_ct_seq = []
                     chosen_jobs_np = (full_actions.squeeze(-1).detach().cpu().numpy() // self.env.number_of_machines).astype(np.int32)
                     active_mask_np = batch_idx.detach().cpu().numpy().astype(bool)
                     td_step_np = np.asarray(info.get('reward_td_step', np.zeros(self.num_envs)), dtype=np.float64)
+                    if rollout_op_ct_np is not None:
+                        for env_id, detail in enumerate(info.get('scheduled_op_details_all', [])):
+                            if detail is not None:
+                                rollout_op_ct_np[env_id] = float(detail.get("end_time", 0.0))
                     self._rollout_jobs_seq.append(chosen_jobs_np)
                     self._rollout_active_seq.append(active_mask_np)
                     self._rollout_td_step_seq.append(td_step_np)
+                    self._rollout_op_pt_seq.append(rollout_op_pt_np)
+                    self._rollout_op_ct_seq.append(rollout_op_ct_np)
                 if done.all(): break
 
-            # Optional TD credit redistribution: spread each job's final TD evenly across all its op decisions.
-            if use_legacy_split_redistribution and len(self.memory.reward_seq) > 0:
+            # Optional TD credit redistribution: spread each job's final terminal TD over its op decisions.
+            if use_terminal_split_redistribution and len(self.memory.reward_seq) > 0:
                 T = len(self.memory.reward_seq)
                 E = self.num_envs
                 rewards_mat = np.stack([r.detach().cpu().numpy() for r in self.memory.reward_seq], axis=0).astype(np.float64)
                 jobs_mat = np.stack(self._rollout_jobs_seq, axis=0).astype(np.int32)
                 active_mat = np.stack(self._rollout_active_seq, axis=0).astype(bool)
                 td_old_mat = np.stack(self._rollout_td_step_seq, axis=0).astype(np.float64)
+                op_pt_mat = np.stack(self._rollout_op_pt_seq, axis=0).astype(np.float64)
+                op_ct_mat = np.stack(self._rollout_op_ct_seq, axis=0).astype(np.float64)
                 td_new_mat = np.zeros_like(td_old_mat)
 
                 for e in range(E):
@@ -325,11 +357,17 @@ class Trainer:
                         td_total = float(np.sum(td_old_mat[step_ids, e]))
                         if abs(td_total) <= 1e-12:
                             continue
-                        # Geometric weighting with larger weights on later ops:
-                        # e.g., for 5 ops -> [0.9^4, 0.9^3, 0.9^2, 0.9^1, 1.0]
-                        # while preserving total TD.
-                        n_steps = len(step_ids)
-                        weights = np.power(0.9, np.arange(n_steps - 1, -1, -1, dtype=np.float64))
+                        if td_mode_rollout == "terminal_split_ops_pt":
+                            weights = np.maximum(op_pt_mat[step_ids, e], 0.0)
+                        elif td_mode_rollout == "terminal_split_ops_exp":
+                            decay = min(max(float(getattr(configs, "ll_td_split_exp_decay", 0.8)), 1e-6), 1.0)
+                            weights = np.power(decay, np.arange(len(step_ids) - 1, -1, -1, dtype=np.float64))
+                        elif td_mode_rollout == "terminal_split_ops_job_ct_delta":
+                            ct_values = np.maximum(op_ct_mat[step_ids, e], 0.0)
+                            weights = np.diff(np.concatenate(([0.0], ct_values)))
+                            weights = np.maximum(weights, 0.0)
+                        else:
+                            weights = np.ones(len(step_ids), dtype=np.float64)
                         weights_sum = float(np.sum(weights))
                         if weights_sum <= 1e-12:
                             continue
@@ -352,6 +390,10 @@ class Trainer:
                 self._rollout_jobs_seq.clear()
                 self._rollout_active_seq.clear()
                 self._rollout_td_step_seq.clear()
+                if hasattr(self, "_rollout_op_pt_seq"):
+                    self._rollout_op_pt_seq.clear()
+                if hasattr(self, "_rollout_op_ct_seq"):
+                    self._rollout_op_ct_seq.clear()
 
             loss, v_loss, p_loss = self.ppo.update(self.memory)
             critic_diag = getattr(self.ppo, "last_critic_stats", {})
@@ -382,6 +424,7 @@ class Trainer:
             else:
                 mk_share = 0.0
                 td_share = 0.0
+            reward_component_label = "SlackR%" if td_mode_rollout in ("system_slack_delta_mean", "system_neg_slack_delta_mean", "chosen_neg_slack_delta_mean") else "TD%"
             self.log.append([i_update, np.mean(ep_rewards)])
             self.detailed_log.append([
                 i_update,
@@ -418,25 +461,30 @@ class Trainer:
                 vali_results_per_size = self.validate_envs_with_various_op_nums(self.vali_data_batches)
                 
                 # Calculate overall mean
-                all_td, all_ms = [], []
+                all_td, all_ms, all_obj = [], [], []
                 breakdown_entry = {'update': i_update + 1}
                 for res in vali_results_per_size:
                     nj_key = res['n_j']
                     all_td.extend(res['td_list'])
                     all_ms.extend(res['ms_list'])
+                    obj_list = (0.5 * np.asarray(res['ms_list'], dtype=np.float64) + 0.5 * np.asarray(res['td_list'], dtype=np.float64)).tolist()
+                    all_obj.extend(obj_list)
                     breakdown_entry[f'ms_{nj_key}j'] = res['ms_mean']
                     breakdown_entry[f'td_{nj_key}j'] = res['td_mean']
+                    breakdown_entry[f'obj_{nj_key}j'] = float(np.mean(obj_list))
                 
                 overall_td_mean = np.mean(all_td)
                 overall_ms_mean = np.mean(all_ms)
+                overall_obj_mean = np.mean(all_obj)
                 
                 # Save best model
-                if overall_td_mean < self.record:
-                    self.save_model(); self.record = overall_td_mean
+                if overall_obj_mean < self.record:
+                    self.save_model(); self.record = overall_obj_mean
                 
                 # Logs
                 self.validation_log.append(overall_ms_mean)
                 self.validation_tardiness_log.append(overall_td_mean)
+                self.validation_obj_log.append(overall_obj_mean)
                 if not hasattr(self, 'validation_breakdown_log'): self.validation_breakdown_log = []
                 self.validation_breakdown_log.append(breakdown_entry)
                 
@@ -451,8 +499,9 @@ class Trainer:
                     f'>d{delta_threshold:.0f}: {over_delta_ratio*100:4.1f}% | '
                     f'Vshare: {v_share_loss*100:5.1f}% | '
                     f'Ent: {entropy:.3f} | Clip: {clip_frac*100:4.1f}% | AdvStd: {adv_std:.3f} | '
-                    f'TD%: {td_share*100:5.1f}% | '
-                    f'Vali MK: {overall_ms_mean:.1f} | Vali TD: {overall_td_mean:.1f} | Best TD: {self.record:.1f}'
+                    f'{reward_component_label}: {td_share*100:5.1f}% | '
+                    f'Vali MK: {overall_ms_mean:.1f} | Vali TD: {overall_td_mean:.1f} | '
+                    f'Vali Obj: {overall_obj_mean:.1f} | Best Obj: {self.record:.1f}'
                 )
             else:
                 avg_reward = np.mean(ep_rewards)
@@ -462,7 +511,7 @@ class Trainer:
                     f'>d{delta_threshold:.0f}: {over_delta_ratio*100:4.1f}% | '
                     f'Vshare: {v_share_loss*100:5.1f}% | '
                     f'Ent: {entropy:.3f} | Clip: {clip_frac*100:4.1f}% | AdvStd: {adv_std:.3f} | '
-                    f'TD%: {td_share*100:5.1f}%'
+                    f'{reward_component_label}: {td_share*100:5.1f}%'
                 )
 
         self.train_et = time.time()
@@ -483,6 +532,7 @@ class Trainer:
         with open(f'{log_path_base}detailed_reward_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.detailed_log)))
         with open(f'{log_path_base}valiquality_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.validation_log)))
         with open(f'{log_path_base}valitardiness_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.validation_tardiness_log)))
+        with open(f'{log_path_base}valiobj_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.validation_obj_log)))
         with open(f'{log_path_base}loss_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.loss_log)))
         if hasattr(self, "train_st") and hasattr(self, "train_et"):
             train_seconds = float(self.train_et - self.train_st)
@@ -553,6 +603,7 @@ class Trainer:
         
         with open(f'{log_path_base}valiquality_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.validation_log)))
         with open(f'{log_path_base}valitardiness_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.validation_tardiness_log)))
+        with open(f'{log_path_base}valiobj_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.validation_obj_log)))
         
         # [ALIGNED] Real-time Breakdown .txt
         if hasattr(self, 'validation_breakdown_log') and self.validation_breakdown_log:

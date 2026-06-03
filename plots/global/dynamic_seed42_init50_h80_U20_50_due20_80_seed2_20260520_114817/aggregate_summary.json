@@ -1,0 +1,18 @@
+{
+  "instance_json": "dynamic_instances\\dynamic_seed42_init50_h80_U20_50_due20_80_seed2.json",
+  "solver": "low_level_ppo_cadence_export",
+  "ppo_model_path": "trained_network\\SD2\\llmk_range_u10_30_range3_env50_sizehold60_duehold20_short_mk10.pth",
+  "ppo_model_name": "llmk_range_u10_30_range3_env50_sizehold60_duehold20_short_mk10",
+  "eval_runs": 1,
+  "eval_action_selection": "sample",
+  "cadence": 20,
+  "makespan_mean": 4076.0,
+  "makespan_std": 0.0,
+  "total_tardiness_mean": 14280.532186367289,
+  "total_tardiness_std": 0.0,
+  "objective_mean": 9178.266093183644,
+  "objective_std": 0.0,
+  "release_count_mean": 5.0,
+  "release_count_std": 0.0,
+  "sample_runs_summary_csv": "plots/global\\dynamic_seed42_init50_h80_U20_50_due20_80_seed2_20260520_114817\\sample_runs_summary.csv"
+}

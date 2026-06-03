@@ -2,24 +2,35 @@ import argparse
 import csv
 import json
 import os
+import sys
 from typing import Dict, Tuple
 
 import numpy as np
+
+_gen_parser = argparse.ArgumentParser(add_help=False)
+_gen_parser.add_argument("--output_dir", default="or_instances_uniform_test_30_50_due_scaled")
+_gen_parser.add_argument("--sizes", nargs="+", type=int, default=[30, 40, 50])
+_gen_parser.add_argument("--n_m", type=int, default=5)
+_gen_parser.add_argument("--instances_per_combo", type=int, default=3)
+_gen_parser.add_argument("--seed_base", type=int, default=9000)
+_gen_parser.add_argument("--due_range_scale", type=float, default=None)
+_GEN_ARGS, _REMAINING_ARGS = _gen_parser.parse_known_args()
+sys.argv = [sys.argv[0]] + _REMAINING_ARGS
 
 from data_utils import SD2_instance_generator, matrix_to_text
 from params import configs
 
 
 DUE_SETTINGS: Dict[str, Tuple[float, float]] = {
-    "mixed": (-1.0, 1.0),
-    "loose": (0.0, 1.0),
-    "tight": (-1.0, 0.0),
+    "tight": (-0.1, 1.5),
+    "mixed": (0.1, 1.5),
+    "loose": (0.3, 1.5),
 }
 
 
 def generate_range_due_dates(n_j: int, setting: str, rng: np.random.Generator) -> Tuple[np.ndarray, float, float]:
     mean_pt = (float(configs.low) + float(configs.high)) / 2.0
-    a = float(n_j) * mean_pt
+    a = float(getattr(configs, "due_range_scale", 0.5)) * float(n_j) * mean_pt
     low_mul, high_mul = DUE_SETTINGS[setting]
     low = low_mul * a
     high = high_mul * a
@@ -40,8 +51,10 @@ def generate_test_instances(
     n_m: int,
     instances_per_combo: int,
     seed_base: int,
+    due_range_scale: float,
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
+    configs.due_range_scale = float(due_range_scale)
     manifest_rows = []
 
     for n_j in sizes:
@@ -75,6 +88,7 @@ def generate_test_instances(
                     "due_setting": setting,
                     "range_low": float(range_low),
                     "range_high": float(range_high),
+                    "due_range_scale": float(due_range_scale),
                     "n_j": int(n_j),
                     "n_m": int(n_m),
                     "instance_seed": int(instance_seed),
@@ -94,6 +108,7 @@ def generate_test_instances(
                         "due_seed": int(due_seed),
                         "range_low": float(range_low),
                         "range_high": float(range_high),
+                        "due_range_scale": float(due_range_scale),
                         "fjs_path": fjs_path,
                         "json_path": json_path,
                     }
@@ -113,20 +128,17 @@ def generate_test_instances(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate 30/40/50 x 5 range-due test instances.")
-    parser.add_argument("--output_dir", default="or_instances_uniform_test_30_50")
-    parser.add_argument("--sizes", nargs="+", type=int, default=[30, 40, 50])
-    parser.add_argument("--n_m", type=int, default=5)
-    parser.add_argument("--instances_per_combo", type=int, default=3)
-    parser.add_argument("--seed_base", type=int, default=9000)
-    args = parser.parse_args()
+    due_range_scale = _GEN_ARGS.due_range_scale
+    if due_range_scale is None:
+        due_range_scale = float(getattr(configs, "due_range_scale", 0.7))
 
     generate_test_instances(
-        output_dir=args.output_dir,
-        sizes=args.sizes,
-        n_m=args.n_m,
-        instances_per_combo=args.instances_per_combo,
-        seed_base=args.seed_base,
+        output_dir=_GEN_ARGS.output_dir,
+        sizes=_GEN_ARGS.sizes,
+        n_m=_GEN_ARGS.n_m,
+        instances_per_combo=_GEN_ARGS.instances_per_combo,
+        seed_base=_GEN_ARGS.seed_base,
+        due_range_scale=due_range_scale,
     )
 
 

@@ -336,6 +336,8 @@ class FJSPEnvForVariousOpNums:
         self.old_due_date = np.copy(self.due_date)
         self.old_true_due_date = np.copy(self.true_due_date)
         self.old_accumulated_tardiness = np.copy(self.accumulated_tardiness)
+        self.old_chosen_neg_slack_baseline = np.zeros((self.number_of_envs, self.number_of_jobs), dtype=np.float64)
+        self.old_chosen_partial_tardiness_baseline = np.zeros((self.number_of_envs, self.number_of_jobs), dtype=np.float64)
 
         # state: Avoid deepcopy of CUDA tensors
         self.state = EnvState()
@@ -368,6 +370,8 @@ class FJSPEnvForVariousOpNums:
         self.due_date = np.copy(self.old_due_date)
         self.true_due_date = np.copy(self.old_true_due_date)
         self.accumulated_tardiness = np.copy(self.old_accumulated_tardiness)
+        self.chosen_neg_slack_baseline = np.copy(self.old_chosen_neg_slack_baseline)
+        self.chosen_partial_tardiness_baseline = np.copy(self.old_chosen_partial_tardiness_baseline)
 
         # Rebuild all derived scheduling state from the restored base arrays.
         self.dynamic_pair_mask = np.copy(self.candidate_process_relation)
@@ -396,6 +400,8 @@ class FJSPEnvForVariousOpNums:
         self.done_flag = np.full(shape=(self.number_of_envs,), fill_value=0, dtype=bool)
         self.current_makespan = np.full(self.number_of_envs, float("-inf"))
         self.accumulated_tardiness = np.zeros(self.number_of_envs)
+        self.chosen_neg_slack_baseline = np.zeros((self.number_of_envs, self.number_of_jobs), dtype=np.float64)
+        self.chosen_partial_tardiness_baseline = np.zeros((self.number_of_envs, self.number_of_jobs), dtype=np.float64)
 
         self.mch_queue = np.full(shape=[self.number_of_envs, self.number_of_machines,
                                         self.max_number_of_ops + 1], fill_value=-99, dtype=int)
@@ -458,6 +464,13 @@ class FJSPEnvForVariousOpNums:
         pre_job_tardiness = np.maximum(
             0.0, self.true_candidate_free_time[self.incomplete_env_idx, chosen_job] - self.true_due_date[self.incomplete_env_idx, chosen_job]
         )
+        # Step-level system slack reward uses Jobsystem(t): jobs active before this action.
+        pre_active_jobs_mask = np.zeros((self.number_of_envs, self.number_of_jobs), dtype=bool)
+        pre_active_jobs_mask[self.incomplete_env_idx] = ~self.mask[self.incomplete_env_idx]
+        pre_all_job_remain_work = self.op_match_job_remain_work[self.env_job_idx, self.candidate].copy()
+        pre_job_slack = (self.due_date - self.next_schedule_time[:, np.newaxis]) - pre_all_job_remain_work
+        pre_system_slack = np.sum(np.where(pre_active_jobs_mask, pre_job_slack, 0.0), axis=1)
+        pre_system_neg_slack = np.sum(np.where(pre_active_jobs_mask, np.maximum(0.0, -pre_job_slack), 0.0), axis=1)
 
         if (self.reverse_process_relation[self.incomplete_env_idx, chosen_op, chosen_mch]).any():
             print(f'FJSP_Env Error: Op {chosen_op} cannot be processed by Mch {chosen_mch}')
@@ -627,9 +640,45 @@ class FJSPEnvForVariousOpNums:
 
         # Update accumulated total tardiness
         self.accumulated_tardiness[self.incomplete_env_idx] += tardiness_local
+
+        post_all_job_remain_work = self.op_match_job_remain_work[self.env_job_idx, self.candidate]
+        post_ref_time = np.broadcast_to(
+            self.next_schedule_time[:, np.newaxis],
+            (self.number_of_envs, self.number_of_jobs)
+        ).copy()
+        completed_from_pre_active = np.logical_and(pre_active_jobs_mask, self.mask)
+        post_ref_time[completed_from_pre_active] = self.candidate_free_time[completed_from_pre_active]
+        post_job_slack = (self.due_date - post_ref_time) - post_all_job_remain_work
+        post_system_slack = np.sum(np.where(pre_active_jobs_mask, post_job_slack, 0.0), axis=1)
+        post_system_neg_slack = np.sum(np.where(pre_active_jobs_mask, np.maximum(0.0, -post_job_slack), 0.0), axis=1)
         
         td_mode = str(getattr(configs, "ll_td_mode", "mean_pt")).strip().lower()
-        if td_mode == "workload":
+        if td_mode in ("system_slack_delta_mean", "system_neg_slack_delta_mean"):
+            if td_mode == "system_neg_slack_delta_mean":
+                system_slack_delta = pre_system_neg_slack - post_system_neg_slack
+            else:
+                system_slack_delta = post_system_slack - pre_system_slack
+            beta_mode = str(getattr(configs, "ll_system_slack_beta_mode", "fixed")).strip().lower()
+            if beta_mode == "by_n_j":
+                system_slack_delta = system_slack_delta / max(float(self.number_of_jobs), 1.0)
+            else:
+                system_slack_delta = system_slack_delta * float(getattr(configs, "ll_system_slack_beta", 0.05))
+            reward_td_local = system_slack_delta[self.incomplete_env_idx]
+        elif td_mode == "chosen_neg_slack_delta_mean":
+            post_chosen_slack = post_job_slack[self.incomplete_env_idx, chosen_job]
+            prev_neg_slack = self.chosen_neg_slack_baseline[self.incomplete_env_idx, chosen_job]
+            current_neg_slack = np.maximum(0.0, -post_chosen_slack)
+            chosen_neg_slack_delta = prev_neg_slack - current_neg_slack
+            self.chosen_neg_slack_baseline[self.incomplete_env_idx, chosen_job] = current_neg_slack
+            reward_td_local = chosen_neg_slack_delta
+        elif td_mode == "chosen_partial_tardiness_delta":
+            prev_partial_tardiness = self.chosen_partial_tardiness_baseline[self.incomplete_env_idx, chosen_job]
+            current_partial_tardiness = current_job_tardiness
+            partial_tardiness_delta = prev_partial_tardiness - current_partial_tardiness
+            self.chosen_partial_tardiness_baseline[self.incomplete_env_idx, chosen_job] = current_partial_tardiness
+            base_scale = max(float(self.mean_op_pt), 1e-6)
+            reward_td_local = partial_tardiness_delta / base_scale
+        elif td_mode == "workload":
             # TD / job workload
             chosen_job_workload = self.true_job_total_work[self.incomplete_env_idx, chosen_job]
             base_scale = np.maximum(chosen_job_workload, 1e-6)
@@ -693,9 +742,24 @@ class FJSPEnvForVariousOpNums:
             "end_time": float(self.true_op_ct[env_idx, chosen_op[env_idx]]),
             "proc_time": float(self.true_op_pt[env_idx, chosen_op[env_idx], chosen_mch[env_idx]])
         }
+        scheduled_op_details_all = [None] * self.number_of_envs
+        for local_idx, env_id in enumerate(self.incomplete_env_idx):
+            job_id = int(chosen_job[local_idx])
+            op_id = int(chosen_op[local_idx])
+            mch_id = int(chosen_mch[local_idx])
+            scheduled_op_details_all[int(env_id)] = {
+                "job_id": job_id,
+                "op_id_in_job": int(op_id - self.job_first_op_id[env_id, job_id]),
+                "op_global_id": op_id,
+                "machine_id": mch_id,
+                "start_time": float(true_chosen_op_st[local_idx]),
+                "end_time": float(self.true_op_ct[env_id, op_id]),
+                "proc_time": float(self.true_op_pt[env_id, op_id, mch_id])
+            }
         
         info = {
             "scheduled_op_details": scheduled_op_details,
+            "scheduled_op_details_all": scheduled_op_details_all,
             "reward_mk": reward_mk_weighted / np.sqrt(self.number_of_jobs), # Weighted + scaled
             "reward_td": reward_td_weighted / np.sqrt(self.number_of_jobs), # Weighted + scaled
             "reward_mk_step": reward_mk_step,

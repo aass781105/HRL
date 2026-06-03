@@ -232,20 +232,20 @@ def generate_due_dates(job_length, op_pt, tightness=1.2, due_date_mode='k', seed
             op_idx += 1
 
     if due_date_mode == 'range':
-        # [NEW] Custom Range Mode: Uniform(-n_j*mean_pt, n_j*mean_pt)
-        # We calculate mean_pt from the global configs to stay consistent
+        # Custom range mode: Uniform(-a, a), a = due_range_scale * n_j * mean_pt.
         from params import configs
         mean_pt = (float(configs.low) + float(configs.high)) / 2.0
-        due_range = n_j * mean_pt
+        due_range = float(getattr(configs, "due_range_scale", 0.7)) * n_j * mean_pt
         return rng.uniform(-due_range, due_range, size=n_j)
 
     if due_date_mode == 'range3':
-        # Match the static 30/40/50 test set: one instance is either
-        # loose=[0,a], mixed=[-a,a], or tight=[-a,0], where a=n_j*mean_pt.
+        # One instance is either:
+        # tight=[-0.1a,1.2a], mixed=[0.1a,1.2a], loose=[0.3a,1.2a],
+        # where a = due_range_scale * n_j * mean_pt.
         from params import configs
         mean_pt = (float(configs.low) + float(configs.high)) / 2.0
-        due_range = n_j * mean_pt
-        ranges = ((0.0, due_range), (-due_range, due_range), (-due_range, 0.0))
+        due_range = float(getattr(configs, "due_range_scale", 0.7)) * n_j * mean_pt
+        ranges = ((-0.1 * due_range, 1.2 * due_range), (0.1 * due_range, 1.2 * due_range), (0.3 * due_range, 1.2 * due_range))
         idx = int(rng.integers(0, len(ranges))) if hasattr(rng, "integers") else int(rng.randint(0, len(ranges)))
         low, high = ranges[idx]
         return rng.uniform(low, high, size=n_j)
@@ -253,11 +253,11 @@ def generate_due_dates(job_length, op_pt, tightness=1.2, due_date_mode='k', seed
     if due_date_mode in ('range3_loose', 'range3_mixed', 'range3_tight'):
         from params import configs
         mean_pt = (float(configs.low) + float(configs.high)) / 2.0
-        due_range = n_j * mean_pt
+        due_range = float(getattr(configs, "due_range_scale", 0.7)) * n_j * mean_pt
         ranges = {
-            'range3_loose': (0.0, due_range),
-            'range3_mixed': (-due_range, due_range),
-            'range3_tight': (-due_range, 0.0),
+            'range3_loose': (0.3 * due_range, 1.2 * due_range),
+            'range3_mixed': (0.1 * due_range, 1.2 * due_range),
+            'range3_tight': (-0.1 * due_range, 1.2 * due_range),
         }
         low, high = ranges[due_date_mode]
         return rng.uniform(low, high, size=n_j)

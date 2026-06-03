@@ -67,6 +67,7 @@ def run_event_driven_until_nevents(
     is_ppo = (gate_policy == "ppo")
 
     all_job_due_dates: Dict[int, float] = {}
+    all_job_arrive_times: Dict[int, float] = {}
     mean_pt = (float(configs.low) + float(configs.high)) / 2.0
     reward_scale = mean_pt
     stability_scale = float(getattr(configs, "stability_scale", 0.0))
@@ -248,17 +249,21 @@ def run_event_driven_until_nevents(
             "Event_ID",
             "Release_Type",
             "Release_Time",
-            "Objective_MK_Plus_TD",
+            "Objective_0p5MK_0p5TD",
             "Makespan",
             "Total_Tardiness",
-            "Global_Objective_MK_Plus_TD",
+            "Global_Objective_0p5MK_0p5TD",
             "Global_Makespan",
             "Global_Total_Tardiness",
             "Num_Committed_Jobs",
             "Num_Rows",
+            "Subproblem_Job_Count",
+            "Repeated_Job_Count",
+            "Repeated_Job_IDs",
         ])
 
     release_count, plot_seq = 0, 0
+    previous_release_job_ids = set()
     total_cumulative_reward = 0.0
     baseline_cadence = 1
     stability_mode = resolve_stability_mode()
@@ -377,7 +382,12 @@ def run_event_driven_until_nevents(
         full_data_rows = []
         for (jid, opid), (row, status) in sorted(unique_rows.items()):
             dd = all_job_due_dates.get(jid, 0.0); is_last = (opid == job_max_op[jid])
-            row.update({"status": status, "due_date": f"{dd:.2f}", "tardiness": f"{max(0.0, float(row['end']) - dd):.2f}" if is_last else "0.00"})
+            row.update({
+                "arrive_time": f"{float(all_job_arrive_times.get(jid, 0.0)):.2f}",
+                "status": status,
+                "due_date": f"{dd:.2f}",
+                "tardiness": f"{max(0.0, float(row['end']) - dd):.2f}" if is_last else "0.00",
+            })
             full_data_rows.append(row)
         fname = f"details_r{seq:03d}_t{int(t):05d}{label}.csv"; df = pd.DataFrame(full_data_rows); df.to_csv(os.path.join(csv_dir, fname), index=False)
         csv_sum_td = df["tardiness"].astype(float).sum(); print(f"  [CSV Export] {fname} | Unique Jobs: {len(job_max_op)} | Total TD: {csv_sum_td:.2f}")
@@ -408,7 +418,7 @@ def run_event_driven_until_nevents(
         return {
             "makespan": float(max_end),
             "total_tardiness": float(total_td),
-            "objective_value": float(max_end + total_td),
+            "objective_value": float(0.5 * max_end + 0.5 * total_td),
         }
 
     def compute_global_kpis() -> Dict[str, float]:
@@ -416,14 +426,17 @@ def run_event_driven_until_nevents(
         info = compute_rows_kpis(rows, all_job_due_dates)
         if getattr(orch, "machine_free_time", None) is not None and len(orch.machine_free_time) > 0:
             info["makespan"] = max(info["makespan"], float(np.max(orch.machine_free_time)))
-            info["objective_value"] = info["makespan"] + info["total_tardiness"]
+            info["objective_value"] = 0.5 * info["makespan"] + 0.5 * info["total_tardiness"]
         return info
 
     def write_release_log(event_id: int, release_type: str, release_time: float, rows) -> None:
+        nonlocal previous_release_job_ids
         if not write_outputs:
             return
         sub_info = compute_rows_kpis(rows, all_job_due_dates)
         global_info = compute_global_kpis()
+        current_job_ids = {int(row["job"]) for row in rows}
+        repeated_job_ids = sorted(current_job_ids & previous_release_job_ids)
         release_csv_writer.writerow([
             int(event_id),
             str(release_type),
@@ -436,10 +449,16 @@ def run_event_driven_until_nevents(
             f"{global_info['total_tardiness']:.4f}",
             len(getattr(orch, "_committed_jobs", [])),
             len(rows),
+            len(current_job_ids),
+            len(repeated_job_ids),
+            ";".join(str(job_id) for job_id in repeated_job_ids),
         ])
+        previous_release_job_ids = current_job_ids
 
     init_jobs = sample_initial_jobs(configs, rng=rng, base_job_id=0, t_arrive=0.0)
     if init_jobs:
+        for job in init_jobs:
+            all_job_arrive_times[job.job_id] = float(job.meta.get("t_arrive", 0.0))
         release_count += register_initial_jobs(orch, gen, init_jobs, all_job_due_dates, t0=0.0)
         write_release_log(0, "INIT", 0.0, getattr(orch, "last_batch_rows", []))
         collect_subproblem_stats(orch._committed_jobs, 0.0) # [STATS: INITIAL SUBPROBLEM]
@@ -461,7 +480,9 @@ def run_event_driven_until_nevents(
         inter_arrival = t_now - t_prev
         new_jobs = gen.generate_burst(t_now)
         if new_jobs:
-            for j in new_jobs: all_job_due_dates[j.job_id] = j.meta["due_date"]
+            for j in new_jobs:
+                all_job_due_dates[j.job_id] = j.meta["due_date"]
+                all_job_arrive_times[j.job_id] = float(j.meta.get("t_arrive", t_now))
             orch.buffer.extend(new_jobs)
         stats["arrive"] += 1
         is_last_step = bool(stats["arrive"] >= int(max_events))

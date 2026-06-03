@@ -1,0 +1,23 @@
+eval_model_name: llmk_range_u10_30_range3_env50_sizehold60_duehold20_short_mk10_system_neg_slack_beta1
+ppo_model_path: trained_network\SD2\llmk_range_u10_30_range3_env50_sizehold60_duehold20_short_mk10_system_neg_slack_beta1.pth
+num_envs: 50
+due_date_mode: range3_hold
+val_due_date_mode: range3
+due_range_scale: 0.7
+schedule_type: u10_30
+mixed_size_hold_updates: 60
+due_setting_hold_updates: 20
+max_updates: 3000
+mixed_size_large_prob: 0.0
+ll_mk_coef: 10.0
+ll_td_coef: 1.0
+ll_td_mode: system_neg_slack_delta_mean
+ll_system_slack_beta_mode: fixed
+ll_system_slack_beta: 1
+critic_size_context_max_n_j: 30.0
+critic_due_context: false
+layer_fea_output_dim: [64, 64, 64]
+separate_actor_critic_encoder: false
+ll_due_vloss_coef: false
+ll_vtarget_norm: false
+ll_critic_loss: huber

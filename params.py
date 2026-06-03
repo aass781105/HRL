@@ -163,6 +163,7 @@ parser.add_argument('--mixed_size_large_min_n_j', type=int, default=20, help='Lo
 parser.add_argument('--due_setting_hold_updates', type=int, default=10, help='Updates to keep one due setting when due_date_mode=range3_hold.')
 parser.add_argument('--due_date_mode', type=str, default='range', choices=['k', 'M', 'range', 'range3', 'range3_hold', 'range3_loose', 'range3_mixed', 'range3_tight', 'range15', 'range2', 'norm', 'dynamic_shift'], help='Due date generation mode: k (Individual), M (Common), range (uniform symmetric range), range3 (randomly choose tight/mixed/loose range per instance), range3_hold (training code cycles one due setting for several updates), range3_loose/mixed/tight (fixed range3 sub-mode), range15 (1.5x wider than range), norm (normal with random mean), dynamic_shift (workload factor shifted tighter by n_j). range2 is kept as a backward-compatible alias.')
 parser.add_argument('--val_due_date_mode', type=str, default='range', choices=['', 'k', 'M', 'range', 'range3', 'range3_loose', 'range3_mixed', 'range3_tight', 'range15', 'range2', 'norm', 'dynamic_shift'], help='Validation due date mode override. Empty string means using due_date_mode.')
+parser.add_argument('--due_range_scale', type=float, default=0.7, help='Scale factor for range/range3 due-date span a: a = due_range_scale * n_j * mean_pt.')
 parser.add_argument('--m_value', type=float, default=0.6, help='M-value used for Common Due Date (Static Curriculum Only)')
 parser.add_argument('--due_date_tightness', type=float, default=1.2, help='Legacy tightness base factor. k-mode now uses due_date_k_low/high.')
 parser.add_argument('--due_date_k_low', type=float, default=1.2, help='Lower bound of workload multiplier k for individual due dates.')
@@ -180,7 +181,7 @@ parser.add_argument('--dynamic_due_min_factor', type=float, default=None, help='
 parser.add_argument('--scheduler_type', type=str, default='PPO', 
                     choices=['PPO', 'SPT', 'MWKR', 'FIFO', 'OR-Tools'],
                     help='Unified scheduling method used across all stages (Init, Dynamic, Flush)')
-parser.add_argument('--ppo_model_path', type=str, default=r'trained_network\SD2\same.pth', help='PPO 權重檔 .pth 路徑')
+parser.add_argument('--ppo_model_path', type=str, default=r'trained_network\SD2\llmk_range_u10_30_range3_env50_sizehold60_duehold20_short_mk10.pth', help='PPO 權重檔 .pth 路徑')
 parser.add_argument('--ppo_sample', type=str2bool, default=False, help='PPO 推論是否採用抽樣；False=貪婪/取最大機率')
 
 
@@ -203,8 +204,18 @@ parser.add_argument('--reward_alpha', type=float, default=0.3, help='Deprecated.
 parser.add_argument('--tardiness_alpha', type=float, default=1.0, help='Deprecated. TD weighting is now controlled by ll_td_coef.')
 parser.add_argument('--ll_mk_coef', type=float, default=1.0, help='Low-level PPO reward coefficient for MK component.')
 parser.add_argument('--ll_td_coef', type=float, default=1.0, help='Low-level PPO reward coefficient for TD component.')
-parser.add_argument('--ll_td_mode', type=str, default='mean_pt', choices=['mean_pt', 'workload', 'slack_delta_mean_pt', 'tardiness_delta_mean_pt', 'mean_pt_split_ops', 'td_minus_workload_relu'],
-                    help='Low-level TD reward mode: mean_pt=TD/mean_pt, workload=TD/job_workload, slack_delta_mean_pt=negative slack-drop / mean_pt (only at job completion), tardiness_delta_mean_pt=per-op marginal tardiness increase / mean_pt, td_minus_workload_relu=-max(0, tardiness-workload). mean_pt_split_ops is kept as alias to tardiness_delta_mean_pt.')
+parser.add_argument('--ll_td_mode', type=str, default='mean_pt',
+                    choices=['mean_pt', 'workload', 'slack_delta_mean_pt', 'tardiness_delta_mean_pt',
+                             'mean_pt_split_ops', 'td_minus_workload_relu',
+                             'terminal_split_ops_equal', 'terminal_split_ops_pt',
+                             'terminal_split_ops_exp', 'terminal_split_ops_job_ct_delta',
+                             'system_slack_delta_mean',
+                             'system_neg_slack_delta_mean', 'chosen_neg_slack_delta_mean',
+                             'chosen_partial_tardiness_delta'],
+                    help='Low-level TD reward mode: mean_pt=terminal TD/mean_pt, workload=terminal TD/job_workload, slack_delta_mean_pt=negative slack-drop / mean_pt (only at job completion), tardiness_delta_mean_pt=per-op marginal tardiness increase / mean_pt, td_minus_workload_relu=-max(0, tardiness-workload). terminal_split_ops_equal redistributes final job TD equally over the selected job ops; terminal_split_ops_pt redistributes final job TD proportional to selected op processing times; terminal_split_ops_exp redistributes final job TD with exponentially larger weights on later ops; terminal_split_ops_job_ct_delta redistributes final job TD by each selected op completion frontier delta within that job; system_slack_delta_mean replaces TD with active-system total slack delta based on mean remaining work; system_neg_slack_delta_mean uses active-system negative slack proxy delta; chosen_neg_slack_delta_mean uses only the selected job negative slack proxy delta; chosen_partial_tardiness_delta penalizes increases in selected job current tardiness after each scheduled op.')
+parser.add_argument('--ll_td_split_exp_decay', type=float, default=0.8, help='Decay used by terminal_split_ops_exp. Later ops get larger weights: decay^(n-1), ..., decay, 1.')
+parser.add_argument('--ll_system_slack_beta_mode', type=str, default='fixed', choices=['fixed', 'by_n_j'], help='Scaling mode for system slack reward modes: fixed uses ll_system_slack_beta; by_n_j divides the system slack delta by the instance job count.')
+parser.add_argument('--ll_system_slack_beta', type=float, default=0.05, help='Fixed beta for system slack reward modes when ll_system_slack_beta_mode=fixed.')
 parser.add_argument('--stability_scale', type=float, default=0.0, help='決策穩定性懲罰 (Action 1 的額外扣分)。設為 0 代表純效能模式。')
 parser.add_argument('--ll_vtarget_norm', type=str2bool, default=False, help='Normalize low-level PPO value targets per-env trajectory before critic loss.')
 parser.add_argument('--ll_critic_loss', type=str, default='mse', choices=['mse', 'huber'], help='Critic loss type for low-level PPO.')
