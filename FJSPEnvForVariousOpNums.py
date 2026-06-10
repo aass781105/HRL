@@ -103,6 +103,184 @@ class FJSPEnvForVariousOpNums:
         scaled = self._scale_true_time(np.maximum(x, 0.0))
         return np.log1p(scaled)
 
+    @staticmethod
+    def _find_earliest_gap(intervals, earliest_start, duration):
+        """Return the earliest start >= earliest_start that fits duration in sorted busy intervals."""
+        t = float(earliest_start)
+        dur = max(float(duration), 0.0)
+        for s, e in sorted(intervals, key=lambda x: (float(x[0]), float(x[1]))):
+            s = float(s)
+            e = float(e)
+            if e <= t + 1e-12:
+                continue
+            if t + dur <= s + 1e-12:
+                return t
+            if t < e:
+                t = e
+        return t
+
+    @staticmethod
+    def _insert_interval(intervals, start, end):
+        intervals.append((float(start), float(end)))
+        intervals.sort(key=lambda x: (float(x[0]), float(x[1])))
+
+    def _init_machine_calendars(self):
+        self.machine_calendars = [
+            [[] for _ in range(self.number_of_machines)]
+            for _ in range(self.number_of_envs)
+        ]
+        self.true_machine_calendars = [
+            [[] for _ in range(self.number_of_machines)]
+            for _ in range(self.number_of_envs)
+        ]
+
+    def set_fixed_machine_intervals(self, true_intervals_by_env_machine, base_time=None):
+        """
+        Install fixed machine busy intervals for gap insertion.
+        true_intervals_by_env_machine: [env][machine] -> [(start_abs, end_abs), ...]
+        """
+        self._init_machine_calendars()
+        if base_time is None:
+            base_arr = self.true_mch_free_time - self.mch_free_time * max(float(self.pt_scale), 1e-6)
+            base_time = np.median(base_arr, axis=1)
+        base_time = np.asarray(base_time, dtype=np.float64)
+        if base_time.ndim == 0:
+            base_time = np.full(self.number_of_envs, float(base_time))
+
+        for e in range(min(self.number_of_envs, len(true_intervals_by_env_machine))):
+            for m in range(min(self.number_of_machines, len(true_intervals_by_env_machine[e]))):
+                for s_abs, e_abs in true_intervals_by_env_machine[e][m]:
+                    s_abs = float(s_abs)
+                    e_abs = float(e_abs)
+                    if e_abs <= s_abs:
+                        continue
+                    self.true_machine_calendars[e][m].append((s_abs, e_abs))
+                    self.machine_calendars[e][m].append((
+                        (s_abs - float(base_time[e])) / max(float(self.pt_scale), 1e-6),
+                        (e_abs - float(base_time[e])) / max(float(self.pt_scale), 1e-6),
+                    ))
+                self.true_machine_calendars[e][m].sort(key=lambda x: (x[0], x[1]))
+                self.machine_calendars[e][m].sort(key=lambda x: (x[0], x[1]))
+
+    def _compute_pair_free_time(self, env_indices=None, true_time=False):
+        if env_indices is None:
+            env_indices = range(self.number_of_envs)
+        env_indices = list(env_indices)
+        if true_time:
+            candidate_free = self.true_candidate_free_time
+            release_time = self.true_release_time
+            candidate_pt = self.true_op_pt[self.env_job_idx, self.candidate]
+            calendars = self.true_machine_calendars
+            fallback_mch_free = self.true_mch_free_time
+        else:
+            candidate_free = self.candidate_free_time
+            release_time = self.release_time
+            candidate_pt = self.candidate_pt
+            calendars = self.machine_calendars
+            fallback_mch_free = self.mch_free_time
+
+        out = np.zeros((len(env_indices), self.number_of_jobs, self.number_of_machines), dtype=np.float64)
+        for local_e, e in enumerate(env_indices):
+            for j in range(self.number_of_jobs):
+                earliest = max(float(candidate_free[e, j]), float(release_time[e, j]))
+                for m in range(self.number_of_machines):
+                    if self.candidate_process_relation[e, j, m]:
+                        out[local_e, j, m] = 0.0
+                        continue
+                    if self.enable_gap_insertion:
+                        out[local_e, j, m] = self._find_earliest_gap(
+                            calendars[e][m],
+                            earliest,
+                            float(candidate_pt[e, j, m]),
+                        )
+                    else:
+                        out[local_e, j, m] = max(earliest, float(fallback_mch_free[e, m]))
+        return out
+
+    def _estimate_op_completion_mean(self, env_idx, job_idx, op_idx, true_time=True):
+        """Paper-style estimated completion time: mean over feasible machines."""
+        if true_time:
+            candidate_free = self.true_candidate_free_time
+            release_time = self.true_release_time
+            op_pt = self.true_op_pt
+            calendars = self.true_machine_calendars
+            fallback_mch_free = self.true_mch_free_time
+        else:
+            candidate_free = self.candidate_free_time
+            release_time = self.release_time
+            op_pt = self.op_pt
+            calendars = self.machine_calendars
+            fallback_mch_free = self.mch_free_time
+
+        e = int(env_idx)
+        j = int(job_idx)
+        op = int(op_idx)
+        earliest = max(float(candidate_free[e, j]), float(release_time[e, j]))
+        completion_times = []
+        for m in range(self.number_of_machines):
+            if self.reverse_process_relation[e, op, m]:
+                continue
+            duration = float(op_pt[e, op, m])
+            if self.enable_gap_insertion:
+                st = self._find_earliest_gap(calendars[e][m], earliest, duration)
+            else:
+                st = max(earliest, float(fallback_mch_free[e, m]))
+            completion_times.append(st + duration)
+        if not completion_times:
+            return earliest
+        return float(np.mean(completion_times))
+
+    def _estimate_chosen_job_tardiness(self, env_indices, job_indices):
+        """
+        Estimate selected-job tardiness using Algorithm 1/2 style logic.
+        Returns max(0, accuracy_rate * (C_est - due)) in absolute time units.
+        """
+        out = np.zeros(len(env_indices), dtype=np.float64)
+        for local_idx, env_idx in enumerate(env_indices):
+            e = int(env_idx)
+            j = int(job_indices[local_idx])
+            due = float(self.true_due_date[e, j])
+            if self.mask[e, j]:
+                est_lateness = float(self.true_candidate_free_time[e, j]) - due
+                out[local_idx] = max(0.0, est_lateness)
+                continue
+
+            op = int(self.candidate[e, j])
+            first_op = int(self.job_first_op_id[e, j])
+            last_op = int(self.job_last_op_id[e, j])
+            total_work = max(float(self.true_job_total_work[e, j]), 1e-6)
+            prefix_work = float(np.sum(self.true_op_mean_pt[e, first_op:op + 1]))
+            accuracy_rate = min(max(prefix_work / total_work, 0.0), 1.0)
+            c_est = self._estimate_op_completion_mean(e, j, op, true_time=True)
+            est_lateness = accuracy_rate * (c_est - due)
+            out[local_idx] = max(0.0, est_lateness)
+        return out
+
+    def _machine_reference_at_times(self, times, env_indices=None):
+        if env_indices is None:
+            env_indices = range(self.number_of_envs)
+        env_indices = list(env_indices)
+        refs = np.zeros((len(env_indices), self.number_of_machines), dtype=np.float64)
+        for local_e, e in enumerate(env_indices):
+            t = float(times[local_e])
+            for m in range(self.number_of_machines):
+                if not self.enable_gap_insertion:
+                    refs[local_e, m] = float(self.mch_free_time[e, m])
+                    continue
+                ref = 0.0
+                for s, end in sorted(self.machine_calendars[e][m], key=lambda x: (x[0], x[1])):
+                    s = float(s)
+                    end = float(end)
+                    if s <= t < end:
+                        ref = end
+                        break
+                    if end <= t:
+                        ref = max(ref, end)
+                    if s > t:
+                        break
+                refs[local_e, m] = ref
+        return refs
+
     # -------------------- static properties & init --------------------
 
     def set_static_properties(self):
@@ -139,6 +317,7 @@ class FJSPEnvForVariousOpNums:
             release_time_list: Optional list of release times for each job (for dynamic scenarios).
         """
         self.number_of_envs = len(job_length_list)
+        self.enable_gap_insertion = bool(getattr(configs, "enable_gap_insertion", False))
         self.job_length = np.array(job_length_list)
         self.number_of_machines = op_pt_list[0].shape[1]
         self.number_of_jobs = job_length_list[0].shape[0]
@@ -338,6 +517,9 @@ class FJSPEnvForVariousOpNums:
         self.old_accumulated_tardiness = np.copy(self.accumulated_tardiness)
         self.old_chosen_neg_slack_baseline = np.zeros((self.number_of_envs, self.number_of_jobs), dtype=np.float64)
         self.old_chosen_partial_tardiness_baseline = np.zeros((self.number_of_envs, self.number_of_jobs), dtype=np.float64)
+        self.old_chosen_est_tardiness_baseline = np.zeros((self.number_of_envs, self.number_of_jobs), dtype=np.float64)
+        self.old_machine_calendars = [[list(self.machine_calendars[e][m]) for m in range(self.number_of_machines)] for e in range(self.number_of_envs)]
+        self.old_true_machine_calendars = [[list(self.true_machine_calendars[e][m]) for m in range(self.number_of_machines)] for e in range(self.number_of_envs)]
 
         # state: Avoid deepcopy of CUDA tensors
         self.state = EnvState()
@@ -372,6 +554,9 @@ class FJSPEnvForVariousOpNums:
         self.accumulated_tardiness = np.copy(self.old_accumulated_tardiness)
         self.chosen_neg_slack_baseline = np.copy(self.old_chosen_neg_slack_baseline)
         self.chosen_partial_tardiness_baseline = np.copy(self.old_chosen_partial_tardiness_baseline)
+        self.chosen_est_tardiness_baseline = np.copy(self.old_chosen_est_tardiness_baseline)
+        self.machine_calendars = [[list(self.old_machine_calendars[e][m]) for m in range(self.number_of_machines)] for e in range(self.number_of_envs)]
+        self.true_machine_calendars = [[list(self.old_true_machine_calendars[e][m]) for m in range(self.number_of_machines)] for e in range(self.number_of_envs)]
 
         # Rebuild all derived scheduling state from the restored base arrays.
         self.dynamic_pair_mask = np.copy(self.candidate_process_relation)
@@ -402,6 +587,7 @@ class FJSPEnvForVariousOpNums:
         self.accumulated_tardiness = np.zeros(self.number_of_envs)
         self.chosen_neg_slack_baseline = np.zeros((self.number_of_envs, self.number_of_jobs), dtype=np.float64)
         self.chosen_partial_tardiness_baseline = np.zeros((self.number_of_envs, self.number_of_jobs), dtype=np.float64)
+        self.chosen_est_tardiness_baseline = np.zeros((self.number_of_envs, self.number_of_jobs), dtype=np.float64)
 
         self.mch_queue = np.full(shape=[self.number_of_envs, self.number_of_machines,
                                         self.max_number_of_ops + 1], fill_value=-99, dtype=int)
@@ -421,6 +607,7 @@ class FJSPEnvForVariousOpNums:
         self.true_op_ct = np.zeros((self.number_of_envs, self.max_number_of_ops))
         self.true_candidate_free_time = np.zeros((self.number_of_envs, self.number_of_jobs))
         self.true_mch_free_time = np.zeros((self.number_of_envs, self.number_of_machines))
+        self._init_machine_calendars()
 
         self.candidate = np.copy(self.job_first_op_id)
 
@@ -458,19 +645,7 @@ class FJSPEnvForVariousOpNums:
         # [FIX] Correctly index candidate using incomplete_env_idx for row and chosen_job for column
         chosen_op = self.candidate[self.incomplete_env_idx, chosen_job]
 
-        # Snapshots before state transition (used by configurable TD reward modes).
-        pre_job_ready_time = self.true_candidate_free_time[self.incomplete_env_idx, chosen_job].copy()
-        pre_job_remain_work = self.true_op_match_job_remain_work[self.incomplete_env_idx, chosen_op].copy()
-        pre_job_tardiness = np.maximum(
-            0.0, self.true_candidate_free_time[self.incomplete_env_idx, chosen_job] - self.true_due_date[self.incomplete_env_idx, chosen_job]
-        )
-        # Step-level system slack reward uses Jobsystem(t): jobs active before this action.
-        pre_active_jobs_mask = np.zeros((self.number_of_envs, self.number_of_jobs), dtype=bool)
-        pre_active_jobs_mask[self.incomplete_env_idx] = ~self.mask[self.incomplete_env_idx]
-        pre_all_job_remain_work = self.op_match_job_remain_work[self.env_job_idx, self.candidate].copy()
-        pre_job_slack = (self.due_date - self.next_schedule_time[:, np.newaxis]) - pre_all_job_remain_work
-        pre_system_slack = np.sum(np.where(pre_active_jobs_mask, pre_job_slack, 0.0), axis=1)
-        pre_system_neg_slack = np.sum(np.where(pre_active_jobs_mask, np.maximum(0.0, -pre_job_slack), 0.0), axis=1)
+        # (Snapshots before state transition removed as other TD modes are cleaned up)
 
         if (self.reverse_process_relation[self.incomplete_env_idx, chosen_op, chosen_mch]).any():
             print(f'FJSP_Env Error: Op {chosen_op} cannot be processed by Mch {chosen_mch}')
@@ -487,31 +662,68 @@ class FJSPEnvForVariousOpNums:
         self.mch_queue_len[self.incomplete_env_idx, chosen_mch] += 1
 
         # [E] (normalized time)
-        # [MODIFIED] Include release_time constraint (normalized)
-        chosen_op_st = np.maximum(
-            np.maximum(self.candidate_free_time[self.incomplete_env_idx, chosen_job],
-                       self.mch_free_time[self.incomplete_env_idx, chosen_mch]),
-            self.release_time[self.incomplete_env_idx, chosen_job]
-        )
+        chosen_op_st = np.zeros(self.number_of_incomplete_envs, dtype=np.float64)
+        for local_idx, env_idx in enumerate(self.incomplete_env_idx):
+            j = int(chosen_job[local_idx])
+            m = int(chosen_mch[local_idx])
+            earliest = max(
+                float(self.candidate_free_time[env_idx, j]),
+                float(self.release_time[env_idx, j]),
+            )
+            if self.enable_gap_insertion:
+                chosen_op_st[local_idx] = self._find_earliest_gap(
+                    self.machine_calendars[env_idx][m],
+                    earliest,
+                    float(self.op_pt[env_idx, chosen_op[local_idx], m]),
+                )
+            else:
+                chosen_op_st[local_idx] = max(earliest, float(self.mch_free_time[env_idx, m]))
 
         self.op_ct[self.incomplete_env_idx, chosen_op] = chosen_op_st + self.op_pt[
             self.incomplete_env_idx, chosen_op, chosen_mch]
         self.candidate_free_time[self.incomplete_env_idx, chosen_job] = self.op_ct[self.incomplete_env_idx, chosen_op]
-        self.mch_free_time[self.incomplete_env_idx, chosen_mch] = self.op_ct[self.incomplete_env_idx, chosen_op]
+        self.mch_free_time[self.incomplete_env_idx, chosen_mch] = np.maximum(
+            self.mch_free_time[self.incomplete_env_idx, chosen_mch],
+            self.op_ct[self.incomplete_env_idx, chosen_op],
+        )
+        for local_idx, env_idx in enumerate(self.incomplete_env_idx):
+            self._insert_interval(
+                self.machine_calendars[int(env_idx)][int(chosen_mch[local_idx])],
+                chosen_op_st[local_idx],
+                self.op_ct[int(env_idx), int(chosen_op[local_idx])],
+            )
 
         # absolute time counterparts
-        # [MODIFIED] Include true_release_time constraint
-        true_chosen_op_st = np.maximum(
-            np.maximum(self.true_candidate_free_time[self.incomplete_env_idx, chosen_job],
-                       self.true_mch_free_time[self.incomplete_env_idx, chosen_mch]),
-            self.true_release_time[self.incomplete_env_idx, chosen_job]
-        )
+        true_chosen_op_st = np.zeros(self.number_of_incomplete_envs, dtype=np.float64)
+        for local_idx, env_idx in enumerate(self.incomplete_env_idx):
+            j = int(chosen_job[local_idx])
+            m = int(chosen_mch[local_idx])
+            earliest = max(
+                float(self.true_candidate_free_time[env_idx, j]),
+                float(self.true_release_time[env_idx, j]),
+            )
+            if self.enable_gap_insertion:
+                true_chosen_op_st[local_idx] = self._find_earliest_gap(
+                    self.true_machine_calendars[env_idx][m],
+                    earliest,
+                    float(self.true_op_pt[env_idx, chosen_op[local_idx], m]),
+                )
+            else:
+                true_chosen_op_st[local_idx] = max(earliest, float(self.true_mch_free_time[env_idx, m]))
         self.true_op_ct[self.incomplete_env_idx, chosen_op] = true_chosen_op_st + self.true_op_pt[
             self.incomplete_env_idx, chosen_op, chosen_mch]
         self.true_candidate_free_time[self.incomplete_env_idx, chosen_job] = self.true_op_ct[
             self.incomplete_env_idx, chosen_op]
-        self.true_mch_free_time[self.incomplete_env_idx, chosen_mch] = self.true_op_ct[
-            self.incomplete_env_idx, chosen_op]
+        self.true_mch_free_time[self.incomplete_env_idx, chosen_mch] = np.maximum(
+            self.true_mch_free_time[self.incomplete_env_idx, chosen_mch],
+            self.true_op_ct[self.incomplete_env_idx, chosen_op],
+        )
+        for local_idx, env_idx in enumerate(self.incomplete_env_idx):
+            self._insert_interval(
+                self.true_machine_calendars[int(env_idx)][int(chosen_mch[local_idx])],
+                true_chosen_op_st[local_idx],
+                self.true_op_ct[int(env_idx), int(chosen_op[local_idx])],
+            )
 
         self.current_makespan[self.incomplete_env_idx] = np.maximum(self.current_makespan[self.incomplete_env_idx],
                                                                     self.true_op_ct[self.incomplete_env_idx, chosen_op])
@@ -523,9 +735,7 @@ class FJSPEnvForVariousOpNums:
             else:
                 self.candidate_process_relation[j, chosen_job[k]] = 1
 
-        candidateFT_for_compare = np.expand_dims(self.candidate_free_time, axis=2)
-        mchFT_for_compare = np.expand_dims(self.mch_free_time, axis=1)
-        self.pair_free_time = np.maximum(candidateFT_for_compare, mchFT_for_compare)
+        self.pair_free_time = self._compute_pair_free_time()
 
         pair_free_time = self.pair_free_time[self.incomplete_env_idx]
         schedule_matrix = ma.array(pair_free_time, mask=self.candidate_process_relation[self.incomplete_env_idx])
@@ -579,8 +789,11 @@ class FJSPEnvForVariousOpNums:
         self.mch_current_available_op_nums[self.incomplete_env_idx] -= self.process_relation[
             self.incomplete_env_idx, chosen_op]
 
-        mch_free_duration = np.expand_dims(self.next_schedule_time[self.incomplete_env_idx], axis=1) - \
-                            self.mch_free_time[self.incomplete_env_idx]
+        mch_ref_time = self._machine_reference_at_times(
+            self.next_schedule_time[self.incomplete_env_idx],
+            env_indices=self.incomplete_env_idx,
+        )
+        mch_free_duration = np.expand_dims(self.next_schedule_time[self.incomplete_env_idx], axis=1) - mch_ref_time
         mch_free_flag = mch_free_duration < 0
         self.mch_working_flag[self.incomplete_env_idx] = mch_free_flag + 0
         self.mch_waiting_time[self.incomplete_env_idx] = (1 - mch_free_flag) * mch_free_duration
@@ -634,73 +847,20 @@ class FJSPEnvForVariousOpNums:
         tardiness = np.zeros(self.number_of_envs, dtype=np.float64)
         tardiness[self.incomplete_env_idx] = tardiness_local
 
-        current_job_tardiness = np.maximum(
-            0.0, self.true_candidate_free_time[self.incomplete_env_idx, chosen_job] - relevant_due_dates
-        )
-
         # Update accumulated total tardiness
         self.accumulated_tardiness[self.incomplete_env_idx] += tardiness_local
 
-        post_all_job_remain_work = self.op_match_job_remain_work[self.env_job_idx, self.candidate]
-        post_ref_time = np.broadcast_to(
-            self.next_schedule_time[:, np.newaxis],
-            (self.number_of_envs, self.number_of_jobs)
-        ).copy()
-        completed_from_pre_active = np.logical_and(pre_active_jobs_mask, self.mask)
-        post_ref_time[completed_from_pre_active] = self.candidate_free_time[completed_from_pre_active]
-        post_job_slack = (self.due_date - post_ref_time) - post_all_job_remain_work
-        post_system_slack = np.sum(np.where(pre_active_jobs_mask, post_job_slack, 0.0), axis=1)
-        post_system_neg_slack = np.sum(np.where(pre_active_jobs_mask, np.maximum(0.0, -post_job_slack), 0.0), axis=1)
-        
         td_mode = str(getattr(configs, "ll_td_mode", "mean_pt")).strip().lower()
-        if td_mode in ("system_slack_delta_mean", "system_neg_slack_delta_mean"):
-            if td_mode == "system_neg_slack_delta_mean":
-                system_slack_delta = pre_system_neg_slack - post_system_neg_slack
-            else:
-                system_slack_delta = post_system_slack - pre_system_slack
-            beta_mode = str(getattr(configs, "ll_system_slack_beta_mode", "fixed")).strip().lower()
-            if beta_mode == "by_n_j":
-                system_slack_delta = system_slack_delta / max(float(self.number_of_jobs), 1.0)
-            else:
-                system_slack_delta = system_slack_delta * float(getattr(configs, "ll_system_slack_beta", 0.05))
-            reward_td_local = system_slack_delta[self.incomplete_env_idx]
-        elif td_mode == "chosen_neg_slack_delta_mean":
-            post_chosen_slack = post_job_slack[self.incomplete_env_idx, chosen_job]
-            prev_neg_slack = self.chosen_neg_slack_baseline[self.incomplete_env_idx, chosen_job]
-            current_neg_slack = np.maximum(0.0, -post_chosen_slack)
-            chosen_neg_slack_delta = prev_neg_slack - current_neg_slack
-            self.chosen_neg_slack_baseline[self.incomplete_env_idx, chosen_job] = current_neg_slack
-            reward_td_local = chosen_neg_slack_delta
-        elif td_mode == "chosen_partial_tardiness_delta":
-            prev_partial_tardiness = self.chosen_partial_tardiness_baseline[self.incomplete_env_idx, chosen_job]
-            current_partial_tardiness = current_job_tardiness
-            partial_tardiness_delta = prev_partial_tardiness - current_partial_tardiness
-            self.chosen_partial_tardiness_baseline[self.incomplete_env_idx, chosen_job] = current_partial_tardiness
+        if td_mode == "chosen_est_tardiness_delta":
+            prev_est_tardiness = self.chosen_est_tardiness_baseline[self.incomplete_env_idx, chosen_job]
+            current_est_tardiness = self._estimate_chosen_job_tardiness(self.incomplete_env_idx, chosen_job)
+            est_tardiness_increase = np.maximum(0.0, current_est_tardiness - prev_est_tardiness)
+            self.chosen_est_tardiness_baseline[self.incomplete_env_idx, chosen_job] = np.maximum(
+                prev_est_tardiness,
+                current_est_tardiness,
+            )
             base_scale = max(float(self.mean_op_pt), 1e-6)
-            reward_td_local = partial_tardiness_delta / base_scale
-        elif td_mode == "workload":
-            # TD / job workload
-            chosen_job_workload = self.true_job_total_work[self.incomplete_env_idx, chosen_job]
-            base_scale = np.maximum(chosen_job_workload, 1e-6)
-            reward_td_local = -(tardiness_local / base_scale)
-        elif td_mode == "td_minus_workload_relu":
-            # TD = -max(0, tardiness - workload) / mean_pt
-            chosen_job_workload = self.true_job_total_work[self.incomplete_env_idx, chosen_job]
-            base_scale = max(float(self.mean_op_pt), 1e-6)
-            reward_td_local = -np.maximum(0.0, tardiness_local - chosen_job_workload) / base_scale
-        elif td_mode in ("tardiness_delta_mean_pt", "mean_pt_split_ops"):
-            # Per-op marginal tardiness increase for the selected job.
-            # This provides dense TD signal while preserving final total tardiness semantics.
-            base_scale = max(float(self.mean_op_pt), 1e-6)
-            delta_job_tardiness = np.maximum(0.0, current_job_tardiness - pre_job_tardiness)
-            reward_td_local = -(delta_job_tardiness / base_scale)
-        elif td_mode == "slack_delta_mean_pt":
-            # Only penalize slack deterioration; no positive reward.
-            # Baseline completion target = pre_ready + pre_remaining_work.
-            base_scale = max(float(self.mean_op_pt), 1e-6)
-            slack_drop_local = np.maximum(0.0, relevant_completion_times - (pre_job_ready_time + pre_job_remain_work))
-            slack_drop_local = slack_drop_local * is_last_op
-            reward_td_local = -(slack_drop_local / base_scale)
+            reward_td_local = -(est_tardiness_increase / base_scale)
         else:
             # Default: TD / mean_pt
             base_scale = max(float(self.mean_op_pt), 1e-6)
@@ -1022,9 +1182,7 @@ class FJSPEnvForVariousOpNums:
                                                 axis=-1) + 1e-8
 
         true_candidate_pt = self.true_op_pt[self.env_job_idx, self.candidate]
-        true_candidate_ready = self.true_candidate_free_time[:, :, np.newaxis]
-        true_machine_ready = self.true_mch_free_time[:, np.newaxis, :]
-        true_pair_free_time = np.maximum(true_candidate_ready, true_machine_ready)
+        true_pair_free_time = self._compute_pair_free_time(true_time=True)
         true_due_date = self.true_due_date[:, :, np.newaxis]
         pair_est_lateness = np.maximum(0.0, true_pair_free_time + true_candidate_pt - true_due_date)
 
@@ -1081,9 +1239,7 @@ class FJSPEnvForVariousOpNums:
         本函式【嚴格】使用「正規化」時間系統，以匹配 step() 和 construct_mch_features() 的邏輯。
         """
         # ----- next_schedule_time 依據 pair_free_time（正規化）重新計算 -----
-        candidateFT_for_compare = np.expand_dims(self.candidate_free_time, axis=2)  # [E,J,1]
-        mchFT_for_compare = np.expand_dims(self.mch_free_time, axis=1)              # [E,1,M]
-        self.pair_free_time = np.maximum(candidateFT_for_compare, mchFT_for_compare)  # [E,J,M]
+        self.pair_free_time = self._compute_pair_free_time()  # [E,J,M]
 
         schedule_matrix = ma.array(self.pair_free_time, mask=self.candidate_process_relation)
         self.next_schedule_time = np.min(
@@ -1114,7 +1270,8 @@ class FJSPEnvForVariousOpNums:
         self.mch_current_available_jc_nums = np.sum(~self.dynamic_pair_mask, axis=1)  # [E,M]
 
         # 機器端等待/加工中/剩餘（正規化）
-        mch_free_duration = np.expand_dims(self.next_schedule_time, axis=1) - self.mch_free_time  # [E,M]
+        mch_ref_time = self._machine_reference_at_times(self.next_schedule_time)
+        mch_free_duration = np.expand_dims(self.next_schedule_time, axis=1) - mch_ref_time  # [E,M]
         mch_free_flag = mch_free_duration < 0
         self.mch_working_flag = mch_free_flag + 0
         self.mch_waiting_time = (1 - mch_free_flag) * mch_free_duration

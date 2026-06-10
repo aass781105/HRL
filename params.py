@@ -127,6 +127,10 @@ parser.add_argument('--instance_json', type=str, default='', help='Fixed dynamic
 parser.add_argument('--dynamic_instance_dir', type=str, default='dynamic_instances', help='Directory for exported fixed dynamic instance JSON files')
 parser.add_argument('--eval_runs_per_instance', type=int, default=10, help='Number of runs per test instance')
 parser.add_argument('--main_sample_runs', type=int, default=-1, help='Number of sample runs for main.py dynamic evaluation. If <=0, use eval_runs_per_instance.')
+parser.add_argument('--debug_instance_path', type=str, default='', help='Static .fjs instance path for debug scripts.')
+parser.add_argument('--debug_due_path', type=str, default='', help='Due-date JSON path for debug scripts. If empty, use same basename as debug_instance_path.')
+parser.add_argument('--debug_output_dir', type=str, default='debug/esttd_reward_runs', help='Output directory for debug scripts.')
+parser.add_argument('--debug_action_mode', type=str, default='', choices=['', 'sample', 'greedy'], help='Action mode for debug scripts. Empty uses eval_action_selection.')
 parser.add_argument('--eval_num_instances', type=int, default=10, help='Number of test instances to evaluate')
 parser.add_argument('--test_data', nargs='+', default=['Hurink_vdata'], help='List of data for testing')
 parser.add_argument('--test_mode', type=str2bool, default=False, help='Whether using the sampling strategy in testing')
@@ -149,6 +153,7 @@ parser.add_argument('--burst_size', type=int, default=1, help='每次生成工�
 parser.add_argument('--event_seed', type=int, default=42, help='事件驅動到達過程的亂數種子（Exponential 間隔）')
 parser.add_argument('--episode_seed_base', type=int, default=12345, help='episode 級別的基種子；每個 episode 以此為基準派生子亂數流')
 parser.add_argument('--fast_mode', type=str2bool, default=False, help='是否開啟高速模式（跳過甘特圖與詳細 CSV 生成）')
+parser.add_argument('--disable_main_baseline', type=str2bool, default=False, help='Skip main.py cadence baseline simulation when baseline-gap rewards/logs are not needed.')
 
 # ============================
 # Curriculum Learning Specifics
@@ -181,8 +186,9 @@ parser.add_argument('--dynamic_due_min_factor', type=float, default=None, help='
 parser.add_argument('--scheduler_type', type=str, default='PPO', 
                     choices=['PPO', 'SPT', 'MWKR', 'FIFO', 'OR-Tools'],
                     help='Unified scheduling method used across all stages (Init, Dynamic, Flush)')
-parser.add_argument('--ppo_model_path', type=str, default=r'trained_network\SD2\llmk_range_u10_30_range3_env50_sizehold60_duehold20_short_mk10.pth', help='PPO 權重檔 .pth 路徑')
+parser.add_argument('--ppo_model_path', type=str, default=r'trained_network\SD2\llmk_range_u10_30_range3_env50_sizehold60_duehold20_short_mk10_esttd.pth', help='PPO 權重檔 .pth 路徑')
 parser.add_argument('--ppo_sample', type=str2bool, default=False, help='PPO 推論是否採用抽樣；False=貪婪/取最大機率')
+parser.add_argument('--enable_gap_insertion', type=str2bool, default=False, help='Allow low-level scheduler to insert operations into machine idle gaps instead of always appending after machine free time.')
 
 
 parser.add_argument('--gate_policy', type=str, default='ppo',
@@ -211,9 +217,10 @@ parser.add_argument('--ll_td_mode', type=str, default='mean_pt',
                              'terminal_split_ops_exp', 'terminal_split_ops_job_ct_delta',
                              'system_slack_delta_mean',
                              'system_neg_slack_delta_mean', 'chosen_neg_slack_delta_mean',
-                             'chosen_partial_tardiness_delta'],
-                    help='Low-level TD reward mode: mean_pt=terminal TD/mean_pt, workload=terminal TD/job_workload, slack_delta_mean_pt=negative slack-drop / mean_pt (only at job completion), tardiness_delta_mean_pt=per-op marginal tardiness increase / mean_pt, td_minus_workload_relu=-max(0, tardiness-workload). terminal_split_ops_equal redistributes final job TD equally over the selected job ops; terminal_split_ops_pt redistributes final job TD proportional to selected op processing times; terminal_split_ops_exp redistributes final job TD with exponentially larger weights on later ops; terminal_split_ops_job_ct_delta redistributes final job TD by each selected op completion frontier delta within that job; system_slack_delta_mean replaces TD with active-system total slack delta based on mean remaining work; system_neg_slack_delta_mean uses active-system negative slack proxy delta; chosen_neg_slack_delta_mean uses only the selected job negative slack proxy delta; chosen_partial_tardiness_delta penalizes increases in selected job current tardiness after each scheduled op.')
+                             'chosen_partial_tardiness_delta', 'chosen_est_tardiness_delta'],
+                    help='Low-level TD reward mode: mean_pt=terminal TD/mean_pt, workload=terminal TD/job_workload, slack_delta_mean_pt=negative slack-drop / mean_pt (only at job completion), tardiness_delta_mean_pt=per-op marginal tardiness increase / mean_pt, td_minus_workload_relu=-max(0, tardiness-workload). terminal_split_ops_equal redistributes final job TD equally over the selected job ops; terminal_split_ops_pt redistributes final job TD proportional to selected op processing times; terminal_split_ops_exp redistributes final job TD with exponentially larger weights on later ops; terminal_split_ops_job_ct_delta redistributes final job TD by each selected op completion frontier delta within that job; system_slack_delta_mean replaces TD with active-system total slack delta based on mean remaining work; system_neg_slack_delta_mean uses active-system negative slack proxy delta; chosen_neg_slack_delta_mean uses only the selected job negative slack proxy delta; chosen_partial_tardiness_delta penalizes increases in selected job current tardiness after each scheduled op; chosen_est_tardiness_delta uses the paper-style accuracy-weighted estimated tardiness increase of the selected job.')
 parser.add_argument('--ll_td_split_exp_decay', type=float, default=0.8, help='Decay used by terminal_split_ops_exp. Later ops get larger weights: decay^(n-1), ..., decay, 1.')
+parser.add_argument('--ll_td_split_max_share', type=float, default=0.5, help='Max reward share per selected op for terminal_split_ops_job_ct_delta. Set <=0 or >=1 to disable.')
 parser.add_argument('--ll_system_slack_beta_mode', type=str, default='fixed', choices=['fixed', 'by_n_j'], help='Scaling mode for system slack reward modes: fixed uses ll_system_slack_beta; by_n_j divides the system slack delta by the instance job count.')
 parser.add_argument('--ll_system_slack_beta', type=float, default=0.05, help='Fixed beta for system slack reward modes when ll_system_slack_beta_mode=fixed.')
 parser.add_argument('--stability_scale', type=float, default=0.0, help='決策穩定性懲罰 (Action 1 的額外扣分)。設為 0 代表純效能模式。')

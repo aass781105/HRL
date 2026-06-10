@@ -68,6 +68,7 @@ def run_event_driven_until_nevents(
 
     all_job_due_dates: Dict[int, float] = {}
     all_job_arrive_times: Dict[int, float] = {}
+    env_job_info_rows: List[Dict] = []
     mean_pt = (float(configs.low) + float(configs.high)) / 2.0
     reward_scale = mean_pt
     stability_scale = float(getattr(configs, "stability_scale", 0.0))
@@ -141,6 +142,57 @@ def run_event_driven_until_nevents(
                 'due_date': due_abs - t_now,
                 'slack': due_abs - ready_abs - rem_work
             })
+
+    def record_env_job_info(job, *, event_id: int, phase: str, inter_arrival: float) -> None:
+        arrive_time = float(job.meta.get("t_arrive", 0.0))
+        due_date = float(job.meta.get("due_date", 0.0))
+        total_pt = float(job.meta.get("total_proc_time", 0.0))
+        min_total_pt = float(job.meta.get("min_total_proc_time", 0.0))
+        total_ops = int(job.meta.get("total_ops", len(job.operations)))
+        avg_pt = total_pt / max(float(total_ops), 1.0)
+        k_value = (due_date - arrive_time) / total_pt if total_pt > 1e-12 else 0.0
+        row = {
+            "event_id": int(event_id),
+            "phase": str(phase),
+            "job_id": int(job.job_id),
+            "inter_arrival": float(inter_arrival),
+            "arrive_time": arrive_time,
+            "due_date": due_date,
+            "relative_due": due_date - arrive_time,
+            "k_value": k_value,
+            "total_proc_time_mean": total_pt,
+            "min_total_proc_time": min_total_pt,
+            "avg_op_proc_time": avg_pt,
+            "total_ops": total_ops,
+        }
+        for op_idx, op in enumerate(job.operations):
+            if op.time_row is not None:
+                pts = [float(x) for x in op.time_row]
+            elif op.machine_times is not None:
+                pts = [0.0 for _ in range(int(configs.n_m))]
+                for m, pt in op.machine_times.items():
+                    pts[int(m)] = float(pt)
+            else:
+                pts = []
+            feasible = [pt for pt in pts if pt > 0]
+            row[f"op{op_idx}_pt_mean"] = float(np.mean(feasible)) if feasible else 0.0
+            row[f"op{op_idx}_pt_row"] = "|".join(f"{pt:.6g}" for pt in pts)
+        env_job_info_rows.append(row)
+
+    def write_env_job_info_csv() -> None:
+        if not write_outputs or not env_job_info_rows:
+            return
+        path = os.path.join(csv_dir, f"{csv_prefix}_env_jobs.csv")
+        fieldnames = []
+        for row in env_job_info_rows:
+            for key in row.keys():
+                if key not in fieldnames:
+                    fieldnames.append(key)
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(env_job_info_rows)
+        print(f"[CSV Export] Env jobs: {path}")
 
     ppo_gate_model = None
     gate_device = torch.device(getattr(configs, "device", "cpu"))
@@ -459,6 +511,7 @@ def run_event_driven_until_nevents(
     if init_jobs:
         for job in init_jobs:
             all_job_arrive_times[job.job_id] = float(job.meta.get("t_arrive", 0.0))
+            record_env_job_info(job, event_id=0, phase="init", inter_arrival=0.0)
         release_count += register_initial_jobs(orch, gen, init_jobs, all_job_due_dates, t0=0.0)
         write_release_log(0, "INIT", 0.0, getattr(orch, "last_batch_rows", []))
         collect_subproblem_stats(orch._committed_jobs, 0.0) # [STATS: INITIAL SUBPROBLEM]
@@ -468,7 +521,17 @@ def run_event_driven_until_nevents(
             plot_global_gantt(build_plot_rows(0.0), os.path.join(csv_dir, f"global_r{plot_seq:03d}_t0.png"), t_now=0.0, title="Initial")
         plot_seq += 1
 
-    baseline_final_td, baseline_final_mk, baseline_release_count, baseline_event_td = run_cadence_baseline()
+    baseline_needed = td_signal_source in ("baseline_gap_final", "baseline_gap_release_interval")
+    if bool(getattr(configs, "disable_main_baseline", False)) and baseline_needed:
+        print("[WARN] disable_main_baseline=True overrides baseline-gap TD signal; using zero baseline.")
+    if baseline_needed and not bool(getattr(configs, "disable_main_baseline", False)):
+        baseline_final_td, baseline_final_mk, baseline_release_count, baseline_event_td = run_cadence_baseline()
+    else:
+        print("[INFO] Skipping main cadence baseline simulation.")
+        baseline_final_td = 0.0
+        baseline_final_mk = 0.0
+        baseline_release_count = 0
+        baseline_event_td = [0.0 for _ in range(int(max_events))]
     last_release_event_idx = 0
     last_release_td = 0.0
 
@@ -483,6 +546,7 @@ def run_event_driven_until_nevents(
             for j in new_jobs:
                 all_job_due_dates[j.job_id] = j.meta["due_date"]
                 all_job_arrive_times[j.job_id] = float(j.meta.get("t_arrive", t_now))
+                record_env_job_info(j, event_id=int(stats["arrive"]), phase="arrival", inter_arrival=float(inter_arrival))
             orch.buffer.extend(new_jobs)
         stats["arrive"] += 1
         is_last_step = bool(stats["arrive"] >= int(max_events))
@@ -738,6 +802,7 @@ def run_event_driven_until_nevents(
     if write_outputs:
         raw_csv_writer.writerow(raw_summary)
         obs_csv_writer.writerow(obs_summary)
+        write_env_job_info_csv()
         raw_csv_file.close()
         obs_csv_file.close()
         release_csv_file.close()

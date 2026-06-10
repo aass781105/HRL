@@ -15,7 +15,7 @@ init_jobs: 50
 burst_size: 1
 due_date_k_low: 2.0
 due_date_k_high: 8.0
-event_seed: 1
+event_seed: 7
 fast_mode: true
 main_sample_runs: 1
 eval_runs_per_instance: 1

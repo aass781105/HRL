@@ -1,5 +1,5 @@
 gate_policy: cadence
-scheduler_type: OR-Tools
+scheduler_type: PPO
 gate_cadence: 20
 ortools_total_solve_time_budget: 0.0
 ortools_subproblem_time_limit: 7200.0
@@ -16,5 +16,8 @@ burst_size: 1
 due_date_k_low: 2.0
 due_date_k_high: 8.0
 event_seed: 3
-fast_mode: false
-instance_json: dynamic_instances\dynamic_seed42_init50_h80_U20_50_due20_80_seed3.json
+fast_mode: true
+main_sample_runs: 1
+eval_runs_per_instance: 1
+disable_main_baseline: true
+td_signal_source: agent_only

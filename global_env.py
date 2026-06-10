@@ -401,6 +401,12 @@ class GlobalTimelineOrchestrator:
         
         state = env.set_initial_data(jl, pt, due_date_list=[due_dates_state_rel], true_due_date_list=[due_dates_abs])
         env.true_mch_free_time[0,:] = self.machine_free_time; env.mch_free_time[0,:] = norm.f(self.machine_free_time)
+        if bool(getattr(configs, "enable_gap_insertion", False)):
+            fixed_intervals = [[[] for _ in range(self.M)]]
+            for r in self._global_rows:
+                if float(r["start"]) < self.t < float(r["end"]):
+                    fixed_intervals[0][int(r["machine"])].append((float(r["start"]), float(r["end"])))
+            env.set_fixed_machine_intervals(fixed_intervals, base_time=[self.t])
         for i, js_b in enumerate(jobs_new):
             r_abs = float(js_b.meta.get("ready_at", self.t))
             env.true_candidate_free_time[0,i] = r_abs; env.candidate_free_time[0,i] = norm.f(r_abs)

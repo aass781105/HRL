@@ -10,6 +10,7 @@ import random
 import time
 import sys
 import pandas as pd 
+import numpy as np
 from model.PPO import PPO_initialize
 from model.PPO import Memory
 
@@ -18,6 +19,43 @@ os.environ["CUDA_VISIBLE_DEVICES"] = configs.device_id
 import torch
 
 device = torch.device(configs.device)
+
+
+def _cap_normalized_weights(raw_weights, max_share):
+    """Normalize nonnegative weights while enforcing an optional per-item max share."""
+    weights = np.asarray(raw_weights, dtype=np.float64)
+    weights = np.maximum(weights, 0.0)
+    total = float(np.sum(weights))
+    if total <= 1e-12:
+        return weights
+
+    shares = weights / total
+    cap = float(max_share)
+    if cap <= 0.0 or cap >= 1.0 or shares.size <= 1:
+        return shares
+    cap = max(cap, 1.0 / float(shares.size))
+
+    remaining = np.ones(shares.size, dtype=bool)
+    capped = np.zeros_like(shares)
+    remaining_mass = 1.0
+    raw = shares.copy()
+    while remaining.any():
+        rem_sum = float(np.sum(raw[remaining]))
+        if rem_sum <= 1e-12:
+            capped[remaining] = remaining_mass / float(np.sum(remaining))
+            break
+        proposed = raw[remaining] / rem_sum * remaining_mass
+        over = proposed > cap + 1e-12
+        if not over.any():
+            capped[remaining] = proposed
+            break
+        rem_idx = np.where(remaining)[0]
+        over_idx = rem_idx[over]
+        capped[over_idx] = cap
+        remaining[over_idx] = False
+        remaining_mass = max(0.0, 1.0 - float(np.sum(capped[~remaining])))
+    return capped / max(float(np.sum(capped)), 1e-12)
+
 
 class Trainer:
     def __init__(self, config):
@@ -366,6 +404,10 @@ class Trainer:
                             ct_values = np.maximum(op_ct_mat[step_ids, e], 0.0)
                             weights = np.diff(np.concatenate(([0.0], ct_values)))
                             weights = np.maximum(weights, 0.0)
+                            weights = _cap_normalized_weights(
+                                weights,
+                                float(getattr(configs, "ll_td_split_max_share", 0.5)),
+                            )
                         else:
                             weights = np.ones(len(step_ids), dtype=np.float64)
                         weights_sum = float(np.sum(weights))
@@ -424,7 +466,12 @@ class Trainer:
             else:
                 mk_share = 0.0
                 td_share = 0.0
-            reward_component_label = "SlackR%" if td_mode_rollout in ("system_slack_delta_mean", "system_neg_slack_delta_mean", "chosen_neg_slack_delta_mean") else "TD%"
+            if td_mode_rollout in ("system_slack_delta_mean", "system_neg_slack_delta_mean", "chosen_neg_slack_delta_mean"):
+                reward_component_label = "SlackR%"
+            elif td_mode_rollout == "chosen_est_tardiness_delta":
+                reward_component_label = "EstTD%"
+            else:
+                reward_component_label = "TD%"
             self.log.append([i_update, np.mean(ep_rewards)])
             self.detailed_log.append([
                 i_update,
