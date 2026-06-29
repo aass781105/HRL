@@ -1,6 +1,14 @@
 import numpy as np
 
 HL_GATE_STATE_DIM = 25
+HL_LL_BUFFER_EMBED_DIM = 128
+
+
+def get_hl_gate_state_dim(config=None) -> int:
+    """Return the actual high-level observation dimension for the active config."""
+    if config is not None and bool(getattr(config, "hl_use_ll_buffer_embedding", False)):
+        return HL_GATE_STATE_DIM + int(getattr(config, "hl_ll_buffer_embedding_dim", HL_LL_BUFFER_EMBED_DIM))
+    return HL_GATE_STATE_DIM
 
 
 def _buffer_machine_demand_stats(buffer_jobs, machine_free_time, t_now: float, n_machines: int):

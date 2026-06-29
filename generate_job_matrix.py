@@ -19,8 +19,9 @@ from data_utils import SD2_instance_generator, generate_due_dates
 from dynamic_job_stream import register_initial_jobs, sample_initial_jobs
 
 import torch
-from model.hl_gate_state import HL_GATE_STATE_DIM, calculate_hl_gate_state
+from model.hl_gate_state import HL_GATE_STATE_DIM, HL_LL_BUFFER_EMBED_DIM, calculate_hl_gate_state, get_hl_gate_state_dim
 from model.hl_ppo_gate_model import HLPPOGateNet
+from hl_gate_env import compute_hl_ll_buffer_embedding
 
 def run_matrix_tracing_simulation():
     seed = int(getattr(configs, "event_seed", 42))
@@ -40,7 +41,7 @@ def run_matrix_tracing_simulation():
     gate_device = torch.device(getattr(configs, "device", "cpu"))
     if gate_policy == "ppo":
         ppo_gate_model = HLPPOGateNet(
-            obs_dim=HL_GATE_STATE_DIM,
+            obs_dim=get_hl_gate_state_dim(configs),
             n_actions=2,
             hidden=int(getattr(configs, "hl_ppo_hidden_dim", 256)),
             num_layers=int(getattr(configs, "hl_ppo_num_layers", 3)),
@@ -54,6 +55,10 @@ def run_matrix_tracing_simulation():
             use_residual=bool(getattr(configs, "hl_ppo_use_residual", False)),
             use_glu=bool(getattr(configs, "hl_ppo_use_glu", False)),
             pre_norm=bool(getattr(configs, "hl_ppo_pre_norm", False)),
+            manual_obs_dim=HL_GATE_STATE_DIM,
+            ll_embed_raw_dim=int(getattr(configs, "hl_ll_buffer_embedding_dim", HL_LL_BUFFER_EMBED_DIM)) if bool(getattr(configs, "hl_use_ll_buffer_embedding", False)) else 0,
+            ll_embed_proj_dim=int(getattr(configs, "hl_ll_buffer_projection_dim", 16)),
+            initial_release_prob=float(getattr(configs, "hl_initial_release_prob", -1.0)),
         ).to(gate_device)
         ppo_gate_model.load_state_dict(torch.load(configs.hl_ppo_model_path, map_location=gate_device, weights_only=True))
         ppo_gate_model.eval()
@@ -127,13 +132,18 @@ def run_matrix_tracing_simulation():
                 is_last_step=bool(i >= max_events),
                 buffer_jobs=orch.buffer,
             )
+            if bool(getattr(configs, "hl_use_ll_buffer_embedding", False)):
+                obs = np.concatenate(
+                    (obs, compute_hl_ll_buffer_embedding(orch, t_now, configs.n_m, configs)),
+                    axis=0,
+                ).astype(np.float32)
             with torch.no_grad():
                 logits, _ = ppo_gate_model(torch.from_numpy(obs).float().unsqueeze(0).to(gate_device))
                 if str(getattr(configs, "hl_eval_action_selection", "greedy")).lower() == "sample":
                     act = int(torch.distributions.Categorical(logits=logits).sample().item())
                 else:
                     act = int(torch.argmax(logits, dim=1).item())
-            if float(obs[-1]) >= 0.5:
+            if i >= max_events:
                 act = 1
         else:
             act = 1 if (i >= max_events or (i % configs.hl_gate_cadence == 0)) else 0

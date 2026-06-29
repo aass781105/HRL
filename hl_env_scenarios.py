@@ -54,7 +54,7 @@ def scenario_config(config, scenario: str):
         setattr(cfg, "hl_burst_size_high", 5)
         setattr(cfg, "hl_bottleneck_order_prob", 0.0)
         setattr(cfg, "hl_bottleneck_order_machine_count", 1)
-        setattr(cfg, "hl_bottleneck_exclude_urgent", True)
+        setattr(cfg, "hl_bottleneck_exclude_urgent", False)
         setattr(cfg, "hl_bottleneck_group_sampling", "rolling_freq")
         setattr(cfg, "hl_due_date_urgent_prob", 0.3)
         setattr(cfg, "hl_due_date_k_urgent_low", 1.5)
@@ -68,7 +68,7 @@ def scenario_config(config, scenario: str):
         setattr(cfg, "interarrival_uniform_low", 20.0)
         setattr(cfg, "interarrival_uniform_high", 45.0)
         setattr(cfg, "hl_burst_size_mode", "fixed")
-        setattr(cfg, "hl_bottleneck_order_prob", 0.5)
+        setattr(cfg, "hl_bottleneck_order_prob", 0.3)
         setattr(cfg, "hl_bottleneck_order_machine_count", 1)
         setattr(cfg, "hl_bottleneck_exclude_urgent", True)
         setattr(cfg, "hl_bottleneck_group_sampling", "rolling_freq")
@@ -133,9 +133,9 @@ def apply_bottleneck_orders(jobs, config, rng: np.random.Generator, n_machines: 
             counts = np.asarray(getattr(config, "_bottleneck_machine_counts", np.zeros(int(n_machines), dtype=int)), dtype=int)
             if counts.shape[0] != int(n_machines):
                 counts = np.zeros(int(n_machines), dtype=int)
-            tie_noise = rng.random(int(n_machines)) * 1e-6
-            order = np.lexsort((tie_noise, counts))
-            bottleneck_machines = np.asarray(order[:machine_count], dtype=int)
+            weights = 1.0 / (counts.astype(float) + 1.0)
+            probs = weights / np.sum(weights)
+            bottleneck_machines = rng.choice(machine_pool, size=machine_count, replace=False, p=probs)
         else:
             prev = np.asarray(getattr(config, "_last_bottleneck_machines", []), dtype=int)
             if avoid_prev and prev.size > 0:

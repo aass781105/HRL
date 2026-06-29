@@ -1,5 +1,5 @@
 # Evaluation config using the newly trained PPO Gate policy
-# Seed: 8
+# Seed: 3
 
 # --- Scheduler ---
 hl_gate_policy: ppo
@@ -11,6 +11,10 @@ hl_ppo_name: hlgate_scn_bneck_s05_e4
 hl_ppo_separate_trunks: true
 hl_ppo_value_num_layers: 1
 hl_ppo_use_residual: true
+hl_use_ll_buffer_embedding: false
+hl_ll_buffer_embedding_dim: 128
+hl_ll_buffer_projection_dim: 16
+hl_initial_release_prob: 0.25
 hl_eval_action_selection: greedy
 
 # --- Dynamic Environment ---
@@ -24,7 +28,7 @@ interarrival_uniform_low: 20
 interarrival_uniform_high: 45
 init_jobs: 30
 burst_size: 1
-event_seed: 8
+event_seed: 3
 fast_mode: true
 hl_env_scenario: bottleneck_order
 hl_bottleneck_order_prob: 0.5
@@ -42,8 +46,8 @@ hl_due_date_k_normal_high: 10
 
 # --- Baseline Policy ---
 hl_gate_decision_interval: 2
-hl_gate_cadence: 1
-baseline_cadence: 1
+hl_gate_cadence: 5
+baseline_cadence: 5
 
 # --- Low-Level PPO Action Selection ---
 ll_eval_action_selection: greedy

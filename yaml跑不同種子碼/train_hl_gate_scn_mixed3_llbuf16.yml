@@ -1,10 +1,9 @@
-# High-level PPO gate training: bottleneck-order arrivals.
-# Some jobs are restricted to a sampled bottleneck machine when feasible.
+# High-level PPO gate training: sample one of baseline/burst/bottleneck per episode + LL buffer embedding.
 
 hl_gate_policy: ppo
 scheduler_type: PPO
 ll_ppo_model_path: trained_network\SD2\ll_u1030_esttd_odprog.pth
-hl_ppo_model_path: ppo_ckpt\hlgate_scn_bneck_s05_e4.pth
+hl_ppo_model_path: ppo_ckpt\hlgate_scn_mix3_s05_e4_llbuf16.pth
 
 n_m: 5
 low: 1
@@ -18,7 +17,7 @@ init_jobs: 50
 burst_size: 1
 event_seed: 1
 fast_mode: false
-hl_env_scenario: bottleneck_order
+hl_env_scenario: mixed3
 hl_bottleneck_order_prob: 0.3
 hl_bottleneck_order_machine_count: 1
 
@@ -29,8 +28,6 @@ hl_due_date_k_normal_low: 6
 hl_due_date_k_normal_high: 12
 
 hl_gate_decision_interval: 2
-baseline_cadence: 1
-ll_eval_action_selection: greedy
 
 hl_td_credit_mode: terminal_only
 hl_release_reward_decay: 0.9
@@ -44,7 +41,7 @@ hl_stability_mode_v2: free_threshold_distributed
 hl_stability_scale: 0.5
 hl_stability_free_releases: 10
 
-hl_ppo_name: hlgate_scn_bneck_s05_e4
+hl_ppo_name: hlgate_scn_mix3_s05_e4_llbuf16
 hl_ppo_updates: 200
 hl_ppo_num_envs: 4
 hl_ppo_use_async_envs: true
@@ -77,4 +74,8 @@ hl_ppo_value_num_layers: 1
 hl_ppo_use_residual: true
 hl_ppo_use_glu: false
 hl_ppo_pre_norm: false
+
+hl_use_ll_buffer_embedding: true
+hl_ll_buffer_embedding_dim: 128
+hl_ll_buffer_projection_dim: 16
 hl_initial_release_prob: 0.25

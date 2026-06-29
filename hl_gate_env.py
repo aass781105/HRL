@@ -7,12 +7,101 @@ from typing import Optional, Tuple, Dict
 
 import gymnasium as gym
 from gymnasium import spaces
+import torch
 from params import configs
 from data_utils import SD2_instance_generator
 from dynamic_job_stream import register_initial_jobs, sample_initial_jobs
 from hrl_orchestrator import GlobalTimelineOrchestrator, EventBurstGenerator
-from model.hl_gate_state import HL_GATE_STATE_DIM, calculate_hl_gate_state
+from ll_fjsp_env import LLFJSPEnv
+from model.ll_dan_model import LLDANNet
+from model.hl_gate_state import HL_LL_BUFFER_EMBED_DIM, calculate_hl_gate_state, get_hl_gate_state_dim
 from hl_env_scenarios import make_burst_sampler, resolve_hl_env_scenario, scenario_config
+from common_utils import setup_seed
+
+
+_LL_ENCODER_MODEL = None
+_LL_ENCODER_LOAD_FAILED = False
+
+
+def _zero_ll_buffer_embedding(config=configs) -> np.ndarray:
+    dim = int(getattr(config, "hl_ll_buffer_embedding_dim", HL_LL_BUFFER_EMBED_DIM))
+    return np.zeros(dim, dtype=np.float32)
+
+
+def _get_global_ll_encoder_model(config=configs):
+    global _LL_ENCODER_MODEL, _LL_ENCODER_LOAD_FAILED
+    if _LL_ENCODER_MODEL is not None:
+        return _LL_ENCODER_MODEL
+    if _LL_ENCODER_LOAD_FAILED:
+        return None
+
+    model_path = str(getattr(config, "ll_ppo_model_path", "") or "")
+    if not model_path or not os.path.exists(model_path):
+        _LL_ENCODER_LOAD_FAILED = True
+        return None
+
+    try:
+        device = torch.device(getattr(config, "device", "cpu"))
+        model = LLDANNet(config).to(device)
+        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad_(False)
+        _LL_ENCODER_MODEL = model
+        return _LL_ENCODER_MODEL
+    except Exception as exc:
+        _LL_ENCODER_LOAD_FAILED = True
+        if bool(getattr(config, "debug_hl_ll_buffer_embedding", False)):
+            print(f"[HL-LL-EMB-WARN] failed to load low-level encoder: {exc}")
+        return None
+
+
+def compute_hl_ll_buffer_embedding(orch, t_now: float, n_machines: int, config=configs) -> np.ndarray:
+    if not bool(getattr(config, "hl_use_ll_buffer_embedding", False)):
+        return np.zeros(0, dtype=np.float32)
+    if not orch or not getattr(orch, "buffer", None):
+        return _zero_ll_buffer_embedding(config)
+
+    model = _get_global_ll_encoder_model(config)
+    if model is None:
+        return _zero_ll_buffer_embedding(config)
+
+    target_dim = int(getattr(config, "hl_ll_buffer_embedding_dim", HL_LL_BUFFER_EMBED_DIM))
+    try:
+        jobs = list(orch.buffer)
+        jl_list, pt_list = orch._build_batch(jobs)
+        due_rel = [float(job.meta.get("due_date", t_now)) - float(t_now) for job in jobs]
+        release_rel = [0.0 for _ in jobs]
+        env = LLFJSPEnv(n_j=len(jobs), n_m=int(n_machines))
+        state = env.set_initial_data(
+            jl_list,
+            pt_list,
+            due_date_list=[due_rel],
+            true_due_date_list=[due_rel],
+            release_time_list=[release_rel],
+        )
+        device = torch.device(getattr(config, "device", "cpu"))
+        with torch.no_grad():
+            _, _, fea_j_global, fea_m_global = model.feature_exact(
+                state.fea_j_tensor.to(device),
+                state.op_mask_tensor.to(device),
+                state.candidate_tensor.to(device),
+                state.fea_m_tensor.to(device),
+                state.mch_mask_tensor.to(device),
+                state.comp_idx_tensor.to(device),
+                state.dynamic_pair_mask_tensor.to(device),
+                state.fea_pairs_tensor.to(device),
+            )
+            emb = torch.cat((fea_j_global[0], fea_m_global[0]), dim=-1).detach().float().cpu().numpy()
+        if emb.size < target_dim:
+            emb = np.pad(emb, (0, target_dim - emb.size), mode="constant")
+        elif emb.size > target_dim:
+            emb = emb[:target_dim]
+        return emb.astype(np.float32)
+    except Exception as exc:
+        if bool(getattr(config, "debug_hl_ll_buffer_embedding", False)):
+            print(f"[HL-LL-EMB-WARN] failed to compute buffer embedding: {exc}")
+        return _zero_ll_buffer_embedding(config)
 
 
 def _baseline_cache_key(
@@ -29,6 +118,10 @@ def _baseline_cache_key(
     hl_burst_size_high: int,
     hl_bottleneck_order_prob: float,
     hl_bottleneck_order_machine_count: int,
+    hl_bottleneck_exclude_urgent: bool,
+    hl_bottleneck_group_sampling: str,
+    hl_bottleneck_avoid_prev_machines: bool,
+    ll_eval_action_selection: str,
     arrival_mode: str,
     interarrival_uniform_low: float,
     interarrival_uniform_high: float,
@@ -47,7 +140,7 @@ def _baseline_cache_key(
 ) -> str:
     return "|".join(
         [
-            "baseline-v2",
+            "baseline-v4",
             str(int(instance_seed)),
             str(int(cadence)),
             str(int(n_machines)),
@@ -61,6 +154,10 @@ def _baseline_cache_key(
             str(int(hl_burst_size_high)),
             f"{float(hl_bottleneck_order_prob):.12g}",
             str(int(hl_bottleneck_order_machine_count)),
+            str(bool(hl_bottleneck_exclude_urgent)),
+            str(hl_bottleneck_group_sampling),
+            str(bool(hl_bottleneck_avoid_prev_machines)),
+            str(ll_eval_action_selection),
             str(arrival_mode),
             f"{float(interarrival_uniform_low):.12g}",
             f"{float(interarrival_uniform_high):.12g}",
@@ -90,6 +187,8 @@ def compute_cadence_baseline_for_seed(
     init_jobs: int,
     cadence: int = 1,
 ) -> Dict[str, float]:
+    setup_seed(int(instance_seed))
+    setattr(configs, "ll_eval_action_selection", "greedy")
     rng = np.random.default_rng(int(instance_seed))
     scenario = resolve_hl_env_scenario(configs, rng)
     base_cfg = scenario_config(configs, scenario)
@@ -191,20 +290,22 @@ class HLGateEnv(gym.Env):
         self.baseline_final_mk = 0.0
         self.baseline_release_count = 0
         self.baseline_event_td = []
-        self.baseline_cadence = int(getattr(
-            configs,
-            "baseline_cadence",
-            getattr(configs, "hl_gate_decision_interval", 1),
-        ))
+        setattr(configs, "ll_eval_action_selection", "greedy")
+        self.baseline_cadence = int(getattr(configs, "baseline_cadence", 1))
+        self.baseline_event_cadence = self._effective_baseline_event_cadence(self.baseline_cadence)
         self._last_release_event_idx = 0
         self._last_release_td = 0.0
         self._prev_arrival_time = 0.0
         self.instance_seed = 0
         self.steps_since_last_release = 0
+        self.use_ll_buffer_embedding = bool(getattr(configs, "hl_use_ll_buffer_embedding", False))
+        self.ll_buffer_embedding_dim = int(getattr(configs, "hl_ll_buffer_embedding_dim", HL_LL_BUFFER_EMBED_DIM))
+        self._ll_encoder_model = None
+        self._ll_encoder_load_failed = False
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(HL_GATE_STATE_DIM,),
+            shape=(get_hl_gate_state_dim(configs),),
             dtype=np.float32,
         )
         self.action_space = spaces.Discrete(2)
@@ -291,6 +392,11 @@ class HLGateEnv(gym.Env):
         event_idx = int(event_idx)
         return bool(event_idx >= horizon or event_idx % K == 0)
 
+    @staticmethod
+    def _effective_baseline_event_cadence(decision_cadence: int) -> int:
+        decision_interval = max(1, int(getattr(configs, "hl_gate_decision_interval", 1)))
+        return max(1, int(decision_cadence)) * decision_interval
+
     def _advance_sim_to_next_arrival(self, gen, orch, all_job_due_dates, t_next: float):
         t_event = float(t_next)
         new_jobs = gen.generate_burst(t_event)
@@ -306,6 +412,8 @@ class HLGateEnv(gym.Env):
         )
 
     def _build_simulation(self, instance_seed: int):
+        setup_seed(int(instance_seed))
+        setattr(configs, "ll_eval_action_selection", "greedy")
         rng = np.random.default_rng(int(instance_seed))
         scenario = resolve_hl_env_scenario(configs, rng)
         base_cfg = scenario_config(configs, scenario)
@@ -331,10 +439,11 @@ class HLGateEnv(gym.Env):
         return rng, gen, orch, all_job_due_dates, t_now, t_next, release_count
 
     def _run_cadence_baseline(self, instance_seed: int, cadence: Optional[int] = None) -> Dict[str, object]:
-        cadence = max(1, int(self.baseline_cadence if cadence is None else cadence))
+        decision_cadence = max(1, int(self.baseline_cadence if cadence is None else cadence))
+        event_cadence = self._effective_baseline_event_cadence(decision_cadence)
         cache_key = _baseline_cache_key(
             int(instance_seed),
-            int(cadence),
+            int(event_cadence),
             int(self.M),
             int(self.init_jobs),
             int(self.event_horizon),
@@ -346,6 +455,10 @@ class HLGateEnv(gym.Env):
             int(getattr(configs, "hl_burst_size_high", 5)),
             float(getattr(configs, "hl_bottleneck_order_prob", 0.0)),
             int(getattr(configs, "hl_bottleneck_order_machine_count", 1)),
+            bool(getattr(configs, "hl_bottleneck_exclude_urgent", False)),
+            str(getattr(configs, "hl_bottleneck_group_sampling", "random")),
+            bool(getattr(configs, "hl_bottleneck_avoid_prev_machines", False)),
+            str(getattr(configs, "ll_eval_action_selection", "greedy")),
             str(getattr(configs, "arrival_mode", "exponential")),
             float(getattr(configs, "interarrival_uniform_low", 10.0)),
             float(getattr(configs, "interarrival_uniform_high", 50.0)),
@@ -388,7 +501,7 @@ class HLGateEnv(gym.Env):
             burst_k=int(self.burst_K),
             event_horizon=int(self.event_horizon),
             init_jobs=int(self.init_jobs),
-            cadence=int(cadence),
+            cadence=int(event_cadence),
         )
         result = {
             "td": float(baseline["td"]),
@@ -431,7 +544,7 @@ class HLGateEnv(gym.Env):
         is_last_step = bool((self.events_done + 1) >= self.event_horizon)
         decision_interval = max(1, int(getattr(configs, "hl_gate_decision_interval", 1)))
         decision_steps_elapsed = max(0, int(self.events_done) // decision_interval)
-        return calculate_hl_gate_state(
+        obs = calculate_hl_gate_state(
             len(self.orch.buffer),
             self.orch.machine_free_time,
             t_now,
@@ -449,6 +562,41 @@ class HLGateEnv(gym.Env):
             is_last_step=is_last_step,
             buffer_jobs=self.orch.buffer,
         )
+        if self.use_ll_buffer_embedding:
+            obs = np.concatenate((obs, self._compute_ll_buffer_embedding()), axis=0).astype(np.float32)
+        return obs
+
+    def _get_ll_encoder_model(self):
+        if self._ll_encoder_model is not None:
+            return self._ll_encoder_model
+        if self._ll_encoder_load_failed:
+            return None
+
+        model_path = str(getattr(configs, "ll_ppo_model_path", "") or "")
+        if not model_path or not os.path.exists(model_path):
+            self._ll_encoder_load_failed = True
+            return None
+
+        try:
+            device = torch.device(getattr(configs, "device", "cpu"))
+            model = LLDANNet(configs).to(device)
+            model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+            model.eval()
+            for param in model.parameters():
+                param.requires_grad_(False)
+            self._ll_encoder_model = model
+            return self._ll_encoder_model
+        except Exception as exc:
+            self._ll_encoder_load_failed = True
+            if bool(getattr(configs, "debug_hl_ll_buffer_embedding", False)):
+                print(f"[HL-LL-EMB-WARN] failed to load low-level encoder: {exc}")
+            return None
+
+    def _zero_ll_buffer_embedding(self) -> np.ndarray:
+        return np.zeros(self.ll_buffer_embedding_dim, dtype=np.float32)
+
+    def _compute_ll_buffer_embedding(self) -> np.ndarray:
+        return compute_hl_ll_buffer_embedding(self.orch, self.t_now, self.M, configs)
 
     def _get_buffer_stats(self, t_now: float):
         if not self.orch.buffer: return {"buffer_neg_slack_ratio": 0.0, "min_slack": 0.0, "avg_slack": 0.0, "slack_std": 0.0, "slack_q25": 0.0}
@@ -488,11 +636,9 @@ class HLGateEnv(gym.Env):
         _, self.gen, self.orch, self.all_job_due_dates, self.t_now, self.t_next, self.release_count = self._build_simulation(instance_seed)
         self.episode_tardiness, self.events_done = 0.0, 0
         self.agent_release_count = 0
-        self.baseline_cadence = int(getattr(
-            configs,
-            "baseline_cadence",
-            getattr(configs, "hl_gate_decision_interval", 1),
-        ))
+        setattr(configs, "ll_eval_action_selection", "greedy")
+        self.baseline_cadence = int(getattr(configs, "baseline_cadence", 1))
+        self.baseline_event_cadence = self._effective_baseline_event_cadence(self.baseline_cadence)
         td_signal_source = self._resolve_td_signal_source()
         needs_baseline = td_signal_source in ("baseline_gap_final", "baseline_gap_release_interval")
         if options.get("needs_baseline", True) is False:
@@ -725,6 +871,7 @@ class HLGateEnv(gym.Env):
             "baseline_final_mk": float(self.baseline_final_mk),
             "baseline_release_count": int(self.baseline_release_count),
             "baseline_cadence": int(self.baseline_cadence),
+            "baseline_event_cadence": int(getattr(self, "baseline_event_cadence", self._effective_baseline_event_cadence(self.baseline_cadence))),
             "td_gap_vs_baseline_cadence": float(td_gap),
         }
         

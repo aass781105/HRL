@@ -64,8 +64,9 @@ BatchScheduleRecorder.record_step = patched_record_step
 # ============================== End of Monkey Patch ===============================
 
 
-from model.hl_gate_state import HL_GATE_STATE_DIM, calculate_hl_gate_state
+from model.hl_gate_state import HL_GATE_STATE_DIM, HL_LL_BUFFER_EMBED_DIM, calculate_hl_gate_state, get_hl_gate_state_dim
 from model.hl_ppo_gate_model import HLPPOGateNet
+from hl_gate_env import compute_hl_ll_buffer_embedding
 
 def fixed_k_sampler(K: int):
     """[ADDED] 固定一次釋放 K 筆的 sampler。"""
@@ -113,7 +114,7 @@ def _gate_obs(orch: GlobalTimelineOrchestrator, n_machines: int, t_now: float,
 
     wip_stats = orch.get_wip_stats(t_now)
 
-    return calculate_hl_gate_state(
+    obs = calculate_hl_gate_state(
         buffer_size=len(orch.buffer),
         machine_free_time=orch.machine_free_time,
         t_now=t_now,
@@ -131,6 +132,12 @@ def _gate_obs(orch: GlobalTimelineOrchestrator, n_machines: int, t_now: float,
         is_last_step=is_last_step,
         buffer_jobs=orch.buffer,
     )
+    if bool(getattr(configs, "hl_use_ll_buffer_embedding", False)):
+        obs = np.concatenate(
+            (obs, compute_hl_ll_buffer_embedding(orch, t_now, n_machines, configs)),
+            axis=0,
+        ).astype(np.float32)
+    return obs
 
 
 def run_dynamic_ppo_episode(adapter, ppo_policy, hl_action_selection, ll_action_selection, device, max_events,
@@ -300,7 +307,7 @@ def main():
             gate_policy = 'cadence'
         else:
             ppo_gate_model = HLPPOGateNet(
-                obs_dim=HL_GATE_STATE_DIM,
+                obs_dim=get_hl_gate_state_dim(configs),
                 n_actions=2,
                 hidden=int(getattr(configs, "hl_ppo_hidden_dim", 256)),
                 num_layers=int(getattr(configs, "hl_ppo_num_layers", 3)),
@@ -314,6 +321,10 @@ def main():
             use_residual=bool(getattr(configs, "hl_ppo_use_residual", False)),
             use_glu=bool(getattr(configs, "hl_ppo_use_glu", False)),
             pre_norm=bool(getattr(configs, "hl_ppo_pre_norm", False)),
+            manual_obs_dim=HL_GATE_STATE_DIM,
+            ll_embed_raw_dim=int(getattr(configs, "hl_ll_buffer_embedding_dim", HL_LL_BUFFER_EMBED_DIM)) if bool(getattr(configs, "hl_use_ll_buffer_embedding", False)) else 0,
+            ll_embed_proj_dim=int(getattr(configs, "hl_ll_buffer_projection_dim", 16)),
+            initial_release_prob=float(getattr(configs, "hl_initial_release_prob", -1.0)),
             ).to(device)
             ppo_gate_model.load_state_dict(torch.load(ppo_gate_model_path, map_location=device, weights_only=True))
             ppo_gate_model.eval()
