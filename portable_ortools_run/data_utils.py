@@ -239,64 +239,30 @@ def generate_due_dates(job_length, op_pt, tightness=1.2, due_date_mode='k', seed
         due_range = n_j * mean_pt
         return rng.uniform(-due_range, due_range, size=n_j)
 
-    if due_date_mode in ('range15', 'range2'):
-        # 1.5x wider than range: Uniform(-1.5*n_j*mean_pt, 1.5*n_j*mean_pt)
-        # Keep "range2" as backward-compatible alias.
+
+    if due_date_mode == 'normal_only':
         from params import configs
-        mean_pt = (float(configs.low) + float(configs.high)) / 2.0
-        due_range = 1.5 * n_j * mean_pt
-        return rng.uniform(-due_range, due_range, size=n_j)
+        k_normal_low = float(getattr(configs, "hl_due_date_k_normal_low", 4.0))
+        k_normal_high = float(getattr(configs, "hl_due_date_k_normal_high", 7.0))
+        k_factors = rng.uniform(k_normal_low, k_normal_high, size=n_j)
+        return job_work * k_factors
 
-    if due_date_mode == 'norm':
+    if due_date_mode == 'mix_urgent_normal':
         from params import configs
-
-        mean_pt = (float(configs.low) + float(configs.high)) / 2.0
-        a = int(op_pt.shape[1]) * mean_pt
-        # Instance-level parameters: all jobs in this instance share one mu/sigma pair.
-        mu = float(rng.uniform(-a / 2.0, a * 1.5))
-        sigma = float(rng.uniform(a / 2.0, a))
-        return rng.normal(loc=mu, scale=sigma, size=n_j)
-
-    if due_date_mode == 'dynamic_shift':
-        from params import configs
-
-        base_low = float(getattr(configs, "dynamic_due_base_low", 1.2))
-        base_high = float(getattr(configs, "dynamic_due_base_high", 2.0))
-        shift_per_job = float(getattr(configs, "dynamic_due_shift_per_job", 0.2))
-        ref_n_j = int(getattr(configs, "dynamic_due_ref_n_j", 10))
-        shift = shift_per_job * max(0, int(n_j) - ref_n_j)
-        low = base_low - shift
-        high = base_high - shift
-        if low > high:
-            low, high = high, low
-        factors = rng.uniform(low, high, size=int(n_j))
-        min_factor = getattr(configs, "dynamic_due_min_factor", None)
-        if min_factor is not None:
-            factors = np.maximum(factors, float(min_factor))
-        return job_work * factors
-
-    if due_date_mode == 'M':
-        total_work = np.sum(job_work)
-        base = total_work / n_m
+        urgent_prob = float(getattr(configs, "hl_due_date_urgent_prob", 0.3))
+        k_urgent_low = float(getattr(configs, "hl_due_date_k_urgent_low", 1.5))
+        k_urgent_high = float(getattr(configs, "hl_due_date_k_urgent_high", 2.5))
+        k_normal_low = float(getattr(configs, "hl_due_date_k_normal_low", 4.0))
+        k_normal_high = float(getattr(configs, "hl_due_date_k_normal_high", 7.0))
         
-        if noise_level > 0:
-            noise = rng.uniform(-noise_level, noise_level, size=n_j)
-            return base * float(tightness) * (1 + noise)
-        elif noise_level < 0:
-            level = abs(noise_level)
-            mean_work = np.mean(job_work)
-            norm_diff = (job_work - mean_work) / mean_work if mean_work > 0 else np.zeros(n_j)
-            return base * float(tightness) * (1 + norm_diff * level)
-        else:
-            return np.full(n_j, base * float(tightness))
+        is_urgent = rng.uniform(0.0, 1.0, size=n_j) < urgent_prob
+        k_urgent = rng.uniform(k_urgent_low, k_urgent_high, size=n_j)
+        k_normal = rng.uniform(k_normal_low, k_normal_high, size=n_j)
+        k_factors = np.where(is_urgent, k_urgent, k_normal)
+        return job_work * k_factors
 
-    # Default 'k' Mode (Individual) with configurable workload multiplier range.
-    from params import configs
-    k_low = float(getattr(configs, "due_date_k_low", 1.2))
-    k_high = float(getattr(configs, "due_date_k_high", 6.0))
-    if k_low > k_high:
-        k_low, k_high = k_high, k_low
-    k_factors = rng.uniform(k_low, k_high, size=int(n_j))
+    # Default 'k' Mode (Individual) with constant tightness.
+    k_factors = np.full(n_j, tightness)
     return job_work * k_factors
 
 

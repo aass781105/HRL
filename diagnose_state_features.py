@@ -291,7 +291,7 @@ def main():
 
     for episode in range(int(LOCAL_ARGS.episodes)):
         jl, pt, _ = SD2_instance_generator(configs, rng=rng)
-        due_mode = str(getattr(configs, "due_date_mode", "range"))
+        due_mode = str(getattr(configs, "ll_due_date_mode", "range"))
         due = generate_due_dates(jl, pt, due_date_mode=due_mode, rng=rng)
 
         env = FJSPEnvForVariousOpNums(n_j=n_j, n_m=n_m)

@@ -18,10 +18,10 @@ import re
 
 # --- Core components from the project ---
 from params import configs
-from model.PPO_dynamic import PPO
+from model.ll_ppo import LLPPO
 from common_utils import sample_action, greedy_select_action
 from data_utils import SD2_instance_generator
-from global_env import (
+from hrl_orchestrator import (
     GlobalTimelineOrchestrator,
     EventBurstGenerator,
     BatchScheduleRecorder,
@@ -64,8 +64,8 @@ BatchScheduleRecorder.record_step = patched_record_step
 # ============================== End of Monkey Patch ===============================
 
 
-from model.gate_state import calculate_gate_state
-from model.ppo_gate_model import PPOGateNet
+from model.hl_gate_state import HL_GATE_STATE_DIM, calculate_hl_gate_state
+from model.hl_ppo_gate_model import HLPPOGateNet
 
 def fixed_k_sampler(K: int):
     """[ADDED] 固定一次釋放 K 筆的 sampler。"""
@@ -76,7 +76,10 @@ def fixed_k_sampler(K: int):
 def _gate_obs(orch: GlobalTimelineOrchestrator, n_machines: int, t_now: float,
               burst_K: int, interarrival_mean: float,
               buf_cap_cfg: int = 0,
-              is_last_step: bool = False) -> np.ndarray:
+              is_last_step: bool = False,
+              steps_since_last_release: int = 0,
+              release_count_so_far: int = 0,
+              decision_steps_elapsed: int = 0) -> np.ndarray:
     """
     Calculates the observation for the PPO high-level gate policy.
     """
@@ -110,7 +113,7 @@ def _gate_obs(orch: GlobalTimelineOrchestrator, n_machines: int, t_now: float,
 
     wip_stats = orch.get_wip_stats(t_now)
 
-    return calculate_gate_state(
+    return calculate_hl_gate_state(
         buffer_size=len(orch.buffer),
         machine_free_time=orch.machine_free_time,
         t_now=t_now,
@@ -122,18 +125,23 @@ def _gate_obs(orch: GlobalTimelineOrchestrator, n_machines: int, t_now: float,
         buffer_stats=buf_stats,
         wip_stats=wip_stats,
         inter_arrival_scaled=0.0,
-        steps_since_last_release=0,
+        steps_since_last_release=steps_since_last_release,
+        release_count_so_far=release_count_so_far,
+        decision_steps_elapsed=decision_steps_elapsed,
         is_last_step=is_last_step,
+        buffer_jobs=orch.buffer,
     )
 
 
-def run_dynamic_ppo_episode(adapter, ppo_policy, action_selection, device, max_events,
+def run_dynamic_ppo_episode(adapter, ppo_policy, hl_action_selection, ll_action_selection, device, max_events,
                             gate_policy, ppo_gate_model, burst_size, interarrival_mean, job_gen):
     """
     Runs a single dynamic episode with PPO or cadence gate decisions.
     """
     orch = adapter.o
     release_count = 0
+    gate_release_count = 0
+    steps_since_last_release = 0
     t_prev = 0.0
 
     num_arrivals = 0
@@ -152,7 +160,15 @@ def run_dynamic_ppo_episode(adapter, ppo_policy, action_selection, device, max_e
             
         # --- Gating Decision ---
         decide_release = False
-        if gate_policy == 'ppo' and ppo_gate_model is not None and len(orch.buffer) > 0:
+        K = int(getattr(configs, "hl_gate_decision_interval", 1))
+        is_decision_step = ((num_arrivals - 1) % K == 0)
+        is_last_step = bool(num_arrivals >= max_events)
+
+        if is_last_step:
+            decide_release = True
+        elif not is_decision_step:
+            decide_release = False
+        elif gate_policy == 'ppo' and ppo_gate_model is not None and len(orch.buffer) > 0:
             gate_obs_buffer_cap = int(getattr(configs, "gate_obs_buffer_cap", 0))
             obs = _gate_obs(
                 orch,
@@ -161,26 +177,43 @@ def run_dynamic_ppo_episode(adapter, ppo_policy, action_selection, device, max_e
                 burst_size,
                 interarrival_mean,
                 buf_cap_cfg=gate_obs_buffer_cap,
-                is_last_step=bool(num_arrivals >= max_events),
+                is_last_step=is_last_step,
+                steps_since_last_release=steps_since_last_release,
+                release_count_so_far=gate_release_count,
+                decision_steps_elapsed=max(0, (num_arrivals - 1) // max(1, K)),
             )
             with torch.no_grad():
                 logits, _ = ppo_gate_model(torch.from_numpy(obs).float().unsqueeze(0).to(device))
-                if action_selection == 'sample':
+                if hl_action_selection == 'sample':
                     act = torch.distributions.Categorical(logits=logits).sample().item()
                 else:
                     act = torch.argmax(logits, dim=1).item()
             if float(obs[-1]) >= 0.5:
                 act = 1
             decide_release = (act == 1)
+        elif gate_policy == 'random':
+            prob = float(getattr(configs, "hl_random_release_prob", 0.087))
+            act = 1 if (np.random.rand() < prob) else 0
+            decide_release = (act == 1)
+        elif gate_policy == 'slack_threshold':
+            threshold = float(getattr(configs, "hl_buffer_slack_release_threshold", 0.0))
+            if len(orch.buffer) > 0:
+                min_slack = min(float(j.meta.get("due_date", 0.0)) - (t_now + float(j.meta.get("total_proc_time", 0.0))) for j in orch.buffer)
+                decide_release = (min_slack < threshold)
+            else:
+                decide_release = False
         else:
-            cadence = max(1, int(getattr(configs, "gate_cadence", 1)))
-            decide_release = bool(num_arrivals >= max_events) or (num_arrivals % cadence == 0)
+            cadence = max(1, int(getattr(configs, "hl_gate_cadence", getattr(configs, "gate_cadence", 1))))
+            decision_step_idx = (num_arrivals - 1) // K + 1
+            decide_release = (decision_step_idx % cadence == 0)
         
         # --- Scheduling (if released) ---
         if decide_release:
             state_ppo = adapter.begin_new_batch(t_now)
             if state_ppo:
                 release_count += 1
+                gate_release_count += 1
+                steps_since_last_release = 0
                 while True:
                     with torch.no_grad():
                         pi, _ = ppo_policy(
@@ -190,7 +223,7 @@ def run_dynamic_ppo_episode(adapter, ppo_policy, action_selection, device, max_e
                             dynamic_pair_mask=state_ppo.dynamic_pair_mask_tensor, fea_pairs=state_ppo.fea_pairs_tensor
                         )
                     
-                    if action_selection == 'sample':
+                    if ll_action_selection == 'sample':
                         action_ppo, _ = sample_action(pi)
                     else:
                         action_ppo = greedy_select_action(pi)
@@ -200,6 +233,8 @@ def run_dynamic_ppo_episode(adapter, ppo_policy, action_selection, device, max_e
                     if sub_done:
                         break
                 adapter.finalize_batch()
+        else:
+            steps_since_last_release += 1
         
         t_next = job_gen.sample_next_time(t_now)
             
@@ -219,7 +254,7 @@ def run_dynamic_ppo_episode(adapter, ppo_policy, action_selection, device, max_e
                     fea_m=state_ppo.fea_m_tensor, mch_mask=state_ppo.mch_mask_tensor, comp_idx=state_ppo.comp_idx_tensor,
                     dynamic_pair_mask=state_ppo.dynamic_pair_mask_tensor, fea_pairs=state_ppo.fea_pairs_tensor
                 )
-            if action_selection == 'sample':
+            if ll_action_selection == 'sample':
                 action_ppo, _ = sample_action(pi)
             else:
                 action_ppo = greedy_select_action(pi)
@@ -243,11 +278,12 @@ def main():
     burst_size = configs.burst_size
 
     model_name = getattr(configs, 'eval_model_name', 'default_model')
-    ppo_model_path = getattr(configs, 'ppo_model_path', None)
-    action_selection = getattr(configs, 'eval_action_selection', 'sample')
+    ppo_model_path = getattr(configs, 'll_ppo_model_path', None)
+    hl_action_selection = getattr(configs, 'hl_eval_action_selection', 'sample')
+    ll_action_selection = getattr(configs, 'll_eval_action_selection', 'sample')
 
-    gate_policy = getattr(configs, 'gate_policy', 'ppo').lower()
-    ppo_gate_model_path = getattr(configs, 'ppo_gate_model_path', None)
+    gate_policy = getattr(configs, 'hl_gate_policy', 'ppo').lower()
+    ppo_gate_model_path = getattr(configs, 'hl_ppo_model_path', None)
     
     if not ppo_model_path:
         tqdm.write("Error: PPO model path not specified. Please set --eval_ppo_model_path.")
@@ -263,18 +299,21 @@ def main():
             tqdm.write("       Falling back to cadence gate policy.")
             gate_policy = 'cadence'
         else:
-            ppo_gate_model = PPOGateNet(
-                obs_dim=22,
+            ppo_gate_model = HLPPOGateNet(
+                obs_dim=HL_GATE_STATE_DIM,
                 n_actions=2,
-                hidden=int(getattr(configs, "ppo_gate_hidden_dim", 256)),
-                num_layers=int(getattr(configs, "ppo_gate_num_layers", 3)),
-                separate_trunks=bool(getattr(configs, "ppo_gate_separate_trunks", False)),
-                actor_hidden=int(getattr(configs, "ppo_gate_actor_hidden_dim", getattr(configs, "ppo_gate_hidden_dim", 256))),
-                actor_num_layers=int(getattr(configs, "ppo_gate_actor_num_layers", getattr(configs, "ppo_gate_num_layers", 3))),
-                critic_hidden=int(getattr(configs, "ppo_gate_critic_hidden_dim", getattr(configs, "ppo_gate_hidden_dim", 256))),
-                critic_num_layers=int(getattr(configs, "ppo_gate_critic_num_layers", getattr(configs, "ppo_gate_num_layers", 3))),
-                value_hidden=int(getattr(configs, "ppo_gate_value_hidden_dim", getattr(configs, "ppo_gate_hidden_dim", 256))),
-                value_num_layers=int(getattr(configs, "ppo_gate_value_num_layers", 1)),
+                hidden=int(getattr(configs, "hl_ppo_hidden_dim", 256)),
+                num_layers=int(getattr(configs, "hl_ppo_num_layers", 3)),
+                separate_trunks=bool(getattr(configs, "hl_ppo_separate_trunks", False)),
+                actor_hidden=int(getattr(configs, "hl_ppo_actor_hidden_dim", getattr(configs, "hl_ppo_hidden_dim", 256))),
+                actor_num_layers=int(getattr(configs, "hl_ppo_actor_num_layers", getattr(configs, "hl_ppo_num_layers", 3))),
+                critic_hidden=int(getattr(configs, "hl_ppo_critic_hidden_dim", getattr(configs, "hl_ppo_hidden_dim", 256))),
+                critic_num_layers=int(getattr(configs, "hl_ppo_critic_num_layers", getattr(configs, "hl_ppo_num_layers", 3))),
+                value_hidden=int(getattr(configs, "hl_ppo_value_hidden_dim", getattr(configs, "hl_ppo_hidden_dim", 256))),
+                value_num_layers=int(getattr(configs, "hl_ppo_value_num_layers", 1)),
+            use_residual=bool(getattr(configs, "hl_ppo_use_residual", False)),
+            use_glu=bool(getattr(configs, "hl_ppo_use_glu", False)),
+            pre_norm=bool(getattr(configs, "hl_ppo_pre_norm", False)),
             ).to(device)
             ppo_gate_model.load_state_dict(torch.load(ppo_gate_model_path, map_location=device, weights_only=True))
             ppo_gate_model.eval()
@@ -327,7 +366,7 @@ def main():
             adapter = OrchestratorAdapter(orchestrator, n_machines=configs.n_m)
             
             makespan, rel_cnt = run_dynamic_ppo_episode(
-                adapter, ppo_policy, action_selection, device, event_horizon,
+                adapter, ppo_policy, hl_action_selection, ll_action_selection, device, event_horizon,
                 gate_policy, ppo_gate_model, burst_size, interarrival_mean,
                 job_generator
             )

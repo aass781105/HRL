@@ -66,8 +66,8 @@ def sample_initial_jobs(config, *, rng: np.random.Generator, base_job_id: int = 
     dd_rel = generate_due_dates(
         jl,
         pt,
-        tightness=getattr(config, "due_date_tightness", 1.2),
-        due_date_mode="k",
+        tightness=getattr(config, "hl_due_date_tightness", 1.2),
+        due_date_mode="normal_only",
         rng=rng,
     )
     return split_matrix_to_jobs(jl, pt, base_job_id=base_job_id, t_arrive=float(t_arrive), due_dates=float(t_arrive) + dd_rel)
@@ -205,7 +205,7 @@ def dynamic_job_stream_to_dict(stream: Dict, config=None) -> Dict:
                 "interarrival_uniform_high": float(getattr(config, "interarrival_uniform_high", 0.0)),
                 "burst_size": int(getattr(config, "burst_size", 1)),
                 "event_horizon": int(getattr(config, "event_horizon", len(stream["events"]))),
-                "due_date_tightness": float(getattr(config, "due_date_tightness", 1.2)),
+                "hl_due_date_tightness": float(getattr(config, "hl_due_date_tightness", 1.2)),
                 "init_jobs": int(getattr(config, "init_jobs", 0)),
             }
         )

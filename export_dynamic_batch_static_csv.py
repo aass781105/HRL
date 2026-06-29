@@ -62,7 +62,7 @@ def infer_n_machines_from_payload(payload: Dict) -> int:
 
 
 def build_job_spec(job_payload: Dict, n_m: int) -> JobSpec:
-    from global_env import JobSpec, OperationSpec
+    from hrl_orchestrator import JobSpec, OperationSpec
 
     operations: List[OperationSpec] = []
     ops_payload = sorted(job_payload.get("operations", []), key=lambda x: int(x.get("op_id", 0)))
@@ -98,7 +98,7 @@ def build_job_spec(job_payload: Dict, n_m: int) -> JobSpec:
 
 
 def load_instance_as_run_input(path: str) -> RunInput:
-    from global_env import JobSpec, OperationSpec
+    from hrl_orchestrator import JobSpec, OperationSpec
     from params import configs
 
     payload = load_payload(path)
@@ -161,7 +161,7 @@ def record_batch_rows(
 
 
 def run_one_environment(run_id: int, run_input: RunInput, cadence: int, output_rows: List[Dict]):
-    from global_env import GlobalTimelineOrchestrator
+    from hrl_orchestrator import GlobalTimelineOrchestrator
 
     orch = GlobalTimelineOrchestrator(int(run_input.n_machines), job_generator=None, t0=0.0)
     orch.reset(t0=0.0)

@@ -1,0 +1,10 @@
+{
+  "case_npz": "debug\\dynamic_r60_candidate_features\\r060_event118_t03691_fixed_ll_case.npz",
+  "batch_time": 3691.2481285285403,
+  "event_id": 118,
+  "job_count": 51,
+  "op_count": 216,
+  "machine_count": 5,
+  "model_path": "trained_network\\SD2\\ll_u1030_esttd_odprog.pth",
+  "note": "Times in *_rel are shifted so the dynamic release time is static t=0."
+}

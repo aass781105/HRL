@@ -7,7 +7,8 @@ import numpy as np
 import torch
 
 from data_utils import SD2_instance_generator, generate_due_dates
-from global_env import EventBurstGenerator, GlobalTimelineOrchestrator, JobSpec, split_matrix_to_jobs
+from hrl_orchestrator import EventBurstGenerator, GlobalTimelineOrchestrator, JobSpec, split_matrix_to_jobs
+from hl_env_scenarios import apply_bottleneck_orders, make_burst_sampler, resolve_hl_env_scenario, scenario_config
 
 
 def fixed_k_sampler(k: int):
@@ -28,7 +29,8 @@ def seed_dynamic_simulation(seed: int) -> np.random.Generator:
 
 
 def create_dynamic_generator(config, *, interarrival_mean: float, burst_k: int, rng: np.random.Generator) -> EventBurstGenerator:
-    base_cfg = copy.deepcopy(config)
+    scenario = resolve_hl_env_scenario(config, rng)
+    base_cfg = scenario_config(config, scenario)
     # Keep main/dynamic world separate from low-level training data mixture:
     # dynamic arrivals use fixed 5 operations per job.
     setattr(base_cfg, "op_per_job", 5)
@@ -36,9 +38,9 @@ def create_dynamic_generator(config, *, interarrival_mean: float, burst_k: int, 
     return EventBurstGenerator(
         SD2_instance_generator,
         base_cfg,
-        int(config.n_m),
-        float(interarrival_mean),
-        fixed_k_sampler(int(burst_k)),
+        int(base_cfg.n_m),
+        float(getattr(base_cfg, "interarrival_mean", interarrival_mean)),
+        make_burst_sampler(base_cfg),
         rng,
     )
 
@@ -53,24 +55,29 @@ def create_dynamic_world(config, *, interarrival_mean: float, burst_k: int, seed
 
 
 def sample_initial_jobs(config, *, rng: np.random.Generator, base_job_id: int = 0, t_arrive: float = 0.0) -> List[JobSpec]:
-    init_jobs = int(getattr(config, "init_jobs", 0))
+    scenario = resolve_hl_env_scenario(config, rng)
+    scenario_cfg = scenario_config(config, scenario)
+    init_jobs = int(getattr(scenario_cfg, "init_jobs", 0))
     if init_jobs <= 0:
         return []
 
-    init_cfg = copy.deepcopy(config)
+    init_cfg = copy.deepcopy(scenario_cfg)
     setattr(init_cfg, "n_j", init_jobs)
     # Keep initial jobs consistent with dynamic bursts: fixed 5 operations.
     setattr(init_cfg, "op_per_job", 5)
     setattr(init_cfg, "enable_op_mixture", False)
     jl, pt, _ = SD2_instance_generator(init_cfg, rng=rng)
-    dd_rel = generate_due_dates(
+    dd_rel, due_info = generate_due_dates(
         jl,
         pt,
-        tightness=getattr(config, "due_date_tightness", 1.2),
-        due_date_mode="k",
+        tightness=getattr(scenario_cfg, "hl_due_date_tightness", 1.2),
+        due_date_mode="mix_urgent_normal",
         rng=rng,
+        return_info=True,
+        due_config=scenario_cfg,
     )
-    return split_matrix_to_jobs(jl, pt, base_job_id=base_job_id, t_arrive=float(t_arrive), due_dates=float(t_arrive) + dd_rel)
+    jobs = split_matrix_to_jobs(jl, pt, base_job_id=base_job_id, t_arrive=float(t_arrive), due_dates=float(t_arrive) + dd_rel, job_info=due_info)
+    return apply_bottleneck_orders(jobs, scenario_cfg, rng, int(scenario_cfg.n_m))
 
 
 def register_initial_jobs(
@@ -114,7 +121,7 @@ def generate_dynamic_job_stream(
     rng = seed_dynamic_simulation(int(seed))
     gen = create_dynamic_generator(config, interarrival_mean=float(interarrival_mean), burst_k=int(burst_k), rng=rng)
     all_job_due_dates: Dict[int, float] = {}
-    init_jobs = sample_initial_jobs(config, rng=rng, base_job_id=0, t_arrive=0.0)
+    init_jobs = sample_initial_jobs(gen.cfg, rng=rng, base_job_id=0, t_arrive=0.0)
     for job in init_jobs:
         all_job_due_dates[job.job_id] = float(job.meta["due_date"])
     if init_jobs:
@@ -172,6 +179,9 @@ def job_to_dict(job: JobSpec) -> Dict:
         "job_id": int(job.job_id),
         "arrive_time": float(job.meta.get("t_arrive", 0.0)),
         "due_date": float(job.meta.get("due_date", 0.0)),
+        "is_urgent": bool(job.meta.get("is_urgent", False)),
+        "due_date_k": float(job.meta.get("due_date_k", 0.0)),
+        "job_work": float(job.meta.get("job_work", job.meta.get("total_proc_time", 0.0))),
         "total_proc_time": float(job.meta.get("total_proc_time", 0.0)),
         "min_total_proc_time": float(job.meta.get("min_total_proc_time", 0.0)),
         "total_ops": int(job.meta.get("total_ops", len(job.operations))),
@@ -205,7 +215,7 @@ def dynamic_job_stream_to_dict(stream: Dict, config=None) -> Dict:
                 "interarrival_uniform_high": float(getattr(config, "interarrival_uniform_high", 0.0)),
                 "burst_size": int(getattr(config, "burst_size", 1)),
                 "event_horizon": int(getattr(config, "event_horizon", len(stream["events"]))),
-                "due_date_tightness": float(getattr(config, "due_date_tightness", 1.2)),
+                "hl_due_date_tightness": float(getattr(config, "hl_due_date_tightness", 1.2)),
                 "init_jobs": int(getattr(config, "init_jobs", 0)),
             }
         )

@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from gantt import plot_global_gantt
-from global_env import GlobalTimelineOrchestrator, JobSpec, OperationSpec
+from hrl_orchestrator import GlobalTimelineOrchestrator, JobSpec, OperationSpec
 from params import configs
 
 
@@ -105,6 +105,9 @@ def build_job_spec(job_payload: Dict, n_m: int) -> JobSpec:
     meta = {
         "t_arrive": float(job_payload.get("arrive_time", 0.0)),
         "due_date": float(job_payload.get("due_date", 0.0)),
+        "is_urgent": bool(job_payload.get("is_urgent", False)),
+        "due_date_k": float(job_payload.get("due_date_k", 0.0)),
+        "job_work": float(job_payload.get("job_work", total_proc_time)),
         "total_proc_time": total_proc_time,
         "min_total_proc_time": min_total_proc_time,
         "total_ops": int(job_payload.get("total_ops", len(operations))),
@@ -121,9 +124,9 @@ def get_payload_arrive_time(payload: Dict, job_id: int) -> float:
 
 
 def ensure_model_path() -> str:
-    model_path = str(getattr(configs, "ppo_model_path", "") or "").strip()
+    model_path = str(getattr(configs, "ll_ppo_model_path", "") or "").strip()
     if not model_path:
-        raise ValueError("Missing configs.ppo_model_path for low-level PPO scheduler.")
+        raise ValueError("Missing configs.ll_ppo_model_path for low-level PPO scheduler.")
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"PPO model path not found: {model_path}")
     return model_path
@@ -149,6 +152,8 @@ def write_schedule_csv(path: str, rows: List[Dict]):
         "Duration",
         "Arrive_Time",
         "Due_Date",
+        "Is_Urgent",
+        "Due_Date_K",
         "Is_Last_Op",
         "Tardiness",
     ]
@@ -168,6 +173,8 @@ def write_schedule_csv(path: str, rows: List[Dict]):
                     "Duration": f"{float(row['Duration']):.10f}",
                     "Arrive_Time": f"{float(row['Arrive_Time']):.10f}",
                     "Due_Date": f"{float(row['Due_Date']):.10f}",
+                    "Is_Urgent": int(bool(row.get("Is_Urgent", False))),
+                    "Due_Date_K": f"{float(row.get('Due_Date_K', 0.0)):.10f}",
                     "Is_Last_Op": int(row["Is_Last_Op"]),
                     "Tardiness": f"{float(row['Tardiness']):.10f}",
                 }
@@ -198,6 +205,7 @@ def run_once(
     output_dir: str,
     write_outputs: bool,
 ) -> Dict:
+    t_start = time.perf_counter()
     cadence = max(1, int(args.cadence))
     jobs_payload = sorted(payload.get("jobs", []), key=lambda x: int(x.get("job_id", 0)))
     init_jobs_payload = sorted(payload.get("init_jobs", []), key=lambda x: int(x.get("job_id", 0)))
@@ -214,6 +222,8 @@ def run_once(
         torch.cuda.manual_seed_all(int(sample_seed))
 
     batch_jobs_due_dates = {int(job.get("job_id", 0)): float(job.get("due_date", 0.0)) for job in jobs_payload}
+    batch_jobs_urgent = {int(job.get("job_id", 0)): bool(job.get("is_urgent", False)) for job in jobs_payload}
+    batch_jobs_due_k = {int(job.get("job_id", 0)): float(job.get("due_date_k", 0.0)) for job in jobs_payload}
 
     orch = GlobalTimelineOrchestrator(int(n_m), job_generator=None, t0=0.0)
 
@@ -318,6 +328,8 @@ def run_once(
                     "Duration": float(row["duration"]),
                     "Arrive_Time": float(next((job.get("arrive_time", job.get("t_arrive_abs", 0.0)) for job in manifest.get("jobs", []) if int(job["job_id"]) == job_id), 0.0)),
                     "Due_Date": due_date,
+                    "Is_Urgent": bool(batch_jobs_urgent.get(job_id, False)),
+                    "Due_Date_K": float(batch_jobs_due_k.get(job_id, 0.0)),
                     "Is_Last_Op": is_last_op,
                     "Tardiness": tardiness,
                 }
@@ -371,13 +383,15 @@ def run_once(
                         "arrive_time": get_payload_arrive_time(payload, jid),
                         "status": status,
                         "due_date": due_date,
+                        "is_urgent": bool(batch_jobs_urgent.get(jid, False)),
+                        "due_date_k": float(batch_jobs_due_k.get(jid, 0.0)),
                         "tardiness": max(0.0, float(row["end"]) - due_date) if is_last_op else 0.0,
                     }
                 )
             with open(details_path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.DictWriter(
                     f,
-                    fieldnames=["job", "op", "machine", "start", "end", "duration", "arrive_time", "status", "due_date", "tardiness"],
+                    fieldnames=["job", "op", "machine", "start", "end", "duration", "arrive_time", "status", "due_date", "is_urgent", "due_date_k", "tardiness"],
                 )
                 writer.writeheader()
                 writer.writerows(detail_rows)
@@ -523,14 +537,15 @@ def run_once(
                     }
                 )
 
+    elapsed_time_sec = time.perf_counter() - t_start
     summary = {
         "instance_json": instance_json_path,
         "solver": "low_level_ppo_cadence_export",
-        "ppo_model_path": str(getattr(configs, "ppo_model_path", "")),
-        "ppo_model_name": os.path.splitext(os.path.basename(str(getattr(configs, "ppo_model_path", ""))))[0],
+        "ppo_model_path": str(getattr(configs, "ll_ppo_model_path", "")),
+        "ppo_model_name": os.path.splitext(os.path.basename(str(getattr(configs, "ll_ppo_model_path", ""))))[0],
         "run": int(run_idx + 1),
         "sample_seed": int(sample_seed),
-        "eval_action_selection": str(getattr(configs, "eval_action_selection", "greedy")),
+        "hl_eval_action_selection": str(getattr(configs, "hl_eval_action_selection", "greedy")),
         "cadence": int(cadence),
         "num_jobs_total": int(len(jobs_payload)),
         "num_events": int(len(events_payload)),
@@ -540,6 +555,7 @@ def run_once(
         "total_tardiness": total_tardiness,
         "objective": "0.5*MK + 0.5*TD",
         "objective_value": objective_value,
+        "elapsed_time_sec": elapsed_time_sec,
         "details_written": bool(write_outputs),
         "manifest_jsonl": manifest_jsonl if write_outputs else "",
         "summary_json": summary_json if write_outputs else "",
@@ -561,7 +577,7 @@ def run_once(
         print(f"Gantt: {gantt_png}")
     print(
         f"Run {run_idx + 1:02d} | sample_seed={sample_seed} | Cadence={cadence} | Batches={len(manifest_rows)} | "
-        f"MK={makespan:.4f} | TD={total_tardiness:.4f}"
+        f"MK={makespan:.4f} | TD={total_tardiness:.4f} | Time={elapsed_time_sec:.3f}s"
     )
     return summary
 
@@ -604,6 +620,8 @@ def main():
     td_mean, td_std = _mean_std([float(row["total_tardiness"]) for row in run_rows])
     obj_mean, obj_std = _mean_std([float(row["objective_value"]) for row in run_rows])
     rel_mean, rel_std = _mean_std([float(row["num_batches_recorded"]) for row in run_rows])
+    elapsed_mean, elapsed_std = _mean_std([float(row["elapsed_time_sec"]) for row in run_rows])
+    elapsed_total = sum(float(row["elapsed_time_sec"]) for row in run_rows)
 
     sample_csv_path = os.path.join(output_dir, "sample_runs_summary.csv")
     with open(sample_csv_path, "w", newline="", encoding="utf-8-sig") as f:
@@ -613,12 +631,13 @@ def main():
             "ppo_model_path",
             "instance_json",
             "sample_seed",
-            "eval_action_selection",
+            "hl_eval_action_selection",
             "cadence",
             "makespan",
             "total_tardiness",
             "obj",
             "release_count",
+            "elapsed_time_sec",
             "summary_json",
             "schedule_csv",
             "batch_summary_csv",
@@ -637,12 +656,13 @@ def main():
                     "ppo_model_path": row["ppo_model_path"],
                     "instance_json": row["instance_json"],
                     "sample_seed": int(row["sample_seed"]),
-                    "eval_action_selection": row["eval_action_selection"],
+                    "hl_eval_action_selection": row["hl_eval_action_selection"],
                     "cadence": int(row["cadence"]),
                     "makespan": f"{float(row['makespan']):.6f}",
                     "total_tardiness": f"{float(row['total_tardiness']):.6f}",
                     "obj": f"{float(row['objective_value']):.6f}",
                     "release_count": int(row["num_batches_recorded"]),
+                    "elapsed_time_sec": f"{float(row['elapsed_time_sec']):.6f}",
                     "summary_json": row["summary_json"],
                     "schedule_csv": row["schedule_csv"],
                     "batch_summary_csv": row["summary_csv"],
@@ -658,7 +678,7 @@ def main():
             "ppo_model_path": run_rows[0]["ppo_model_path"] if run_rows else "",
             "instance_json": instance_json_path,
             "sample_seed": "",
-            "eval_action_selection": str(getattr(configs, "eval_action_selection", "greedy")),
+            "hl_eval_action_selection": str(getattr(configs, "hl_eval_action_selection", "greedy")),
             "cadence": int(cadence),
             "summary_json": "",
             "schedule_csv": "",
@@ -674,6 +694,7 @@ def main():
             "total_tardiness": f"{td_mean:.6f}",
             "obj": f"{obj_mean:.6f}",
             "release_count": f"{rel_mean:.6f}",
+            "elapsed_time_sec": f"{elapsed_mean:.6f}",
         })
         writer.writerow({
             **common,
@@ -682,6 +703,16 @@ def main():
             "total_tardiness": f"{td_std:.6f}",
             "obj": f"{obj_std:.6f}",
             "release_count": f"{rel_std:.6f}",
+            "elapsed_time_sec": f"{elapsed_std:.6f}",
+        })
+        writer.writerow({
+            **common,
+            "run": "TOTAL",
+            "makespan": "",
+            "total_tardiness": "",
+            "obj": "",
+            "release_count": f"{sum(int(row['num_batches_recorded']) for row in run_rows):.6f}",
+            "elapsed_time_sec": f"{elapsed_total:.6f}",
         })
 
     aggregate_json = os.path.join(output_dir, "aggregate_summary.json")
@@ -690,10 +721,10 @@ def main():
             {
                 "instance_json": instance_json_path,
                 "solver": "low_level_ppo_cadence_export",
-                "ppo_model_path": str(getattr(configs, "ppo_model_path", "")),
-                "ppo_model_name": os.path.splitext(os.path.basename(str(getattr(configs, "ppo_model_path", ""))))[0],
+                "ppo_model_path": str(getattr(configs, "ll_ppo_model_path", "")),
+                "ppo_model_name": os.path.splitext(os.path.basename(str(getattr(configs, "ll_ppo_model_path", ""))))[0],
                 "eval_runs": int(eval_runs),
-                "eval_action_selection": str(getattr(configs, "eval_action_selection", "greedy")),
+                "hl_eval_action_selection": str(getattr(configs, "hl_eval_action_selection", "greedy")),
                 "cadence": int(cadence),
                 "makespan_mean": mk_mean,
                 "makespan_std": mk_std,
@@ -703,6 +734,9 @@ def main():
                 "objective_std": obj_std,
                 "release_count_mean": rel_mean,
                 "release_count_std": rel_std,
+                "elapsed_time_sec_mean": elapsed_mean,
+                "elapsed_time_sec_std": elapsed_std,
+                "elapsed_time_sec_total": elapsed_total,
                 "sample_runs_summary_csv": sample_csv_path,
             },
             f,
@@ -714,7 +748,8 @@ def main():
     print(f"Aggregate summary: {aggregate_json}")
     print(
         f"Sample runs={eval_runs} | MK mean/std={mk_mean:.3f}/{mk_std:.3f} | "
-        f"TD mean/std={td_mean:.3f}/{td_std:.3f} | Obj mean/std={obj_mean:.3f}/{obj_std:.3f}"
+        f"TD mean/std={td_mean:.3f}/{td_std:.3f} | Obj mean/std={obj_mean:.3f}/{obj_std:.3f} | "
+        f"Elapsed total={elapsed_total:.3f}s (mean/std={elapsed_mean:.3f}/{elapsed_std:.3f}s)"
     )
 
 

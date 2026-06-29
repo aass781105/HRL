@@ -112,7 +112,7 @@ class EventBurstGenerator:
             jl, pt, _ = self.sd2_fn(self.cfg, rng=self.rng)
         finally:
             if old_n_j is not None: setattr(self.cfg, "n_j", old_n_j)
-        dd_rel = generate_due_dates(jl, pt, tightness=getattr(configs, "due_date_tightness", 1.2), due_date_mode='k', rng=self.rng)
+        dd_rel = generate_due_dates(jl, pt, tightness=getattr(configs, "hl_due_date_tightness", 1.2), due_date_mode='mix_urgent_normal', rng=self.rng)
         jobs = split_matrix_to_jobs(jl, pt, base_job_id=self._next_id, t_arrive=t_event, due_dates=float(t_event)+dd_rel)
         self._next_id += len(jobs)
         return jobs

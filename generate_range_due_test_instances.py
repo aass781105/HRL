@@ -30,7 +30,7 @@ DUE_SETTINGS: Dict[str, Tuple[float, float]] = {
 
 def generate_range_due_dates(n_j: int, setting: str, rng: np.random.Generator) -> Tuple[np.ndarray, float, float]:
     mean_pt = (float(configs.low) + float(configs.high)) / 2.0
-    a = float(getattr(configs, "due_range_scale", 0.5)) * float(n_j) * mean_pt
+    a = float(getattr(configs, "ll_due_range_scale", 0.5)) * float(n_j) * mean_pt
     low_mul, high_mul = DUE_SETTINGS[setting]
     low = low_mul * a
     high = high_mul * a
@@ -54,7 +54,7 @@ def generate_test_instances(
     due_range_scale: float,
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
-    configs.due_range_scale = float(due_range_scale)
+    configs.ll_due_range_scale = float(due_range_scale)
     manifest_rows = []
 
     for n_j in sizes:
@@ -130,7 +130,7 @@ def generate_test_instances(
 def main():
     due_range_scale = _GEN_ARGS.due_range_scale
     if due_range_scale is None:
-        due_range_scale = float(getattr(configs, "due_range_scale", 0.7))
+        due_range_scale = float(getattr(configs, "ll_due_range_scale", 0.7))
 
     generate_test_instances(
         output_dir=_GEN_ARGS.output_dir,

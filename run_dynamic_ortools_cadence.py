@@ -10,9 +10,9 @@ import pandas as pd
 from ortools.sat.python import cp_model
 
 from params import configs
-from global_env import GlobalTimelineOrchestrator, JobSpec
+from hrl_orchestrator import GlobalTimelineOrchestrator, JobSpec
 from dynamic_job_stream import create_dynamic_world, sample_initial_jobs
-from model.gate_state import calculate_gate_state
+from model.hl_gate_state import calculate_hl_gate_state
 from gantt import plot_global_gantt
 from run_dynamic_ppo_cadence_export import build_job_spec, infer_n_machines, load_payload, validate_unique_job_ids
 
@@ -20,7 +20,8 @@ from run_dynamic_ppo_cadence_export import build_job_spec, infer_n_machines, loa
 ORTOOLS_DEFAULT_CONFIG = {
     "gate_policy": "cadence",
     "scheduler_type": "OR-Tools",
-    "gate_cadence": 10,
+    "hl_gate_cadence": 10,
+    "hl_gate_decision_interval": 1,
     "ortools_subproblem_time_limit": 7200.0,
     "ortools_total_solve_time_budget": 0.0,
     "n_m": 5,
@@ -61,8 +62,15 @@ def unscale_time(value: int, time_scale: int) -> float:
     return float(value) / float(max(1, int(time_scale)))
 
 
-def compute_planned_release_count(max_events: int, cadence: int, has_init_release: bool) -> int:
-    event_releases = 0 if int(max_events) <= 0 else int((int(max_events) + int(cadence) - 1) // int(cadence))
+def compute_planned_release_count(
+    max_events: int,
+    cadence: int,
+    decision_interval: int,
+    has_init_release: bool,
+) -> int:
+    """Match hrl_main: cadence is measured in decision steps, not arrivals."""
+    event_interval = max(1, int(cadence)) * max(1, int(decision_interval))
+    event_releases = 0 if int(max_events) <= 0 else int((int(max_events) + event_interval - 1) // event_interval)
     return int(event_releases + (1 if has_init_release else 0))
 
 
@@ -360,7 +368,8 @@ def run_event_driven_ortools_cadence(
 ):
     fast_mode = bool(getattr(configs, "fast_mode", True))
     seed = int(getattr(configs, "event_seed", 42))
-    cadence = max(1, int(getattr(configs, "gate_cadence", 3)))
+    cadence = max(1, int(getattr(configs, "hl_gate_cadence", 3)))
+    decision_interval = max(1, int(getattr(configs, "hl_gate_decision_interval", 1)))
     time_scale = max(1, int(getattr(configs, "ortools_time_scale", 1)))
     subproblem_time_limit = float(getattr(configs, "ortools_subproblem_time_limit", 30.0))
     total_solve_time_budget = float(getattr(configs, "ortools_total_solve_time_budget", 0.0))
@@ -371,6 +380,8 @@ def run_event_driven_ortools_cadence(
 
     all_job_due_dates: Dict[int, float] = {}
     all_job_arrive_times: Dict[int, float] = {}
+    all_job_is_urgent: Dict[int, bool] = {}
+    all_job_due_date_k: Dict[int, float] = {}
     if instance_json_path:
         if not os.path.exists(instance_json_path):
             raise FileNotFoundError(f"Configured instance_json not found: {instance_json_path}")
@@ -391,6 +402,8 @@ def run_event_driven_ortools_cadence(
                 all_job_due_dates[int(job.get("job_id", 0))] = float(job.get("due_date", 0.0))
         for job in replay_payload.get("jobs", []):
             all_job_arrive_times[int(job.get("job_id", 0))] = float(job.get("arrive_time", job.get("t_arrive_abs", 0.0)))
+            all_job_is_urgent[int(job.get("job_id", 0))] = bool(job.get("is_urgent", False))
+            all_job_due_date_k[int(job.get("job_id", 0))] = float(job.get("due_date_k", 0.0))
     else:
         rng, gen, orch = create_dynamic_world(
             configs,
@@ -400,14 +413,14 @@ def run_event_driven_ortools_cadence(
         )
     reward_scale = (float(configs.low) + float(configs.high)) / 2.0
 
-    suffix = f"ORTCadence_{cadence}"
+    suffix = f"ORTCadence_{cadence}_K{decision_interval}"
     base_plot_dir = plot_global_dir or "plots/global"
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     if instance_json_path:
         inst_name = os.path.splitext(os.path.basename(instance_json_path))[0]
-        safe_name = f"ortcad_{inst_name}_c{cadence}"
+        safe_name = f"ortcad_{inst_name}_c{cadence}_k{decision_interval}"
     else:
-        safe_name = f"ortcad_seed{seed:03d}_c{cadence}"
+        safe_name = f"ortcad_seed{seed:03d}_c{cadence}_k{decision_interval}"
     override_name = str(getattr(configs, "plot_run_name", "")).strip()
     if override_name:
         safe_name = override_name
@@ -444,8 +457,8 @@ def run_event_driven_ortools_cadence(
         "Buffer_NegSlack_Ratio", "Norm_Buf_Min_Slack", "Norm_Buf_Avg_Slack", "Norm_Buf_Slack_Std", "Norm_Buf_Slack_Q25",
         "WIP_Job_Count", "WIP_Tardy_Ratio", "Norm_WIP_Min_Slack", "Norm_WIP_Avg_Slack", "Norm_WIP_Slack_Std",
         "Clipped_Planned_TD_Ratio", "Avg_WIP_Slack_Per_Job",
-        "Scaled_Inter_Arrival", "Log_Steps_Since_Last_Release", "Is_Last_Step",
-    ] + [
+        "Scaled_Inter_Arrival", "Log_Steps_Since_Last_Release", "Release_Rate_So_Far",
+        "Buffer_Demand_Max_Share", "Buffer_WIP_Load_Overlap", "Is_Last_Step",
         "Baseline_Step_TD", "Baseline_Prev_Release_Event_ID", "Baseline_Prev_Release_TD", "Baseline_TD_Delta",
         "Agent_Prev_Release_Event_ID", "Agent_Prev_Release_TD", "Agent_TD_Delta",
         "Actual_TD",
@@ -453,7 +466,7 @@ def run_event_driven_ortools_cadence(
         "Phi_Before", "Phi_After", "Agent_Final_TD", "TD_Gap_vs_Baseline_Cadence",
         "Final_Makespan", "Final_Tardiness", "Release_Count",
     ]
-    obs_csv_order = [0, 1, 2, 15, 10, 3, 17, 4, 5, 6, 12, 14, 9, 7, 8, 13, 11, 16, 18, 19, 20, 21]
+    obs_csv_order = [0, 1, 2, 15, 10, 3, 17, 4, 5, 6, 12, 23, 14, 9, 7, 8, 13, 11, 16, 18, 19, 20, 21, 22, 24]
     raw_csv_writer.writerow(raw_headers)
     obs_csv_writer.writerow(obs_headers)
     ort_csv_writer.writerow([
@@ -564,6 +577,8 @@ def run_event_driven_ortools_cadence(
                     "arrive_time": f"{float(all_job_arrive_times.get(jid, 0.0)):.2f}",
                     "status": status,
                     "due_date": f"{due_date:.2f}",
+                    "is_urgent": int(bool(all_job_is_urgent.get(jid, False))),
+                    "due_date_k": f"{float(all_job_due_date_k.get(jid, 0.0)):.4f}",
                     "tardiness": f"{max(0.0, float(row['end']) - due_date):.2f}" if is_last else "0.00",
                 }
             )
@@ -658,13 +673,14 @@ def run_event_driven_ortools_cadence(
         init_jobs = [build_job_spec(job, int(configs.n_m)) for job in replay_init_jobs_payload]
         effective_max_events = len(replay_events_payload)
     else:
-        init_jobs = sample_initial_jobs(configs, rng=rng, base_job_id=0, t_arrive=0.0)
+        init_jobs = sample_initial_jobs(gen.cfg, rng=rng, base_job_id=0, t_arrive=0.0)
         effective_max_events = int(max_events)
     solve_budget = ORToolsSolveBudget(
         total_budget_seconds=total_solve_time_budget,
         planned_releases=compute_planned_release_count(
             max_events=int(effective_max_events),
             cadence=int(cadence),
+            decision_interval=int(decision_interval),
             has_init_release=bool(init_jobs),
         ),
     )
@@ -672,6 +688,8 @@ def run_event_driven_ortools_cadence(
         for job in init_jobs:
             all_job_due_dates[job.job_id] = float(job.meta.get("due_date", 0.0))
             all_job_arrive_times[job.job_id] = float(job.meta.get("t_arrive", 0.0))
+            all_job_is_urgent[job.job_id] = bool(job.meta.get("is_urgent", False))
+            all_job_due_date_k[job.job_id] = float(job.meta.get("due_date_k", 0.0))
         orch.buffer.extend(init_jobs)
         if gen is not None:
             gen.bump_next_id(max((job.job_id for job in init_jobs), default=-1) + 1)
@@ -723,6 +741,8 @@ def run_event_driven_ortools_cadence(
             for job in new_jobs:
                 all_job_due_dates[job.job_id] = float(job.meta.get("due_date", 0.0))
                 all_job_arrive_times[job.job_id] = float(job.meta.get("t_arrive", t_now))
+                all_job_is_urgent[job.job_id] = bool(job.meta.get("is_urgent", False))
+                all_job_due_date_k[job.job_id] = float(job.meta.get("due_date_k", 0.0))
             orch.buffer.extend(new_jobs)
         stats["arrive"] += 1
         is_last_step = bool(stats["arrive"] >= int(effective_max_events))
@@ -744,7 +764,7 @@ def run_event_driven_ortools_cadence(
             "planned_td": raw_s[17],
             "total_rem_work": raw_s[18],
         }
-        obs = calculate_gate_state(
+        obs = calculate_hl_gate_state(
             len(orch.buffer),
             orch.machine_free_time,
             t_now,
@@ -757,10 +777,20 @@ def run_event_driven_ortools_cadence(
             w_dict,
             inter_arrival_scaled=(float(inter_arrival) / float(reward_scale)) if reward_scale > 0 else 0.0,
             steps_since_last_release=steps_since_last_release,
+            release_count_so_far=release_count,
+            decision_steps_elapsed=max(0, int(stats["arrive"] - 1) // max(1, int(decision_interval))),
             is_last_step=is_last_step,
+            buffer_jobs=orch.buffer,
         )
 
-        act = 1 if (is_last_step or (stats["arrive"] % cadence == 0)) else 0
+        # Keep exactly the same cadence semantics as hrl_main.py: first group
+        # arrivals into decision steps, then apply cadence over those steps.
+        is_decision_step = (stats["arrive"] % decision_interval == 0)
+        decision_step_idx = stats["arrive"] // decision_interval
+        act = 1 if (
+            is_last_step
+            or (is_decision_step and decision_step_idx % cadence == 0)
+        ) else 0
         action_str = "RELEASE" if act == 1 else "HOLD"
 
         if act == 1:
@@ -872,6 +902,7 @@ def run_event_driven_ortools_cadence(
         "replay_mode": bool(instance_json_path),
         "event_seed": seed,
         "gate_cadence": cadence,
+        "gate_decision_interval": decision_interval,
         "event_horizon": int(effective_max_events),
         "init_jobs": int(len(replay_init_jobs_payload)) if instance_json_path else int(getattr(configs, "init_jobs", 0)),
         "release_count": int(release_count),

@@ -8,10 +8,10 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-from FJSPEnvForVariousOpNums import FJSPEnvForVariousOpNums
+from ll_fjsp_env import LLFJSPEnv
 from common_utils import sample_action
 from data_utils import text_to_matrix
-from model.PPO import PPO_initialize
+from model.ll_ppo import ll_ppo_initialize
 from ortools_gantt import plot_ortools_gantt_with_due_dates
 from params import configs
 
@@ -79,7 +79,7 @@ def run_sample_episode(ppo, jl, pt, due_dates_abs, n_j, n_m, seed=None):
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(int(seed))
 
-    env = FJSPEnvForVariousOpNums(n_j=n_j, n_m=n_m)
+    env = LLFJSPEnv(n_j=n_j, n_m=n_m)
     state = env.set_initial_data(
         job_length_list=[jl],
         op_pt_list=[pt],
@@ -115,7 +115,7 @@ def run_sample_episodes_batched(ppo, jl, pt, due_dates_abs, n_j, n_m, num_runs, 
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(int(seed))
 
-    env = FJSPEnvForVariousOpNums(n_j=n_j, n_m=n_m)
+    env = LLFJSPEnv(n_j=n_j, n_m=n_m)
     state = env.set_initial_data(
         job_length_list=[jl.copy() for _ in range(int(num_runs))],
         op_pt_list=[pt.copy() for _ in range(int(num_runs))],
@@ -156,13 +156,14 @@ def evaluate_range_due_test(base_dir=BASE_DIR):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     configs.device = str(device)
 
-    ppo = PPO_initialize()
-    if not os.path.exists(configs.ppo_model_path):
-        raise FileNotFoundError(f"PPO model not found: {configs.ppo_model_path}")
-    ppo.policy.load_state_dict(torch.load(configs.ppo_model_path, map_location=device, weights_only=True))
+    ppo = ll_ppo_initialize()
+    model_path = str(getattr(configs, "ppo_model_path", "") or getattr(configs, "ll_ppo_model_path", ""))
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"PPO model not found: {model_path}")
+    ppo.policy.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     ppo.policy.to(device)
     ppo.policy.eval()
-    print(f"Loaded PPO model from {configs.ppo_model_path}")
+    print(f"Loaded PPO model from {model_path}")
 
     eval_runs = int(getattr(configs, "eval_runs_per_instance", 10))
     eval_runs = max(1, eval_runs)
@@ -263,7 +264,7 @@ def evaluate_range_due_test(base_dir=BASE_DIR):
                 "_best_schedule_rows": schedule_runs[best_run_idx],
             })
 
-    model_name = os.path.basename(configs.ppo_model_path).replace(".pth", "")
+    model_name = os.path.basename(model_path).replace(".pth", "")
     prefix = f"range_due_test_{model_name}_sample{eval_runs}"
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.abspath(os.path.join("evaluation_results", f"{prefix}_{timestamp}"))
@@ -285,8 +286,8 @@ def evaluate_range_due_test(base_dir=BASE_DIR):
     if detail_df.empty:
         raise RuntimeError(f"No instances evaluated under {base_dir}")
 
-    detail_df["ppo_model"] = configs.ppo_model_path
-    run_df["ppo_model"] = configs.ppo_model_path
+    detail_df["ppo_model"] = model_path
+    run_df["ppo_model"] = model_path
 
     per_scale_summary = detail_df.groupby(["scale", "n_j", "n_m", "due_setting"], as_index=False).agg({
         "makespan_mean": "mean",

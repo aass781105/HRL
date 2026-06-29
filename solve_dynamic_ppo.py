@@ -90,6 +90,8 @@ def build_env_inputs(payload: Dict):
     op_rows: List[List[float]] = []
     due_dates_abs = np.zeros(n_j, dtype=np.float64)
     release_times = np.zeros(n_j, dtype=np.float64)
+    is_urgent = np.zeros(n_j, dtype=bool)
+    due_date_k = np.zeros(n_j, dtype=np.float64)
 
     for j_idx, job in enumerate(jobs):
         operations = sorted(job.get("operations", []), key=lambda x: int(x.get("op_id", 0)))
@@ -98,6 +100,8 @@ def build_env_inputs(payload: Dict):
         job_length[j_idx] = len(operations)
         due_dates_abs[j_idx] = float(job.get("due_date", 0.0))
         release_times[j_idx] = float(job.get("arrive_time", 0.0))
+        is_urgent[j_idx] = bool(job.get("is_urgent", False))
+        due_date_k[j_idx] = float(job.get("due_date_k", 0.0))
 
         for op in operations:
             row = np.zeros(n_m, dtype=np.float64)
@@ -112,7 +116,7 @@ def build_env_inputs(payload: Dict):
             op_rows.append(row.tolist())
 
     op_pt = np.asarray(op_rows, dtype=np.float64)
-    return jobs, job_length, op_pt, due_dates_abs, release_times, n_j, n_m
+    return jobs, job_length, op_pt, due_dates_abs, release_times, is_urgent, due_date_k, n_j, n_m
 
 
 def write_detail_csv(path: str, rows: List[Dict]):
@@ -129,6 +133,8 @@ def write_detail_csv(path: str, rows: List[Dict]):
                 "Duration",
                 "Arrive_Time",
                 "Due_Date",
+                "Is_Urgent",
+                "Due_Date_K",
                 "Is_Last_Op",
                 "Tardiness",
             ],
@@ -145,6 +151,8 @@ def write_detail_csv(path: str, rows: List[Dict]):
                     "Duration": f"{float(row['Duration']):.4f}",
                     "Arrive_Time": f"{float(row['Arrive_Time']):.4f}",
                     "Due_Date": f"{float(row['Due_Date']):.4f}",
+                    "Is_Urgent": int(bool(row.get("Is_Urgent", False))),
+                    "Due_Date_K": f"{float(row.get('Due_Date_K', 0.0)):.4f}",
                     "Is_Last_Op": int(row["Is_Last_Op"]),
                     "Tardiness": f"{float(row['Tardiness']):.4f}",
                 }
@@ -165,6 +173,8 @@ def write_machine_csv(path: str, rows: List[Dict]):
                 "Duration",
                 "Arrive_Time",
                 "Due_Date",
+                "Is_Urgent",
+                "Due_Date_K",
                 "Is_Last_Op",
                 "Tardiness",
             ],
@@ -181,6 +191,8 @@ def write_machine_csv(path: str, rows: List[Dict]):
                     "Duration": f"{float(row['Duration']):.4f}",
                     "Arrive_Time": f"{float(row['Arrive_Time']):.4f}",
                     "Due_Date": f"{float(row['Due_Date']):.4f}",
+                    "Is_Urgent": int(bool(row.get("Is_Urgent", False))),
+                    "Due_Date_K": f"{float(row.get('Due_Date_K', 0.0)):.4f}",
                     "Is_Last_Op": int(row["Is_Last_Op"]),
                     "Tardiness": f"{float(row['Tardiness']):.4f}",
                 }
@@ -193,7 +205,7 @@ def main():
     payload = load_payload(instance_json_path)
     validate_unique_job_ids(payload)
 
-    _, jl, pt, due_dates_abs, release_times, n_j, n_m = build_env_inputs(payload)
+    _, jl, pt, due_dates_abs, release_times, is_urgent, due_date_k, n_j, n_m = build_env_inputs(payload)
     configs.n_m = int(n_m)
 
     device = torch.device(getattr(configs, "device", "cpu"))
@@ -258,6 +270,8 @@ def main():
                 "Duration": float(det["proc_time"]),
                 "Arrive_Time": float(release_times[job_id]),
                 "Due_Date": due_date,
+                "Is_Urgent": bool(is_urgent[job_id]),
+                "Due_Date_K": float(due_date_k[job_id]),
                 "Is_Last_Op": is_last_op,
                 "Tardiness": tardiness,
             }

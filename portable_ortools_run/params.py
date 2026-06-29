@@ -147,24 +147,13 @@ parser.add_argument('--fast_mode', type=str2bool, default=False, help='是否開
 # Curriculum Learning Specifics
 # ============================
 parser.add_argument('--curriculum_cycle', type=int, default=250, help='Updates per curriculum stage')
-parser.add_argument('--tardiness_dilution_power', type=float, default=1, help='Beta factor for tardiness dilution')
 parser.add_argument('--schedule_type', type=str, default='same', choices=['s2', 's3', 'same', 'u10_30', 'u10_50'], help='Type of curriculum schedule to use')
-parser.add_argument('--mixed_size_hold_updates', type=int, default=5, help='Updates to keep one sampled mixed-size n_j before resampling for u10_30/u10_50 schedules')
-parser.add_argument('--mixed_size_large_prob', type=float, default=0.0, help='If >0, sample mixed sizes from small/large ranges with this probability for the large range.')
-parser.add_argument('--mixed_size_small_max_n_j', type=int, default=19, help='Upper n_j bound for the small range when mixed_size_large_prob > 0.')
-parser.add_argument('--mixed_size_large_min_n_j', type=int, default=20, help='Lower n_j bound for the large range when mixed_size_large_prob > 0.')
-parser.add_argument('--due_date_mode', type=str, default='range', choices=['k', 'M', 'range', 'range15', 'range2', 'norm', 'dynamic_shift'], help='Due date generation mode: k (Individual), M (Common), range (uniform symmetric range), range15 (1.5x wider than range), norm (normal with random mean), dynamic_shift (workload factor shifted tighter by n_j). range2 is kept as a backward-compatible alias.')
-parser.add_argument('--val_due_date_mode', type=str, default='range', choices=['', 'k', 'M', 'range', 'range15', 'range2', 'norm', 'dynamic_shift'], help='Validation due date mode override. Empty string means using due_date_mode.')
-parser.add_argument('--m_value', type=float, default=0.6, help='M-value used for Common Due Date (Static Curriculum Only)')
+parser.add_argument('--due_date_mode', type=str, default='range', choices=['k', 'range'], help='Due date generation mode: k (Individual), range (uniform symmetric range).')
+parser.add_argument('--val_due_date_mode', type=str, default='range', choices=['', 'k', 'range'], help='Validation due date mode override. Empty string means using due_date_mode.')
 parser.add_argument('--due_date_tightness', type=float, default=1.2, help='Legacy tightness base factor. k-mode now uses due_date_k_low/high.')
 parser.add_argument('--due_date_k_low', type=float, default=1.2, help='Lower bound of workload multiplier k for individual due dates.')
 parser.add_argument('--due_date_k_high', type=float, default=6.0, help='Upper bound of workload multiplier k for individual due dates.')
 parser.add_argument('--due_date_noise', type=float, default=0.0, help='Multiplicative noise level for due dates')
-parser.add_argument('--dynamic_due_base_low', type=float, default=1.2, help='Base lower workload factor for dynamic_shift due dates.')
-parser.add_argument('--dynamic_due_base_high', type=float, default=2.0, help='Base upper workload factor for dynamic_shift due dates.')
-parser.add_argument('--dynamic_due_shift_per_job', type=float, default=0.2, help='Factor shift subtracted per job above dynamic_due_ref_n_j for dynamic_shift due dates.')
-parser.add_argument('--dynamic_due_ref_n_j', type=int, default=10, help='Reference job count with no due-factor shift for dynamic_shift due dates.')
-parser.add_argument('--dynamic_due_min_factor', type=float, default=None, help='Optional lower clamp for dynamic_shift due factors. None leaves factors unclamped.')
 
 # ============================
 # Unified Scheduling Controller

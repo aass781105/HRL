@@ -1,10 +1,29 @@
 # FJSP-DRL (NO_GNN) 深度強化學習框架：極致細節技術手冊
 
+> [!IMPORTANT]
+> **AI 回答風格規範 (AI Response Constraints)**
+> 為了避免公式或格式在使用者端顯示異常，請嚴格遵守以下輸出規定：
+> 1. **禁用 LaTeX 數學公式格式**：永遠不要使用單個或兩個錢字號 (例如 $...$ 或 $$...$$) 來包裝任何公式。
+> 2. **公式表達方式**：一律改用純文字、行內程式碼 (例如 `Reward = a + b`)、或者獨立的代碼區塊 (Code Block) 來表達數學算式。
+> 3. **問答與代碼修改流程**：
+>    - 若使用者提出的是「問句」或諮詢性質的請求，**禁止**直接修改程式碼，以**回答問題為最優先**。
+>    - 當需要進行代碼修改時，除非使用者明確指示「直接改」、「幫我改」或「直接幫我改」，否則**絕對禁止自動或提前修改任何程式碼與設定檔**。必須先提出**修改計畫**，在**取得使用者明確同意後**才能對代碼進行實質修改。
+> 4. **嚴格區分靜態與動態環境**：在討論與修改程式碼時，任何時候都必須確認好並搞清楚當前是在討論「靜態低階 LLPPO 訓練」還是「動態 HRL 評估環境」。
+>      - **靜態低階 LLPPO 訓練 (Static Training)**：
+>        - **含意**：低階調度器（Scheduler Agent）在單一固定工件集、無新到達事件的靜態環境下學習機器分配與排序。
+>        - **交期 (Due Date) 機制**：主要是為了讓 LLPPO 學習不同緊急程度的調度規則，交期係數 `k` 採用大範圍的均勻隨機抽樣（預設 `2.0` 到 `9.0`），以涵蓋多元的緊迫度情境。
+>      - **動態 HRL 模擬評估環境 (Dynamic Environment)**：
+>        - **含意**：結合高階門控與低階調度器，面對連續且動態隨機抵達的工單流，模擬真實車間的流量控制。
+>        - **交期 (Due Date) 機制**：為了反映真實狀況，不再使用大範圍的隨機抽樣，而是固定套用急單（佔比 30%，`k` 值 `1.5 ~ 2.5`）與普通單（佔比 70%，`k` 值 `4.0 ~ 7.0`）的混合交期系統。
+> 5. **主動詢問優先原則 (Ask Before Action)**：任何時候若對使用者的需求、設定檔結構、參數命名或修改方向有任何不確定，**絕對必須先向使用者發問確認，禁止擅自猜測、搜尋或修改程式碼**。一切後續行為均須嚴格遵循此手冊規範。
+
+
+
 ## 1. 系統架構：雙層層次化強化學習 (HRL)
 本框架採用兩層決策機制，解決動態生產環境中的資源分配與工作流控制問題。
 
 ### 1.1 高階門控層 (High-Level: Gate Agent)
-- **模型**: DDQN (Double Deep Q-Network)
+- **模型**: PPO (Proximal Policy Optimization)
 - **任務**: 流量控制。在任務到達時，判斷緩衝區 (Buffer) 內的工單是否應立即釋放入車間。
 - **動作空間**: {0: HOLD (留在緩衝區), 1: RELEASE (釋放並重排)}
 
@@ -49,12 +68,12 @@
 - **全域池化 (Global Pooling)**: 對所有工序的 64 維 Embedding 進行 **Mean Pooling**，生成一個代表全系統計畫完整度的 **64 維全域特徵向量**。
 
 #### **2.4.3 決策輸出 (Heads)**
-- **Actor (Policy)**: 接收 [局部工序, 局部機器, 全域特徵] 拼接向量，輸出 $J \times M$ 的行動機率分佈。
-- **Critic (Value)**: 基於全域 64 維特徵，輸出單一數值 $V(s)$ 用於計算優勢函數 (Advantage)。
+- **Actor (Policy)**: 接收 [局部工序, 局部機器, 全域特徵] 拼接向量，輸出 J * M 的行動機率分佈。
+- **Critic (Value)**: 基於全域 64 維特徵，輸出單一數值 V(s) 用於計算優勢函數 (Advantage)。
 
 ---
 
-## 3. 高階 DDQN 特徵工程 (State Representation - 16維系統特徵)
+## 3. 高階 PPO 門控特徵工程 (State Representation - 22維系統特徵)
 所有時間類特徵均除以 **mean_pt = (Low + High) / 2.0** 進行縮放。
 
 | Index | 特徵名稱 | 物理意義與計算公式 |
@@ -77,6 +96,10 @@
 | **o15** | **Load Span** | **(核心：不平衡預警)** `(Max_Load - Min_Load) / mean_pt`。偵測機器之間的嚴重過載與閒置差距。 |
 | **o16** | **Slack Density** | **(核心：規模感應)** `WIP_Avg_Slack / (WIP_Count + 1)`。反映高工單密度下，Slack 的實際容錯價值縮減。 |
 | **o17** | **Unweighted Idle** | **(核心：碎片總量)** 視窗 `[t_now, t_now + Max_Load]` 內機台的總閒置長度（無時間加權）。反映系統整體的空洞比例。 |
+| **o18** | **Inter-Arrival Scaled** | **(新加入)** 當前事件與上一個事件的時間間隔，除以 `mean_pt`。 |
+| **o19** | **Steps Since Release** | **(新加入)** `Log1p(自上次釋放以來經過的事件次數)`。 |
+| **buf_q25** | **Buf Slack Q25** | **(新加入)** 緩衝區工單 Slack 的 25% 分位數。反映較緊急訂單的早期壓力。 |
+| **o20** | **Is Last Step** | **(新加入)** 若當前步為整個 Event Horizon 的最後一個事件則為 1.0，否則為 0.0。 |
 
 
 ---
@@ -97,7 +120,7 @@
   - 已移除對數壓縮 (Log-scaling)，以保留原始的延遲跳變信號。
 
 1. **Reward_Idle (區間閒置獎勵)**:
-   - **計算範圍**: 採「雙決策點區間積分」。計算自上一次獎勵結算 `t_prev_reward` 到當前時刻 `t_now` 之間，全系統 $M$ 台機器的總空轉分鐘數。
+   - **計算範圍**: 採「雙決策點區間積分」。計算自上一次獎勵結算 `t_prev_reward` 到當前時刻 `t_now` 之間，全系統 M 台機器的總空轉分鐘數。
    - **物理意義**: 懲罰排程中的「時間碎片」。透過 `compute_interval_metrics` 函數，精確計算機器在該特定時間視窗內的閒置 Gap（包含歷史遺留與當前排程的交集）。
    - **公式**: `-( 區間總閒置分鐘數 * idle_penalty_coef ) / mean_pt`。
 
@@ -123,7 +146,7 @@
 
 ### 5.2 數據分佈抽樣
 - **加工時間**: 50% 機率採 Uniform [1, 99]，50% 採 Realistic (仿 vdata 兩階段生成)。
-- **交期抽樣**: 個別交期係數 $k \sim U(1.2, 2.0)$。每張工單獨立抽樣。
+- **交期抽樣**: 個別交期係數 k 服從 U(1.2, 2.0)。每張工單獨立抽樣。
 
 ---
 
@@ -132,19 +155,44 @@
 ### 6.1 低階 PPO 訓練 (Curriculum Learning)
 - **多環境並行 (Vectorized Envs)**: 採用 `num_envs=100` 進行數據收集，同時模擬 100 個獨立的 FJSP 實例，極大化樣本多樣性與 GPU 利用率。
 - **課程學習階梯 (Schedules)**: 透過 `train_curriculum.py` 執行 5 階段難度提升。
-  - **s1 (Baseline)**: 固定規模 ($10\times5$), 固定緊湊度 ($M=0.5$)。
-  - **s2 (Size)**: 動態規模提升 ($10 \to 15 \to 20$), 固定緊湊度。
-  - **s3 (Size+M)**: 動態規模提升 + 動態緊湊度提升 ($M: 0.5 \to 0.4 \to 0.3$)。
+  - **s1 (Baseline)**: 固定規模 (10x5), 固定緊湊度 (M=0.5)。
+  - **s2 (Size)**: 動態規模提升 (10 -> 15 -> 20), 固定緊湊度。
+  - **s3 (Size+M)**: 動態規模提升 + 動態緊湊度提升 (M: 0.5 -> 0.4 -> 0.3)。
   - **s4/s5 (Noise)**: 在規模提升的同時，引入結構性噪聲變化以增強模型魯棒性。
 - **優化器策略 (Sawtooth LR)**: 階段間學習率衰減，搭配階段內 Cosine Annealing (模擬熱重啟) 避免局部最優。
 
-### 6.2 高階 DDQN 訓練 (Gate Training)
-- **穩定化策略**: 每 10 個 Episode 更換隨機種子，確保 Agent 有充足機會在同一環境中優化。
-- **大批量學習**: 採用 `batch_size=1024`，確保 DDQN 從 Replay Buffer 提取的經驗具備足夠的統計穩定性。
+### 6.2 高階 PPO 門控訓練 (Gate Training)
+- **學習率與熵衰減**: 學習率從 `1e-4` 衰減至 `5e-5`，熵權重（Entropy Coeff）從 `0.01` 開始隨訓練演進，平衡探索與收斂。
+- **多環境並行**: 採用向量化並行環境搜集樣本，加速高階軌跡採集。
+- **定時驗證機制**: 每隔固定更新次數即在 Validation 集上測試，記錄 Makespan 與 Tardiness 學習曲線。
 
 ### 6.3 檔案命名與路徑規範
 - **權重**: 
-  - DDQN: `ddqn_ckpt/[ddqn_name].pth`
-  - PPO: `trained_network/due_date/`
-- **日誌**: `plots/global/DDQN_[ddqn_name]/` (含甘特圖與 CSV)。
+  - 高階 PPO 門控: `ppo_ckpt/[hl_ppo_name].pth`
+  - 低階 PPO 排程: `trained_network/due_date/`
+- **日誌與圖表**: `plots/train_ppo/` 及各 Sample 評估產出的資料夾。
 - **分析工具**: `print_test_result_full.py` 生成包含每一 Instance 明細的 Excel。
+
+---
+
+## 7. 運行環境與執行規範 (Execution Environment)
+
+為了確保實驗與評估結果的一致性，且防止使用錯誤的 Python 解譯器導致執行失敗，所有指令均需在指定的專屬環境中執行。
+
+### 7.1 Python 執行路徑與環境
+* **Conda 虛擬環境名稱**: `newest_environment`
+* **Python 解譯器絕對路徑**: `C:\Users\123\anaconda3\envs\newest_environment\python.exe`
+* **核心依賴**: 包含 PyTorch, NumPy, PyYAML, Pandas 等專案指定版本套件。
+
+### 7.2 核心指令執行範例
+執行模擬與評估時，請使用上述絕對路徑的解譯器：
+
+* **執行 HRL 模擬與評估**:
+  ```bash
+  C:\Users\123\anaconda3\envs\newest_environment\python.exe hrl_main.py --config yaml_config/big_env_ortool_dynamic_seed42_init50_h160_U20_50_due20_80_seed1_random.yml
+  ```
+* **執行模型評估 (evaluate_models)**:
+  ```bash
+  C:\Users\123\anaconda3\envs\newest_environment\python.exe evaluate_models.py --config yaml_config/big_env_ortool_dynamic_seed42_init50_h160_U20_50_due20_80_seed1_random.yml
+  ```
+

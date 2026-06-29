@@ -1,0 +1,864 @@
+from common_utils import *
+from params import configs
+from tqdm import tqdm
+from data_utils import SD2_instance_generator, generate_due_dates, load_data_from_files
+from common_utils import strToSuffix, setup_seed
+from ll_fjsp_env import LLFJSPEnv
+from copy import deepcopy
+import os
+import random
+import time
+import sys
+import pandas as pd 
+import numpy as np
+from model.ll_ppo import ll_ppo_initialize
+from model.ll_ppo import LLMemory
+
+str_time = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
+os.environ["CUDA_VISIBLE_DEVICES"] = configs.device_id
+import torch
+
+device = torch.device(configs.device)
+
+
+def _cap_normalized_weights(raw_weights, max_share):
+    """Normalize nonnegative weights while enforcing an optional per-item max share."""
+    weights = np.asarray(raw_weights, dtype=np.float64)
+    weights = np.maximum(weights, 0.0)
+    total = float(np.sum(weights))
+    if total <= 1e-12:
+        return weights
+
+    shares = weights / total
+    cap = float(max_share)
+    if cap <= 0.0 or cap >= 1.0 or shares.size <= 1:
+        return shares
+    cap = max(cap, 1.0 / float(shares.size))
+
+    remaining = np.ones(shares.size, dtype=bool)
+    capped = np.zeros_like(shares)
+    remaining_mass = 1.0
+    raw = shares.copy()
+    while remaining.any():
+        rem_sum = float(np.sum(raw[remaining]))
+        if rem_sum <= 1e-12:
+            capped[remaining] = remaining_mass / float(np.sum(remaining))
+            break
+        proposed = raw[remaining] / rem_sum * remaining_mass
+        over = proposed > cap + 1e-12
+        if not over.any():
+            capped[remaining] = proposed
+            break
+        rem_idx = np.where(remaining)[0]
+        over_idx = rem_idx[over]
+        capped[over_idx] = cap
+        remaining[over_idx] = False
+        remaining_mass = max(0.0, 1.0 - float(np.sum(capped[~remaining])))
+    return capped / max(float(np.sum(capped)), 1e-12)
+
+
+class Trainer:
+    def __init__(self, config):
+        # Initial configurations
+        self.config = config
+        self.initial_n_j = int(getattr(config, "n_j", 10))
+        self.fixed_n_m = config.n_m
+        
+        configs.n_j = self.initial_n_j 
+        # Training setup: fixed 5 operations per job.
+        setattr(configs, "op_per_job", 5)
+        setattr(self.config, "op_per_job", 5)
+        setattr(configs, "enable_op_mixture", False)
+        setattr(self.config, "enable_op_mixture", False)
+        configs.data_source = 'SD2'
+        configs.data_suffix = 'mix'
+        
+        self.n_j = configs.n_j
+        self.n_m = configs.n_m
+
+        self.max_updates = config.ll_max_updates
+        self.reset_env_timestep = config.reset_env_timestep
+        self.validate_timestep = config.validate_timestep
+        self.num_envs = config.ll_num_envs
+
+        if not os.path.exists(f'./trained_network/{self.config.data_source}'):
+            os.makedirs(f'./trained_network/{self.config.data_source}')
+        if not os.path.exists(f'./train_log/{self.config.data_source}'):
+            os.makedirs(f'./train_log/{self.config.data_source}')
+
+        if device.type == 'cuda':
+            torch.set_default_tensor_type('torch.cuda.FloatTensor')
+        else:
+            torch.set_default_tensor_type('torch.FloatTensor')
+
+        self.model_name = configs.eval_model_name
+
+        # --- Fixed Validation Suite [10, 20, 30] with the configured due-date mode and uniform data ---
+        self.vali_data_batches = self.generate_fixed_validation_data(mode='uniform')
+
+        self.ppo = ll_ppo_initialize()
+        self.memory = LLMemory(gamma=config.ll_gamma, gae_lambda=config.ll_gae_lambda)
+
+    def generate_fixed_validation_data(self, mode='uniform'):
+        """
+        Generates fixed validation instances.
+        - Job sizes: [10, 20, 30]
+        - Due Date Mode: configs.val_due_date_mode (fallback to configs.due_date_mode)
+        - Data Mode: 'uniform' (matches dynamic subproblems)
+        """
+        train_due_mode = str(getattr(configs, "ll_due_date_mode", "k"))
+        val_due_mode_raw = str(getattr(configs, "ll_val_due_date_mode", "") or "").strip()
+        due_mode = val_due_mode_raw if val_due_mode_raw else train_due_mode
+        print("-" * 25 + f"Generating Validation Suite (Mode: {mode} | Train Due: {train_due_mode} | Val Due: {due_mode})" + "-" * 25)
+        schedule_type = str(getattr(configs, "ll_schedule_type", "")).lower()
+        if schedule_type == "u30_50":
+            sizes = [30, 40, 50]
+        elif schedule_type == "u10_50":
+            sizes = [10, 30, 50]
+        else:
+            sizes = [10, 20, 30]
+        num_per_size = 50
+        total_instances = len(sizes) * num_per_size
+        
+        vali_batches = []
+        old_n_j = configs.n_j
+        
+        for n_j in sizes:
+            configs.n_j = n_j
+            size_jl, size_pt, size_dd = [], [], []
+            for i in range(num_per_size):
+                vali_seed = 1000 + n_j * 100 + i
+                # Using pure uniform for dynamic subproblem consistency
+                jl, pt, _ = SD2_instance_generator(configs, seed=vali_seed, mode='uniform')
+                dd = generate_due_dates(jl, pt, due_date_mode=due_mode, seed=vali_seed)
+                size_jl.append(jl); size_pt.append(pt); size_dd.append(dd)
+            
+            vali_batches.append({'n_j': n_j, 'jl': size_jl, 'pt': size_pt, 'dd': size_dd})
+            print(f"Generated Validation Batch for Size {n_j} ({due_mode} mode)")
+            
+        configs.n_j = old_n_j
+        return vali_batches
+
+    def train(self):
+        setup_seed(self.config.seed_train)
+        self.log, self.detailed_log, self.validation_log, self.validation_tardiness_log, self.validation_obj_log, self.loss_log = [], [], [], [], [], []
+        self.r60_diag_log = []
+        self.record = float('inf')
+
+        print("-" * 25 + "Training Setting" + "-" * 25)
+        train_due_mode = str(getattr(configs, 'll_due_date_mode', 'k'))
+        val_due_mode_raw = str(getattr(configs, 'll_val_due_date_mode', '') or '').strip()
+        val_due_mode = val_due_mode_raw if val_due_mode_raw else train_due_mode
+        print(f"Model: {self.model_name} | Data: Pure Uniform | TrainDue: {train_due_mode} | ValDue: {val_due_mode}")
+
+        self.train_st = time.time()
+        
+        def create_stage(n_j, multiplier):
+            reset_step = int(5 * n_j)
+            return {
+                "n_j": n_j, "reset_step": reset_step, "duration": int(reset_step * multiplier),
+                "stage_label": f"J{n_j}_Uniform_{str(getattr(configs, 'll_due_date_mode', 'k')).upper()}"
+            }
+
+        def sample_uniform_job_size(low, high, update_idx):
+            rng = random.Random(int(self.config.seed_train) + 100000 + int(update_idx))
+            return rng.randint(low, high)
+
+        def resolve_stage_job_size(stage_cfg, update_idx):
+            if "n_j_range" in stage_cfg:
+                return sample_uniform_job_size(stage_cfg["n_j_range"][0], stage_cfg["n_j_range"][1], update_idx)
+            return stage_cfg["n_j"]
+
+        # Supported schedules:
+        # - u10_30: sample n_j uniformly from [10, 30] at each reset.
+        # - u10_50: sample n_j uniformly from [10, 50] at each reset.
+        # - u30_50: sample n_j uniformly from [30, 50] at each reset.
+        # - otherwise: fixed n_j from configs.n_j.
+        schedule_type = str(getattr(configs, "ll_schedule_type", "")).lower()
+        mixed_size_hold_updates = max(1, int(getattr(configs, "ll_mixed_size_hold_updates", 5)))
+        if schedule_type == "u10_30":
+            curriculum_schedule = [{
+                "n_j_range": (10, 30),
+                "reset_step": mixed_size_hold_updates,
+                "duration": int(getattr(configs, "ll_max_updates", 1000)),
+                "stage_label": f"JU10_30_Uniform_{str(getattr(configs, 'll_due_date_mode', 'k')).upper()}",
+            }]
+        elif schedule_type == "u10_50":
+            curriculum_schedule = [{
+                "n_j_range": (10, 50),
+                "reset_step": mixed_size_hold_updates,
+                "duration": int(getattr(configs, "ll_max_updates", 1000)),
+                "stage_label": f"JU10_50_Uniform_{str(getattr(configs, 'll_due_date_mode', 'k')).upper()}",
+            }]
+        elif schedule_type == "u30_50":
+            curriculum_schedule = [{
+                "n_j_range": (30, 50),
+                "reset_step": mixed_size_hold_updates,
+                "duration": int(getattr(configs, "ll_max_updates", 1000)),
+                "stage_label": f"JU30_50_Uniform_{str(getattr(configs, 'll_due_date_mode', 'k')).upper()}",
+            }]
+        else:
+            fixed_n_j = int(getattr(configs, "n_j", self.initial_n_j))
+            curriculum_schedule = [{
+                "n_j": fixed_n_j,
+                "reset_step": int(5 * fixed_n_j),
+                "duration": int(getattr(configs, "ll_max_updates", 1000)),
+                "stage_label": f"J{fixed_n_j}_Uniform_{str(getattr(configs, 'll_due_date_mode', 'k')).upper()}",
+            }]
+        
+        self.max_updates = int(sum(stage['duration'] for stage in curriculum_schedule))
+        
+        current_stage_idx = 0
+        current_cfg = curriculum_schedule[0]
+        configs.n_j = resolve_stage_job_size(current_cfg, 0)
+        current_reset_step = current_cfg["reset_step"]
+        current_stage_end_step = current_cfg["duration"]
+        current_stage_duration = current_cfg["duration"]
+        stage_start_step = 0
+        
+        import math
+        self.env = LLFJSPEnv(n_j=configs.n_j, n_m=configs.n_m)
+
+        for i_update in tqdm(range(self.max_updates), file=sys.stdout, desc="progress", colour='blue'):
+            if i_update >= current_stage_end_step and current_stage_idx < len(curriculum_schedule) - 1:
+                current_stage_idx += 1
+                current_cfg = curriculum_schedule[current_stage_idx]
+                configs.n_j = resolve_stage_job_size(current_cfg, i_update)
+                current_reset_step = current_cfg["reset_step"]
+                stage_start_step = current_stage_end_step
+                current_stage_duration = current_cfg["duration"]
+                current_stage_end_step += current_stage_duration
+                tqdm.write(f"\nCURRICULUM UPDATE: Stage {current_stage_idx+1}. Job Size={configs.n_j}")
+                
+                # [NEW] Force immediate environment reset on stage transition
+                dataset_job_length, dataset_op_pt, dataset_due_date = self.sample_training_instances(i_update)
+                self.env = LLFJSPEnv(n_j=configs.n_j, n_m=configs.n_m)
+                state = self.env.set_initial_data(dataset_job_length, dataset_op_pt, dataset_due_date, true_due_date_list=dataset_due_date)
+                continue # Skip the normal modulo check below for this step
+
+            if i_update % current_reset_step == 0:
+                configs.n_j = resolve_stage_job_size(current_cfg, i_update)
+                if "n_j_range" in current_cfg:
+                    tqdm.write(f"Sampled mixed training size n_j={configs.n_j} at update {i_update+1}")
+                dataset_job_length, dataset_op_pt, dataset_due_date = self.sample_training_instances(i_update)
+                self.env = LLFJSPEnv(n_j=configs.n_j, n_m=configs.n_m)
+                state = self.env.set_initial_data(dataset_job_length, dataset_op_pt, dataset_due_date, true_due_date_list=dataset_due_date)
+            elif (
+                str(getattr(configs, "ll_due_date_mode", "k")) == "range3_hold"
+                and i_update % max(1, int(getattr(configs, "ll_due_setting_hold_updates", 10))) == 0
+            ):
+                tqdm.write(
+                    f"Resampled due setting at update {i_update+1} "
+                    f"(n_j={configs.n_j}, due={self.resolve_training_due_mode(i_update)})"
+                )
+                dataset_job_length, dataset_op_pt, dataset_due_date = self.sample_training_instances(i_update)
+                self.env = LLFJSPEnv(n_j=configs.n_j, n_m=configs.n_m)
+                state = self.env.set_initial_data(dataset_job_length, dataset_op_pt, dataset_due_date, true_due_date_list=dataset_due_date)
+            else:
+                state = self.env.reset()
+
+            current_due_mode = self.resolve_training_due_mode(i_update)
+            self.ppo.vloss_coef = self.resolve_vloss_coef(current_due_mode)
+
+            # Sawtooth LR
+            peak_lr = configs.ll_lr * (0.95 ** current_stage_idx)
+            steps_in_stage = i_update - stage_start_step
+            cycle_progress = min(1.0, steps_in_stage / max(1, current_stage_duration))
+            cosine_decay = 0.5 * (1 + math.cos(math.pi * cycle_progress))
+            current_lr = max(peak_lr * (0.1 + 0.9 * cosine_decay), 5e-5)
+            for param_group in self.ppo.optimizer.param_groups: param_group['lr'] = current_lr
+            self.ppo.entloss_coef = configs.ll_entloss_coef
+            
+            ep_rewards = np.zeros(self.num_envs)
+            ep_mk_gain, ep_td_penalty = 0.0, 0.0
+            all_mk_rewards, all_td_rewards = [], []
+            all_od_rewards = []
+            all_wait_od_rewards = []
+            td_mode_rollout = str(getattr(configs, "ll_td_mode", "mean_pt")).strip().lower()
+            use_terminal_split_redistribution = td_mode_rollout in (
+                "terminal_split_ops_equal",
+                "terminal_split_ops_pt",
+                "terminal_split_ops_exp",
+                "terminal_split_ops_job_ct_delta",
+            )
+            reward_seq_raw_np = []
+
+            while True:
+                self.memory.push(state)
+                with torch.no_grad():
+                    batch_idx = ~torch.from_numpy(self.env.done_flag).to(state.fea_j_tensor.device)
+                    valid_action_counts = (~state.dynamic_pair_mask_tensor.reshape(state.dynamic_pair_mask_tensor.size(0), -1)).sum(dim=1)
+                    if (valid_action_counts[batch_idx] == 0).any():
+                        bad_local = torch.where(valid_action_counts[batch_idx] == 0)[0]
+                        bad_global = torch.where(batch_idx)[0][bad_local].detach().cpu().tolist()
+                        raise RuntimeError(
+                            "rollout encountered all-masked rows before policy_old: "
+                            f"env_idx={bad_global}, "
+                            f"done_flag={self.env.done_flag[bad_global].tolist()}, "
+                            f"unscheduled_op_nums={self.env.unscheduled_op_nums[bad_global].tolist()}, "
+                            f"candidate={self.env.candidate[bad_global].tolist()}, "
+                            f"valid_action_counts={valid_action_counts[bad_global].detach().cpu().tolist()}"
+                        )
+                    pi_valid, vals_valid = self.ppo.policy_old(
+                        fea_j=state.fea_j_tensor[batch_idx], op_mask=state.op_mask_tensor[batch_idx], candidate=state.candidate_tensor[batch_idx],
+                        fea_m=state.fea_m_tensor[batch_idx], mch_mask=state.mch_mask_tensor[batch_idx], comp_idx=state.comp_idx_tensor[batch_idx],
+                        dynamic_pair_mask=state.dynamic_pair_mask_tensor[batch_idx], fea_pairs=state.fea_pairs_tensor[batch_idx]
+                    )
+                action_valid, action_logprob_valid = sample_action(pi_valid)
+
+                full_actions = torch.zeros((self.num_envs, 1), dtype=action_valid.dtype, device=action_valid.device)
+                full_logprobs = torch.zeros((self.num_envs, 1), dtype=action_logprob_valid.dtype, device=action_logprob_valid.device)
+                full_vals = torch.zeros((self.num_envs, 1), dtype=vals_valid.dtype, device=vals_valid.device)
+                full_actions[batch_idx] = action_valid
+                full_logprobs[batch_idx] = action_logprob_valid
+                full_vals[batch_idx] = vals_valid
+
+                # Capture selected op processing times before env.step advances candidates.
+                rollout_op_pt_np = None
+                rollout_op_ct_np = None
+                if use_terminal_split_redistribution:
+                    action_np = full_actions.squeeze(-1).detach().cpu().numpy().astype(np.int64)
+                    active_mask_np = batch_idx.detach().cpu().numpy().astype(bool)
+                    active_env_ids = np.where(active_mask_np)[0]
+                    rollout_op_pt_np = np.zeros(self.num_envs, dtype=np.float64)
+                    rollout_op_ct_np = np.zeros(self.num_envs, dtype=np.float64)
+                    if active_env_ids.size > 0:
+                        chosen_jobs_active = action_np[active_env_ids] // self.env.number_of_machines
+                        chosen_mchs_active = action_np[active_env_ids] % self.env.number_of_machines
+                        chosen_ops_active = self.env.candidate[active_env_ids, chosen_jobs_active]
+                        rollout_op_pt_np[active_env_ids] = self.env.true_op_pt[
+                            active_env_ids, chosen_ops_active, chosen_mchs_active
+                        ]
+
+                state, reward, done, info = self.env.step(actions=full_actions.cpu().numpy())
+                ep_mk_gain += np.mean(info['reward_mk']); ep_td_penalty += np.mean(info['reward_td'])
+                all_mk_rewards.extend(info['reward_mk'].flatten()); all_td_rewards.extend(info['reward_td'].flatten())
+                all_od_rewards.extend(np.asarray(info.get('reward_od_step', np.zeros(self.num_envs))).flatten())
+                all_wait_od_rewards.extend(np.asarray(info.get('reward_wait_od_step', np.zeros(self.num_envs))).flatten())
+                ep_rewards += reward
+                self.memory.done_seq.append(torch.from_numpy(done).to(device))
+                reward_seq_raw_np.append(np.asarray(reward, dtype=np.float32))
+                self.memory.reward_seq.append(torch.from_numpy(np.asarray(reward, dtype=np.float32)).to(device))
+                self.memory.action_seq.append(full_actions.squeeze(-1))
+                self.memory.log_probs.append(full_logprobs.squeeze(-1))
+                self.memory.val_seq.append(full_vals.squeeze(1))
+                # Record rollout metadata for terminal TD redistribution modes.
+                if use_terminal_split_redistribution:
+                    if not hasattr(self, "_rollout_jobs_seq"):
+                        self._rollout_jobs_seq = []
+                        self._rollout_active_seq = []
+                        self._rollout_td_step_seq = []
+                        self._rollout_op_pt_seq = []
+                        self._rollout_op_ct_seq = []
+                    chosen_jobs_np = (full_actions.squeeze(-1).detach().cpu().numpy() // self.env.number_of_machines).astype(np.int32)
+                    active_mask_np = batch_idx.detach().cpu().numpy().astype(bool)
+                    td_step_np = np.asarray(info.get('reward_td_step', np.zeros(self.num_envs)), dtype=np.float64)
+                    if rollout_op_ct_np is not None:
+                        for env_id, detail in enumerate(info.get('scheduled_op_details_all', [])):
+                            if detail is not None:
+                                rollout_op_ct_np[env_id] = float(detail.get("end_time", 0.0))
+                    self._rollout_jobs_seq.append(chosen_jobs_np)
+                    self._rollout_active_seq.append(active_mask_np)
+                    self._rollout_td_step_seq.append(td_step_np)
+                    self._rollout_op_pt_seq.append(rollout_op_pt_np)
+                    self._rollout_op_ct_seq.append(rollout_op_ct_np)
+                if done.all(): break
+
+            # Optional TD credit redistribution: spread each job's final terminal TD over its op decisions.
+            if use_terminal_split_redistribution and len(self.memory.reward_seq) > 0:
+                T = len(self.memory.reward_seq)
+                E = self.num_envs
+                rewards_mat = np.stack([r.detach().cpu().numpy() for r in self.memory.reward_seq], axis=0).astype(np.float64)
+                jobs_mat = np.stack(self._rollout_jobs_seq, axis=0).astype(np.int32)
+                active_mat = np.stack(self._rollout_active_seq, axis=0).astype(bool)
+                td_old_mat = np.stack(self._rollout_td_step_seq, axis=0).astype(np.float64)
+                op_pt_mat = np.stack(self._rollout_op_pt_seq, axis=0).astype(np.float64)
+                op_ct_mat = np.stack(self._rollout_op_ct_seq, axis=0).astype(np.float64)
+                td_new_mat = np.zeros_like(td_old_mat)
+
+                for e in range(E):
+                    job_to_steps = {}
+                    for t in range(T):
+                        if not active_mat[t, e]:
+                            continue
+                        j = int(jobs_mat[t, e])
+                        if j not in job_to_steps:
+                            job_to_steps[j] = []
+                        job_to_steps[j].append(t)
+                    for _, step_ids in job_to_steps.items():
+                        if not step_ids:
+                            continue
+                        td_total = float(np.sum(td_old_mat[step_ids, e]))
+                        if abs(td_total) <= 1e-12:
+                            continue
+                        if td_mode_rollout == "terminal_split_ops_pt":
+                            weights = np.maximum(op_pt_mat[step_ids, e], 0.0)
+                        elif td_mode_rollout == "terminal_split_ops_exp":
+                            decay = min(max(float(getattr(configs, "ll_td_split_exp_decay", 0.8)), 1e-6), 1.0)
+                            weights = np.power(decay, np.arange(len(step_ids) - 1, -1, -1, dtype=np.float64))
+                        elif td_mode_rollout == "terminal_split_ops_job_ct_delta":
+                            ct_values = np.maximum(op_ct_mat[step_ids, e], 0.0)
+                            weights = np.diff(np.concatenate(([0.0], ct_values)))
+                            weights = np.maximum(weights, 0.0)
+                            weights = _cap_normalized_weights(
+                                weights,
+                                float(getattr(configs, "ll_td_split_max_share", 0.5)),
+                            )
+                        else:
+                            weights = np.ones(len(step_ids), dtype=np.float64)
+                        weights_sum = float(np.sum(weights))
+                        if weights_sum <= 1e-12:
+                            continue
+                        td_new_mat[step_ids, e] = td_total * (weights / weights_sum)
+
+                rewards_mat = rewards_mat - td_old_mat + td_new_mat
+                self.memory.reward_seq = [torch.from_numpy(rewards_mat[t].astype(np.float32)).to(device) for t in range(T)]
+                ep_rewards = np.sum(rewards_mat, axis=0)
+                all_td_rewards = td_new_mat.reshape(-1).tolist()
+            elif bool(getattr(configs, "ll_reward_norm_by_size", False)) and len(self.memory.reward_seq) > 0:
+                rewards_mat = np.stack(reward_seq_raw_np, axis=0).astype(np.float32)
+                mean_r = float(np.mean(rewards_mat))
+                std_r = float(np.std(rewards_mat))
+                rewards_norm = (rewards_mat - mean_r) / (std_r + 1e-8)
+                self.memory.reward_seq = [torch.from_numpy(rewards_norm[t].astype(np.float32)).to(device) for t in range(rewards_norm.shape[0])]
+                ep_rewards = np.sum(rewards_norm, axis=0)
+
+            # Clear rollout metadata buffers for next update.
+            if hasattr(self, "_rollout_jobs_seq"):
+                self._rollout_jobs_seq.clear()
+                self._rollout_active_seq.clear()
+                self._rollout_td_step_seq.clear()
+                if hasattr(self, "_rollout_op_pt_seq"):
+                    self._rollout_op_pt_seq.clear()
+                if hasattr(self, "_rollout_op_ct_seq"):
+                    self._rollout_op_ct_seq.clear()
+
+            loss, v_loss, p_loss = self.ppo.update(self.memory)
+            critic_diag = getattr(self.ppo, "last_critic_stats", {})
+            err_mean = float(critic_diag.get("error_mean", 0.0))
+            err_std = float(critic_diag.get("error_std", 0.0))
+            over_delta_ratio = float(critic_diag.get("over_delta_ratio", 0.0))
+            delta_threshold = float(critic_diag.get("delta_threshold", 1.0))
+            policy_diag = getattr(self.ppo, "last_policy_stats", {})
+            entropy = float(policy_diag.get("entropy", 0.0))
+            clip_frac = float(policy_diag.get("clip_frac", 0.0))
+            adv_std = float(policy_diag.get("adv_std", 0.0))
+            v_term_abs = abs(float(v_loss) * float(getattr(self.ppo, "vloss_coef", getattr(configs, "vloss_coef", 1.0))))
+            p_term_abs = abs(float(p_loss) * float(getattr(configs, "ploss_coef", 1.0)))
+            vp_den = v_term_abs + p_term_abs + 1e-8
+            v_share_loss = v_term_abs / vp_den
+            p_share_loss = p_term_abs / vp_den
+            self.memory.clear_memory()
+
+            mk_std, td_std = np.std(all_mk_rewards), np.std(all_td_rewards)
+            mk_mean = float(np.mean(all_mk_rewards)) if all_mk_rewards else 0.0
+            td_mean = float(np.mean(all_td_rewards)) if all_td_rewards else 0.0
+            mk_abs_sum = float(np.sum(np.abs(all_mk_rewards))) if all_mk_rewards else 0.0
+            td_abs_sum = float(np.sum(np.abs(all_td_rewards))) if all_td_rewards else 0.0
+            od_abs_sum = float(np.sum(np.abs(all_od_rewards))) if all_od_rewards else 0.0
+            od_abs_values = np.abs(np.asarray(all_od_rewards, dtype=np.float64)) if all_od_rewards else np.asarray([], dtype=np.float64)
+            od_nonzero = od_abs_values > 1e-12
+            od_hit = float(np.mean(od_nonzero)) if od_abs_values.size else 0.0
+            wait_od_abs_sum = float(np.sum(np.abs(all_wait_od_rewards))) if all_wait_od_rewards else 0.0
+            wait_od_abs_values = np.abs(np.asarray(all_wait_od_rewards, dtype=np.float64)) if all_wait_od_rewards else np.asarray([], dtype=np.float64)
+            wait_od_nonzero = wait_od_abs_values > 1e-12
+            wait_od_hit = float(np.mean(wait_od_nonzero)) if wait_od_abs_values.size else 0.0
+            total_abs_sum = mk_abs_sum + td_abs_sum + od_abs_sum + wait_od_abs_sum
+            if total_abs_sum > 1e-12:
+                mk_share = mk_abs_sum / total_abs_sum
+                td_share = td_abs_sum / total_abs_sum
+                od_share = od_abs_sum / total_abs_sum
+                wait_od_share = wait_od_abs_sum / total_abs_sum
+            else:
+                mk_share = 0.0
+                td_share = 0.0
+                od_share = 0.0
+                wait_od_share = 0.0
+            if td_mode_rollout in ("system_slack_delta_mean", "system_neg_slack_delta_mean", "chosen_neg_slack_delta_mean"):
+                reward_component_label = "SlackR%"
+            elif td_mode_rollout == "chosen_est_tardiness_delta":
+                reward_component_label = "EstTD%"
+            else:
+                reward_component_label = "TD%"
+            overdue_component_text = ""
+            if float(getattr(configs, "ll_overdue_progress_coef", 0.0)) != 0.0:
+                overdue_component_text = (
+                    f' | OD%: {od_share*100:5.1f}%'
+                    f' | ODHit: {od_hit*100:4.1f}%'
+                )
+            if float(getattr(configs, "ll_ready_overdue_wait_coef", 0.0)) != 0.0:
+                overdue_component_text += (
+                    f' | WaitOD%: {wait_od_share*100:5.1f}%'
+                    f' | WaitHit: {wait_od_hit*100:4.1f}%'
+                )
+            self.log.append([i_update, np.mean(ep_rewards)])
+            self.detailed_log.append([
+                i_update,
+                np.mean(ep_rewards),
+                ep_mk_gain,
+                mk_std,
+                ep_td_penalty,
+                td_std,
+                mk_mean,
+                td_mean,
+                mk_share,
+                td_share,
+                od_share,
+                od_hit,
+                wait_od_share,
+                wait_od_hit,
+                np.mean(self.env.current_makespan),
+                np.mean(self.env.accumulated_tardiness)
+            ])
+            self.loss_log.append([
+                i_update,
+                loss,
+                v_loss,
+                p_loss,
+                v_share_loss,
+                p_share_loss,
+                err_mean,
+                err_std,
+                delta_threshold,
+                over_delta_ratio,
+                entropy,
+                clip_frac,
+                adv_std
+            ])
+
+            if (i_update + 1) % self.validate_timestep == 0:
+                # Get per-size validation results
+                vali_results_per_size = self.validate_envs_with_various_op_nums(self.vali_data_batches)
+                
+                # Calculate overall mean
+                all_td, all_ms, all_obj = [], [], []
+                breakdown_entry = {'update': i_update + 1}
+                for res in vali_results_per_size:
+                    nj_key = res['n_j']
+                    all_td.extend(res['td_list'])
+                    all_ms.extend(res['ms_list'])
+                    obj_list = (0.5 * np.asarray(res['ms_list'], dtype=np.float64) + 0.5 * np.asarray(res['td_list'], dtype=np.float64)).tolist()
+                    all_obj.extend(obj_list)
+                    breakdown_entry[f'ms_{nj_key}j'] = res['ms_mean']
+                    breakdown_entry[f'td_{nj_key}j'] = res['td_mean']
+                    breakdown_entry[f'obj_{nj_key}j'] = float(np.mean(obj_list))
+                
+                overall_td_mean = np.mean(all_td)
+                overall_ms_mean = np.mean(all_ms)
+                overall_obj_mean = np.mean(all_obj)
+                
+                # Save best model
+                if overall_obj_mean < self.record:
+                    self.save_model(); self.record = overall_obj_mean
+                
+                # Logs
+                self.validation_log.append(overall_ms_mean)
+                self.validation_tardiness_log.append(overall_td_mean)
+                self.validation_obj_log.append(overall_obj_mean)
+                if not hasattr(self, 'validation_breakdown_log'): self.validation_breakdown_log = []
+                self.validation_breakdown_log.append(breakdown_entry)
+                r60_diag = self.evaluate_r60_fixed_case()
+                if r60_diag:
+                    r60_diag["update"] = int(i_update + 1)
+                    self.r60_diag_log.append(r60_diag)
+                
+                self.save_validation_log()
+                
+                # [UPDATED] Clean Console Output with Training Metrics
+                avg_reward = np.mean(ep_rewards)
+                r60_text = ""
+                if r60_diag:
+                    if "r60_error" in r60_diag:
+                        r60_text = f" | r60(error={r60_diag['r60_error']})"
+                    else:
+                        r60_text = (
+                            f" | r60(step33={r60_diag['r60_job33_first_step']}, "
+                            f"odsteps={r60_diag.get('r60_overdue_steps_text', '')}, "
+                            f"td={r60_diag['r60_total_td']:.1f})"
+                        )
+                # Use current loss values from the update step
+                tqdm.write(
+                    f'Update {i_update+1}/{self.max_updates} | '
+                    f'R: {avg_reward:.2f} | Loss: {loss:.4f} | V-Loss: {v_loss:.4f} | '
+                    f'>d{delta_threshold:.0f}: {over_delta_ratio*100:4.1f}% | '
+                    f'Vshare: {v_share_loss*100:5.1f}% | '
+                    f'Clip: {clip_frac*100:4.1f}% | '
+                    f'{reward_component_label}: {td_share*100:5.1f}%{overdue_component_text} | '
+                    f'Vali MK: {overall_ms_mean:.1f} | Vali TD: {overall_td_mean:.1f} | '
+                    f'Vali Obj: {overall_obj_mean:.1f} | Best Obj: {self.record:.1f}'
+                    f'{r60_text}'
+                )
+            else:
+                avg_reward = np.mean(ep_rewards)
+                tqdm.write(
+                    f'Update {i_update+1}/{self.max_updates} | '
+                    f'R: {avg_reward:.2f} | Loss: {loss:.4f} | V-Loss: {v_loss:.4f} | '
+                    f'>d{delta_threshold:.0f}: {over_delta_ratio*100:4.1f}% | '
+                    f'Vshare: {v_share_loss*100:5.1f}% | '
+                    f'Clip: {clip_frac*100:4.1f}% | '
+                    f'{reward_component_label}: {td_share*100:5.1f}%{overdue_component_text}'
+                )
+
+        self.train_et = time.time()
+        self.save_training_log()
+
+    def save_training_log(self):
+        def to_native(obj):
+            if isinstance(obj, list): return [to_native(i) for i in obj]
+            if isinstance(obj, dict): return {k: to_native(v) for k, v in obj.items()}
+            if hasattr(obj, 'item'): return obj.item()
+            return obj
+
+        log_model_name = f'{self.model_name}_{self.initial_n_j}x{self.fixed_n_m}{strToSuffix(self.config.data_suffix)}'
+        log_path_base = f'./train_log/{self.config.data_source}/'
+
+        # Convert and save all logs to .txt
+        with open(f'{log_path_base}reward_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.log)))
+        with open(f'{log_path_base}detailed_reward_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.detailed_log)))
+        with open(f'{log_path_base}valiquality_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.validation_log)))
+        with open(f'{log_path_base}valitardiness_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.validation_tardiness_log)))
+        with open(f'{log_path_base}valiobj_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.validation_obj_log)))
+        with open(f'{log_path_base}loss_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.loss_log)))
+        if hasattr(self, "train_st") and hasattr(self, "train_et"):
+            train_seconds = float(self.train_et - self.train_st)
+            avg_seconds_per_update = train_seconds / max(1, int(self.max_updates))
+            train_time_log = {
+                "model_name": self.model_name,
+                "log_model_name": log_model_name,
+                "max_updates": int(self.max_updates),
+                "train_seconds": train_seconds,
+                "train_minutes": train_seconds / 60.0,
+                "train_hours": train_seconds / 3600.0,
+                "avg_seconds_per_update": avg_seconds_per_update,
+                "start_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.train_st)),
+                "end_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.train_et)),
+            }
+            with open(f'{log_path_base}train_time_{log_model_name}.txt', 'w') as f:
+                f.write(str(to_native(train_time_log)))
+            train_time_entry = (
+                "\n" + "=" * 80 + "\n"
+                f"model_name: {train_time_log['model_name']}\n"
+                f"log_model_name: {train_time_log['log_model_name']}\n"
+                f"max_updates: {train_time_log['max_updates']}\n"
+                f"start_time: {train_time_log['start_time']}\n"
+                f"end_time: {train_time_log['end_time']}\n"
+                f"train_seconds: {train_time_log['train_seconds']:.3f}\n"
+                f"train_minutes: {train_time_log['train_minutes']:.3f}\n"
+                f"train_hours: {train_time_log['train_hours']:.3f}\n"
+                f"avg_seconds_per_update: {train_time_log['avg_seconds_per_update']:.3f}\n"
+            )
+            with open('train_time.txt', 'a', encoding='utf-8') as f:
+                f.write(train_time_entry)
+        
+        # [ALIGNED] Save breakdown log as .txt
+        if hasattr(self, 'validation_breakdown_log') and self.validation_breakdown_log:
+            with open(f'{log_path_base}valibreakdown_{log_model_name}.txt', 'w') as f: 
+                f.write(str(to_native(self.validation_breakdown_log)))
+
+            # Plotting (Directly from memory for performance)
+            try:
+                import matplotlib.pyplot as plt
+                df_breakdown = pd.DataFrame(self.validation_breakdown_log)
+                fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+                sizes = [10, 20, 30]
+                for i, n_j in enumerate(sizes):
+                    ax = axes[i]
+                    ax.plot(df_breakdown['update'], df_breakdown[f'td_{n_j}j'], color='red', label='Tardiness')
+                    ax.set_title(f'Validation Trend - {n_j} Jobs')
+                    ax.set_xlabel('Updates')
+                    ax.set_ylabel('Mean Total Tardiness', color='red')
+                    ax2 = ax.twinx()
+                    ax2.plot(df_breakdown['update'], df_breakdown[f'ms_{n_j}j'], color='blue', linestyle='--', label='Makespan')
+                    ax2.set_ylabel('Mean Makespan', color='blue')
+                plt.tight_layout()
+                plt.savefig(f'{log_path_base}valitrend_{log_model_name}.png')
+                plt.close(fig)
+            except Exception as e:
+                print(f"Plotting failed: {e}")
+
+    def save_validation_log(self):
+        def to_native(obj):
+            if isinstance(obj, list): return [to_native(i) for i in obj]
+            if isinstance(obj, dict): return {k: to_native(v) for k, v in obj.items()}
+            if hasattr(obj, 'item'): return obj.item()
+            return obj
+
+        log_model_name = f'{self.model_name}_{self.initial_n_j}x{self.fixed_n_m}{strToSuffix(self.config.data_suffix)}'
+        log_path_base = f'./train_log/{self.config.data_source}/'
+        
+        with open(f'{log_path_base}valiquality_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.validation_log)))
+        with open(f'{log_path_base}valitardiness_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.validation_tardiness_log)))
+        with open(f'{log_path_base}valiobj_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.validation_obj_log)))
+        
+        # [ALIGNED] Real-time Breakdown .txt
+        if hasattr(self, 'validation_breakdown_log') and self.validation_breakdown_log:
+            with open(f'{log_path_base}valibreakdown_{log_model_name}.txt', 'w') as f: 
+                f.write(str(to_native(self.validation_breakdown_log)))
+        if hasattr(self, 'r60_diag_log') and self.r60_diag_log:
+            with open(f'{log_path_base}r60diag_{log_model_name}.txt', 'w') as f:
+                f.write(str(to_native(self.r60_diag_log)))
+
+    def sample_training_instances(self, i_update):
+        dataset_JobLength, dataset_OpPT, dataset_DueDate = [], [], []
+        due_mode = self.resolve_training_due_mode(i_update)
+        # [UPDATED] 100% Uniform for consistency
+        for i in range(self.num_envs):
+            instance_seed = self.config.seed_train + i_update * self.num_envs + i
+            # Force 'uniform' mode
+            JobLength, OpPT, _ = SD2_instance_generator(config=self.config, seed=instance_seed, mode='uniform')
+            DueDate = generate_due_dates(JobLength, OpPT, due_date_mode=due_mode, seed=instance_seed)
+            dataset_JobLength.append(JobLength); dataset_OpPT.append(OpPT); dataset_DueDate.append(DueDate)
+        return dataset_JobLength, dataset_OpPT, dataset_DueDate
+
+    def resolve_training_due_mode(self, i_update):
+        due_mode = str(getattr(configs, "ll_due_date_mode", "k"))
+        if due_mode == "range3_hold":
+            hold = max(1, int(getattr(configs, "ll_due_setting_hold_updates", 10)))
+            due_modes = ("range3_loose", "range3_mixed", "range3_tight")
+            return due_modes[(int(i_update) // hold) % len(due_modes)]
+        return due_mode
+
+    def resolve_vloss_coef(self, due_mode):
+        if not bool(getattr(configs, "ll_due_vloss_coef", False)):
+            return float(getattr(configs, "vloss_coef", 0.1))
+        mode = str(due_mode or "").lower()
+        if "loose" in mode:
+            return float(getattr(configs, "ll_vloss_coef_loose", getattr(configs, "vloss_coef", 0.1)))
+        if "tight" in mode:
+            return float(getattr(configs, "ll_vloss_coef_tight", getattr(configs, "vloss_coef", 0.1)))
+        return float(getattr(configs, "ll_vloss_coef_mixed", getattr(configs, "vloss_coef", 0.1)))
+
+    def evaluate_r60_fixed_case(self):
+        case_path = str(getattr(configs, "ll_r60_case_path", "") or "")
+        if not case_path or not os.path.exists(case_path):
+            return {}
+        try:
+            case = np.load(case_path, allow_pickle=False)
+            job_lengths = case["job_lengths"].astype(np.int64)
+            op_pt = case["op_pt"].astype(np.float64)
+            due_rel = case["due_rel"].astype(np.float64)
+            ready_rel = case["ready_rel"].astype(np.float64)
+            machine_free_rel = case["machine_free_rel"].astype(np.float64)
+            job_ids = case["job_ids"].astype(np.int64)
+            op_offsets = case["op_offsets"].astype(np.int64)
+            pt_scale = (float(configs.low) + float(configs.high)) / 2.0
+
+            env = LLFJSPEnv(n_j=int(len(job_lengths)), n_m=int(op_pt.shape[1]))
+            state = env.set_initial_data(
+                [job_lengths],
+                [op_pt],
+                due_date_list=[due_rel],
+                true_due_date_list=[due_rel],
+            )
+            env.true_mch_free_time[:, :] = machine_free_rel
+            env.mch_free_time[:, :] = machine_free_rel / max(pt_scale, 1e-8)
+            env.true_candidate_free_time[:, :] = ready_rel
+            env.candidate_free_time[:, :] = ready_rel / max(pt_scale, 1e-8)
+            state = env.rebuild_state_from_current()
+
+            target_job_id = 33
+            overdue_order = np.argsort(due_rel)
+            overdue_job_ids = [
+                int(job_ids[idx])
+                for idx in overdue_order
+                if float(due_rel[idx]) < 0.0
+            ]
+            overdue_first_steps = {jid: -1 for jid in overdue_job_ids}
+
+            done = False
+            step = 0
+            job33_first_step = -1
+            while not done:
+                with torch.no_grad():
+                    pi, _ = self.ppo.policy(
+                        fea_j=state.fea_j_tensor,
+                        op_mask=state.op_mask_tensor,
+                        candidate=state.candidate_tensor,
+                        fea_m=state.fea_m_tensor,
+                        mch_mask=state.mch_mask_tensor,
+                        comp_idx=state.comp_idx_tensor,
+                        dynamic_pair_mask=state.dynamic_pair_mask_tensor,
+                        fea_pairs=state.fea_pairs_tensor,
+                    )
+                    action = greedy_select_action(pi).cpu().numpy()
+                chosen_action = int(np.asarray(action).reshape(-1)[0])
+                chosen_job_idx = int(chosen_action // env.number_of_machines)
+                chosen_job_id = int(job_ids[chosen_job_idx])
+                if job33_first_step < 0 and chosen_job_id == target_job_id:
+                    job33_first_step = int(step)
+                if chosen_job_id in overdue_first_steps and overdue_first_steps[chosen_job_id] < 0:
+                    overdue_first_steps[chosen_job_id] = int(step)
+                state, _, done_flag, _ = env.step(action)
+                done = bool(done_flag[0])
+                step += 1
+
+            overdue_steps_text = ",".join(
+                f"{jid}:{overdue_first_steps[jid]}"
+                for jid in overdue_job_ids[:8]
+            )
+            return {
+                "r60_job33_first_step": int(job33_first_step),
+                "r60_total_td": float(env.accumulated_tardiness[0]),
+                "r60_overdue_job_ids": overdue_job_ids,
+                "r60_overdue_first_steps": overdue_first_steps,
+                "r60_overdue_steps_text": overdue_steps_text,
+            }
+        except Exception as exc:
+            return {"r60_error": str(exc)}
+
+    def validate_envs_with_various_op_nums(self, batches):
+        self.ppo.policy.eval()
+        results_per_batch = []
+        for batch in batches:
+            temp_env = LLFJSPEnv(n_j=batch['n_j'], n_m=self.fixed_n_m)
+            state = temp_env.set_initial_data(batch['jl'], batch['pt'], batch['dd'], true_due_date_list=batch['dd'])
+            while True:
+                with torch.no_grad():
+                    batch_idx = ~torch.from_numpy(temp_env.done_flag)
+                    if batch_idx.any():
+                        pi, _ = self.ppo.policy(fea_j=state.fea_j_tensor[batch_idx], op_mask=state.op_mask_tensor[batch_idx], candidate=state.candidate_tensor[batch_idx],
+                                                fea_m=state.fea_m_tensor[batch_idx], mch_mask=state.mch_mask_tensor[batch_idx], comp_idx=state.comp_idx_tensor[batch_idx],
+                                                dynamic_pair_mask=state.dynamic_pair_mask_tensor[batch_idx], fea_pairs=state.fea_pairs_tensor[batch_idx])
+                        if str(getattr(configs, "eval_action_selection", "greedy")).lower() == "sample":
+                            action, _ = sample_action(pi)
+                        else:
+                            action = greedy_select_action(pi)
+                        state, _, done, _ = temp_env.step(action.cpu().numpy())
+                    else: break
+                if done.all(): break
+            
+            results_per_batch.append({
+                'n_j': batch['n_j'],
+                'ms_mean': np.mean(temp_env.current_makespan),
+                'td_mean': np.mean(temp_env.accumulated_tardiness),
+                'ms_list': temp_env.current_makespan.tolist(),
+                'td_list': temp_env.accumulated_tardiness.tolist()
+            })
+            
+        self.ppo.policy.train()
+        return results_per_batch
+
+    def save_model(self):
+        save_dir = os.path.join(".", "trained_network", self.config.data_source)
+        os.makedirs(save_dir, exist_ok=True)
+        target_path = os.path.join(save_dir, f"{self.model_name}.pth")
+        tmp_path = os.path.join(save_dir, f"{self.model_name}.tmp.pth")
+        fallback_path = os.path.join(save_dir, f"{self.model_name}_{time.strftime('%Y%m%d_%H%M%S')}.pth")
+
+        torch.save(self.ppo.policy.state_dict(), tmp_path)
+        try:
+            os.replace(tmp_path, target_path)
+        except OSError as exc:
+            os.replace(tmp_path, fallback_path)
+            print(
+                f"[WARN] Could not replace checkpoint '{target_path}' ({exc}). "
+                f"Saved fallback checkpoint to '{fallback_path}'."
+            )
+
+def main():
+    setup_seed(configs.seed_train)
+    configs.data_source, configs.data_suffix = 'SD2', 'mix'
+    trainer = Trainer(configs)
+    trainer.train()
+
+if __name__ == '__main__': main()

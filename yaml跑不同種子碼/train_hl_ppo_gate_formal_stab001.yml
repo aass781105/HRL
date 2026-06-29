@@ -1,0 +1,71 @@
+# =====================================================================
+# High-Level PPO Gate Training Config: Formal Run (200 updates, num_envs=4)
+# Stability scale: 0.01 (Low stability penalty)
+# =====================================================================
+
+# --- Gate Policy & Unified Scheduler Configuration ---
+hl_gate_policy: ppo
+scheduler_type: PPO
+ll_ppo_model_path: trained_network\SD2\llmk_range_u10_30_range3_env50_sizehold60_duehold20_short_mk10_esttd.pth
+hl_ppo_model_path: ppo_ckpt\hl_ppo_gate_formal_stab001.pth
+
+# --- Environment & Problem Scale Parameters ---
+n_m: 5
+low: 1
+high: 99
+event_horizon: 80
+interarrival_mean: 25
+arrival_mode: uniform
+interarrival_uniform_low: 20
+interarrival_uniform_high: 50
+init_jobs: 50
+burst_size: 1
+due_date_k_low: 2.0
+due_date_k_high: 9.0
+event_seed: 42
+fast_mode: true
+
+# --- Reward & Credit Assignment Configuration ---
+hl_td_credit_mode: terminal_only
+hl_release_reward_decay: 0.9
+hl_td_signal_source: baseline_gap_final
+hl_td_reward_coef: 0.1
+hl_shaping_reward_coef: 0.01
+hl_mk_reward_coef: 0.0
+hl_buffer_penalty_coef: 0.01
+
+# --- Stability Penalty (free_threshold_distributed - distributed over release steps) ---
+hl_stability_mode_v2: free_threshold_distributed
+hl_stability_scale: 0.01
+hl_stability_free_releases: 10
+
+# --- High-Level PPO Training Hyperparameters ---
+hl_ppo_name: hl_ppo_gate_formal_stab001
+hl_ppo_updates: 200                      # Formal training length: 200 updates
+hl_ppo_num_envs: 4                       # Number of parallel environments: 4
+hl_ppo_use_async_envs: true              # Enable async vector env for speed with 4 envs
+
+hl_ppo_train_seed: 42
+hl_ppo_lr: 0.0001
+hl_ppo_lr_decay: true
+hl_ppo_lr_end: 0.00005
+hl_ppo_gamma: 0.995
+hl_ppo_gae_lambda: 0.98
+hl_ppo_clip: 0.2
+hl_ppo_entropy_coef: 0.01
+hl_ppo_entropy_decay: false
+hl_ppo_entropy_end: 0.005
+hl_ppo_value_coef: 0.5
+hl_ppo_update_epochs: 5
+hl_ppo_minibatch_size: 64
+hl_ppo_max_grad_norm: 1.0
+hl_ppo_validate_every: 10
+hl_ppo_instance_episodes: 999999          # Keep the same problem instance forever (no switching)
+hl_ppo_same_problem_eval_every: 10       # Evaluate on the same problem every 10 updates
+
+# --- Network Architecture Parameters ---
+hl_ppo_num_layers: 3
+hl_ppo_hidden_dim: 512
+hl_ppo_separate_trunks: false
+hl_ppo_value_num_layers: 3
+hl_ppo_value_hidden_dim: 512
