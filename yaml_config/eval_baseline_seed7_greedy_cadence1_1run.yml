@@ -6,8 +6,8 @@ hl_gate_policy: ppo
 hl_buffer_slack_release_threshold: 0
 scheduler_type: PPO
 ll_ppo_model_path: trained_network\SD2\ll_u1030_esttd_odprog.pth
-hl_ppo_model_path: ppo_ckpt\hlgate_scn_bneck_s05_e4.pth
-hl_ppo_name: hlgate_scn_bneck_s05_e4
+hl_ppo_model_path: ppo_ckpt\hlgate_scn_base_s05_e4.pth
+hl_ppo_name: hlgate_scn_base_s05_e4
 hl_ppo_separate_trunks: true
 hl_ppo_value_num_layers: 1
 hl_ppo_use_residual: true
@@ -30,7 +30,7 @@ init_jobs: 30
 burst_size: 1
 event_seed: 7
 fast_mode: true
-hl_env_scenario: bottleneck_order
+hl_env_scenario: baseline
 hl_bottleneck_order_prob: 0.5
 hl_bottleneck_order_machine_count: 1
 hl_bottleneck_exclude_urgent: true

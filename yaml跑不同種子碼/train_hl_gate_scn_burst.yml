@@ -27,6 +27,9 @@ hl_due_date_k_normal_low: 6
 hl_due_date_k_normal_high: 12
 
 hl_gate_decision_interval: 2
+baseline_cadence: 1
+ll_eval_action_selection: greedy
+hl_initial_release_prob: 0.25
 
 hl_td_credit_mode: terminal_only
 hl_release_reward_decay: 0.9
