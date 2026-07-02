@@ -24,8 +24,12 @@ def parse_solver_args():
 
 solver_args = parse_solver_args()
 
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 from dynamic_job_stream import dynamic_job_stream_to_dict, generate_dynamic_job_stream
-from ortools_gantt import plot_ortools_gantt_with_due_dates
+from ortools_tools.common.ortools_gantt import plot_ortools_gantt_with_due_dates
 from params import configs
 
 

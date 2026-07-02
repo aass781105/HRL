@@ -337,7 +337,7 @@ class GlobalTimelineOrchestrator:
                 if self.method in ("OR-TOOLS", "ORTOOLS", "OR_TOOLS"):
                     raise RuntimeError(
                         "scheduler_type=OR-Tools is not supported by the generic heuristic/PPO orchestrator path. "
-                        "Use run_dynamic_ortools_cadence.py for OR-Tools cadence scheduling, or set scheduler_type "
+                        "Use ortools_tools/dynamic/run_dynamic_ortools_cadence.py for OR-Tools cadence scheduling, or set scheduler_type "
                         "to PPO/SPT/MWKR/FIFO for this path."
                     )
                 from common_utils import heuristic_select_action

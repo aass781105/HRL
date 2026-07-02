@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import copy
 import csv
@@ -7,6 +8,10 @@ import random
 import pandas as pd
 from tqdm import tqdm
 from typing import Dict, List
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 from params import configs
 from common_utils import *

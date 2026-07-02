@@ -9,6 +9,10 @@ import numpy as np
 import pandas as pd
 from ortools.sat.python import cp_model
 
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 from params import configs
 from hrl_orchestrator import GlobalTimelineOrchestrator, JobSpec
 from dynamic_job_stream import create_dynamic_world, sample_initial_jobs

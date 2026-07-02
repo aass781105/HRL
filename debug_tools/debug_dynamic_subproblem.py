@@ -86,7 +86,7 @@ def simulate_dynamic_subproblem():
     done = False
     step = 0
     
-    output_dir = "debug_dynamic_output"
+    output_dir = os.path.join("debug_tools", "outputs", "debug_dynamic_output")
     states_dir = os.path.join(output_dir, "step_states")
     os.makedirs(states_dir, exist_ok=True)
 
@@ -200,7 +200,7 @@ def simulate_dynamic_subproblem():
     print(f"Makespan (MK): {final_mk:.2f}")
     print(f"Total Tardiness (TD): {total_td:.2f}")
 
-    output_dir = "debug_dynamic_output"
+    output_dir = os.path.join("debug_tools", "outputs", "debug_dynamic_output")
     os.makedirs(output_dir, exist_ok=True)
 
     df = pd.DataFrame(schedule_details)

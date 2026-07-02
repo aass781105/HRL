@@ -20,8 +20,8 @@ from model.ll_ppo import ll_ppo_initialize
 from params import configs
 
 
-CASE_PATH = Path("debug/dynamic_r60_candidate_features/r060_event118_t03691_fixed_ll_case.npz")
-OUTPUT_DIR = Path("debug/dynamic_r60_fixed_ll_eval")
+CASE_PATH = Path("debug_tools/dynamic_r60_candidate_features/r060_event118_t03691_fixed_ll_case.npz")
+OUTPUT_DIR = Path("debug_tools/outputs/dynamic_r60_fixed_ll_eval")
 
 
 def write_csv(path: Path, rows: List[Dict]) -> None:

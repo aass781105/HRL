@@ -1,5 +1,6 @@
 
 import os
+import sys
 import json
 import time
 import argparse
@@ -7,7 +8,12 @@ import re
 import numpy as np
 import pandas as pd
 from ortools.sat.python import cp_model
-from ortools_gantt import plot_ortools_gantt_with_due_dates
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from ortools_tools.common.ortools_gantt import plot_ortools_gantt_with_due_dates
 
 
 def text_to_matrix(text):

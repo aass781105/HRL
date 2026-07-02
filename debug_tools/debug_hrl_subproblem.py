@@ -15,7 +15,7 @@ from FJSPEnvForVariousOpNums import FJSPEnvForVariousOpNums
 
 def main():
     # 0. 初始化配置
-    output_dir = "debug_final_output"
+    output_dir = os.path.join("debug_tools", "outputs", "debug_final_output")
     states_dir = os.path.join(output_dir, "step_states")
     os.makedirs(states_dir, exist_ok=True)
     

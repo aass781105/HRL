@@ -12,7 +12,7 @@ from ll_fjsp_env import LLFJSPEnv
 from common_utils import sample_action
 from data_utils import text_to_matrix
 from model.ll_ppo import ll_ppo_initialize
-from ortools_gantt import plot_ortools_gantt_with_due_dates
+from ortools_tools.common.ortools_gantt import plot_ortools_gantt_with_due_dates
 from params import configs
 
 

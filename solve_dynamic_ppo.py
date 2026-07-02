@@ -12,7 +12,7 @@ import torch
 from common_utils import greedy_select_action, sample_action
 from FJSPEnvForVariousOpNums import FJSPEnvForVariousOpNums
 from model.PPO import PPO_initialize
-from ortools_gantt import plot_ortools_gantt_with_due_dates
+from ortools_tools.common.ortools_gantt import plot_ortools_gantt_with_due_dates
 from params import configs
 
 

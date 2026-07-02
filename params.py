@@ -178,7 +178,7 @@ parser.add_argument('--ll_range3_overdue_factor_low', type=float, default=-1.5, 
 parser.add_argument('--ll_range3_overdue_factor_high', type=float, default=-0.7, help='Upper factor for injected overdue due-date range.')
 parser.add_argument('--ll_range3_overdue_job_frac_low', type=float, default=0.01, help='Lower fraction of jobs injected as overdue when an instance is selected.')
 parser.add_argument('--ll_range3_overdue_job_frac_high', type=float, default=0.20, help='Upper fraction of jobs injected as overdue when an instance is selected.')
-parser.add_argument('--ll_r60_case_path', type=str, default=r'debug\dynamic_r60_candidate_features\r060_event118_t03691_fixed_ll_case.npz', help='Fixed residual subproblem case used for low-level r60 diagnostic validation.')
+parser.add_argument('--ll_r60_case_path', type=str, default=r'debug_tools\dynamic_r60_candidate_features\r060_event118_t03691_fixed_ll_case.npz', help='Fixed residual subproblem case used for low-level r60 diagnostic validation.')
 parser.add_argument('--hl_due_date_tightness', type=float, default=1.2, help='Tightness base factor for high-level dynamic environment.')
 parser.add_argument('--ll_due_date_k_constant', type=float, default=1.2, help='Constant tightness factor k for low-level static training in k-mode.')
 parser.add_argument('--ll_due_date_noise', type=float, default=0.0, help='Multiplicative noise level for low-level due dates')

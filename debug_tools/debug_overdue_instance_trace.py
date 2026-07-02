@@ -40,7 +40,7 @@ if SETTINGS["config"]:
 from data_utils import SD2_instance_generator, generate_due_dates
 from ll_fjsp_env import LLFJSPEnv
 from model.ll_ppo import ll_ppo_initialize
-from ortools_gantt import plot_ortools_gantt_with_due_dates
+from ortools_tools.common.ortools_gantt import plot_ortools_gantt_with_due_dates
 from params import configs
 
 sys.argv = [sys.argv[0]]

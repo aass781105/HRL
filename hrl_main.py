@@ -13,7 +13,6 @@ from hrl_orchestrator import GlobalTimelineOrchestrator
 
 # Plotting
 from gantt import plot_global_gantt
-from plot_utils import plot_simulation_summary_stats
 
 import torch
 from model.hl_gate_state import HL_GATE_STATE_DIM, HL_LL_BUFFER_EMBED_DIM, calculate_hl_gate_state, get_hl_gate_state_dim
@@ -858,9 +857,6 @@ def run_event_driven_until_nevents(
         for row in pending_obs_rows:
             obs_csv_writer.writerow(row + [""] * 9)
     
-    # [DISABLED] Skip summary boxplots
-    # plot_simulation_summary_stats(all_sim_job_stats, csv_dir)
-
     summary_common_tail = [
         "", "", "", "", "", "", "",
         f"{total_td:.2f}",
