@@ -1,6 +1,6 @@
 import numpy as np
 
-HL_GATE_STATE_DIM = 25
+HL_GATE_STATE_DIM = 29
 HL_LL_BUFFER_EMBED_DIM = 128
 
 
@@ -14,7 +14,7 @@ def get_hl_gate_state_dim(config=None) -> int:
 def _buffer_machine_demand_stats(buffer_jobs, machine_free_time, t_now: float, n_machines: int):
     n_machines = int(n_machines)
     if n_machines <= 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
     demand = np.zeros(n_machines, dtype=float)
     for job in buffer_jobs or []:
@@ -47,10 +47,12 @@ def _buffer_machine_demand_stats(buffer_jobs, machine_free_time, t_now: float, n
 
     total_demand = float(np.sum(demand))
     if total_demand <= 1e-12:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
     demand_norm = demand / total_demand
     demand_max_share = float(np.max(demand_norm))
+    valid_share = demand_norm[demand_norm > 1e-12]
+    demand_entropy = float(-np.sum(valid_share * np.log(valid_share)) / max(np.log(float(n_machines)), 1e-8))
 
     load = np.maximum(0.0, np.asarray(machine_free_time, dtype=float)[:n_machines] - float(t_now))
     if load.size < n_machines:
@@ -62,7 +64,7 @@ def _buffer_machine_demand_stats(buffer_jobs, machine_free_time, t_now: float, n
         load_norm = load / total_load
         load_overlap = float(np.sum(demand_norm * load_norm))
 
-    return demand_max_share, load_overlap
+    return demand_max_share, load_overlap, demand_entropy
 
 
 def calculate_hl_gate_state(
@@ -100,7 +102,8 @@ def calculate_hl_gate_state(
 
     buf_neg = buf_min = buf_avg = buf_std = 0.0
     buf_q25 = 0.0
-    w_min = w_avg = w_rat = c_log = w_std = w_cnt = s_den = 0.0
+    buf_neg_sum = buf_total_work = 0.0
+    w_min = w_avg = w_rat = c_log = w_std = w_cnt = s_den = w_total_rem = 0.0
 
     if buffer_stats:
         buf_neg = float(buffer_stats.get("buffer_neg_slack_ratio", 0.0))
@@ -108,6 +111,8 @@ def calculate_hl_gate_state(
         buf_avg = float(buffer_stats.get("avg_slack", 0.0)) / time_scale
         buf_std = float(buffer_stats.get("slack_std", 0.0)) / time_scale
         buf_q25 = float(buffer_stats.get("slack_q25", 0.0)) / time_scale
+        buf_neg_sum = float(buffer_stats.get("neg_slack_sum", 0.0)) / time_scale
+        buf_total_work = float(buffer_stats.get("total_work", 0.0)) / time_scale
 
     if wip_stats:
         w_min = float(wip_stats.get("wip_min_slack", 0.0)) / time_scale
@@ -115,6 +120,7 @@ def calculate_hl_gate_state(
         w_rat = float(wip_stats.get("wip_tardy_ratio", 0.0))
         p_td = float(wip_stats.get("planned_td", 0.0))
         total_rem_work = float(wip_stats.get("total_rem_work", 0.0))
+        w_total_rem = total_rem_work / time_scale
         c_log_raw = p_td / (total_rem_work + 1.0)
         c_log = float(np.clip(c_log_raw, 0.0, 10.0))
         w_std = float(wip_stats.get("wip_slack_std", 0.0)) / time_scale
@@ -126,10 +132,16 @@ def calculate_hl_gate_state(
     o19 = float(np.log1p(max(0, int(steps_since_last_release))))
     decision_den = max(5.0, float(max(0, int(decision_steps_elapsed))))
     o20 = float(max(0, int(release_count_so_far)) / decision_den)
-    o21, o22 = _buffer_machine_demand_stats(buffer_jobs, mft_abs, t_now, n_machines)
+    o21, o22, o24 = _buffer_machine_demand_stats(buffer_jobs, mft_abs, t_now, n_machines)
     o23 = float(1.0 if bool(is_last_step) else 0.0)
 
     return np.array(
-        [o0, o1, o2, o3, buf_neg, buf_min, buf_avg, w_min, w_avg, w_rat, o10, c_log, buf_std, w_std, w_cnt, o15, s_den, o17, o18, o19, o20, o21, o22, buf_q25, o23],
+        [
+            o0, o1, o2, o3, buf_neg, buf_min, buf_avg, w_min, w_avg, w_rat,
+            o10, c_log, buf_std, w_std, w_cnt, o15, s_den, o17, o18, o19,
+            o20, o21, o22, buf_q25,
+            buf_neg_sum, buf_total_work, w_total_rem, o24,
+            o23,
+        ],
         dtype=np.float32,
     )

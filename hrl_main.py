@@ -424,7 +424,10 @@ def run_event_driven_until_nevents(
     def get_raw_state_info(orchestrator, t_now):
         b_slacks, b_neg = [], 0
         for j in orchestrator.buffer:
-            mw = float(j.meta.get("total_proc_time", 0.0)); due = all_job_due_dates[j.job_id]; s = due - t_now - mw
+            mw = float(j.meta.get("total_proc_time", 0.0))
+            if mw <= 0.0:
+                mw = float(sum(float(getattr(op, "avg_proc_time", 0.0)) for op in getattr(j, "operations", []) or []))
+            due = all_job_due_dates[j.job_id]; s = due - t_now - mw
             b_slacks.append(s); 
             if t_now + mw > due: b_neg += 1
         b_stats = (b_neg/len(orchestrator.buffer), min(b_slacks), sum(b_slacks)/len(b_slacks), np.std(b_slacks), np.percentile(b_slacks, 25)) if orchestrator.buffer else (0.0, 0.0, 0.0, 0.0, 0.0)
@@ -432,6 +435,20 @@ def run_event_driven_until_nevents(
         w_idle = orchestrator.compute_weighted_idle(t_now, float(mx_l)) if mx_l>0 else 0.0
         u_idle = orchestrator.compute_unweighted_idle(t_now, float(mx_l)) if mx_l>0 else 0.0
         return [len(orchestrator.buffer), np.mean(rem), np.min(rem), mx_l, np.std(rem), w_idle, u_idle, b_stats[0], b_stats[1], b_stats[2], b_stats[3], b_stats[4], wip["wip_count"], wip["wip_tardy_ratio"], wip["wip_min_slack"], wip["wip_avg_slack"], wip["wip_slack_std"], wip["planned_td"], wip["total_rem_work"]]
+
+    def get_buffer_extra_state_stats(orchestrator, t_now):
+        neg_slack_sum = 0.0
+        total_work = 0.0
+        for j in orchestrator.buffer:
+            mw = float(j.meta.get("total_proc_time", 0.0))
+            if mw <= 0.0:
+                mw = float(sum(float(getattr(op, "avg_proc_time", 0.0)) for op in getattr(j, "operations", []) or []))
+            due = float(all_job_due_dates[j.job_id])
+            slack = due - float(t_now) - mw
+            total_work += mw
+            if slack < 0.0:
+                neg_slack_sum += float(-slack)
+        return {"neg_slack_sum": neg_slack_sum, "total_work": total_work}
 
     def save_details(orch, seq, t, label=""):
         # Skip if Fast Mode is on
@@ -595,7 +612,16 @@ def run_event_driven_until_nevents(
         K = int(getattr(configs, "hl_gate_decision_interval", 1))
         
         raw_s = get_raw_state_info(orch, t_now)
-        b_dict = {"buffer_neg_slack_ratio": raw_s[7], "min_slack": raw_s[8], "avg_slack": raw_s[9], "slack_std": raw_s[10], "slack_q25": raw_s[11]}
+        b_extra = get_buffer_extra_state_stats(orch, t_now)
+        b_dict = {
+            "buffer_neg_slack_ratio": raw_s[7],
+            "min_slack": raw_s[8],
+            "avg_slack": raw_s[9],
+            "slack_std": raw_s[10],
+            "slack_q25": raw_s[11],
+            "neg_slack_sum": b_extra["neg_slack_sum"],
+            "total_work": b_extra["total_work"],
+        }
         w_dict = {
             "wip_count": raw_s[12], 
             "wip_tardy_ratio": raw_s[13], 

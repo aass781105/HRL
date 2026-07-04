@@ -602,18 +602,36 @@ class HLGateEnv(gym.Env):
         return compute_hl_ll_buffer_embedding(self.orch, self.t_now, self.M, configs)
 
     def _get_buffer_stats(self, t_now: float):
-        if not self.orch.buffer: return {"buffer_neg_slack_ratio": 0.0, "min_slack": 0.0, "avg_slack": 0.0, "slack_std": 0.0, "slack_q25": 0.0}
+        if not self.orch.buffer:
+            return {
+                "buffer_neg_slack_ratio": 0.0,
+                "min_slack": 0.0,
+                "avg_slack": 0.0,
+                "slack_std": 0.0,
+                "slack_q25": 0.0,
+                "neg_slack_sum": 0.0,
+                "total_work": 0.0,
+            }
         slacks, neg_count = [], 0
+        neg_slack_sum, total_work = 0.0, 0.0
         for j in self.orch.buffer:
-            mw = float(j.meta.get("total_proc_time", 0.0)); due = self.all_job_due_dates[j.job_id]; s = due - t_now - mw
-            slacks.append(s); 
-            if t_now + mw > due: neg_count += 1
+            mw = float(j.meta.get("total_proc_time", 0.0))
+            if mw <= 0.0:
+                mw = float(sum(float(getattr(op, "avg_proc_time", 0.0)) for op in getattr(j, "operations", []) or []))
+            due = self.all_job_due_dates[j.job_id]; s = due - t_now - mw
+            total_work += mw
+            slacks.append(s)
+            if t_now + mw > due:
+                neg_count += 1
+                neg_slack_sum += float(-s)
         return {
             "buffer_neg_slack_ratio": neg_count / len(self.orch.buffer),
             "min_slack": min(slacks),
             "avg_slack": sum(slacks) / len(slacks),
             "slack_std": float(np.std(slacks)),
             "slack_q25": float(np.percentile(slacks, 25)),
+            "neg_slack_sum": neg_slack_sum,
+            "total_work": total_work,
         }
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):

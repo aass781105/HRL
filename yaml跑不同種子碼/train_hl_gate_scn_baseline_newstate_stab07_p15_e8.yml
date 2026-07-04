@@ -4,7 +4,7 @@
 hl_gate_policy: ppo
 scheduler_type: PPO
 ll_ppo_model_path: trained_weights\lower_level\ll_u1030_esttd_odprog.pth
-hl_ppo_model_path: trained_weights\high_level\hlgate_scn_base_s07_p15_e8.pth
+hl_ppo_model_path: trained_weights\high_level\hlgate_scn_base_newstate_s07_p15_e8.pth
 
 n_m: 5
 low: 1
@@ -44,7 +44,7 @@ hl_stability_scale: 0.7
 hl_stability_power: 1.5
 hl_stability_free_releases: 10
 
-hl_ppo_name: hlgate_scn_base_s07_p15_e8
+hl_ppo_name: hlgate_scn_base_newstate_s07_p15_e8
 hl_ppo_updates: 200
 hl_ppo_num_envs: 8
 hl_ppo_use_async_envs: true
