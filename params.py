@@ -28,21 +28,14 @@ parser.add_argument('--device_id', type=str, default='0', help='Device id')
 # ============================
 # File Naming & Paths
 # ============================
-parser.add_argument('--path_name', type=str, default='test', help='path name for saving network')
-parser.add_argument('--model_suffix', type=str, default='', help='Suffix of the model')
 parser.add_argument('--data_suffix', type=str, default='mix', help='Suffix of the data')
-parser.add_argument('--model_source', type=str, default='static_ppo', help='Suffix of the data that model trained on')
 parser.add_argument('--data_source', type=str, default='SD2', help='Suffix of test data')
 
 
 # ============================
 # Experiment Control
 # ============================
-parser.add_argument('--cover_flag', type=str2bool, default=True, help='Whether covering test results of the model')
 parser.add_argument('--cover_data_flag', type=str2bool, default=False, help='Whether covering the generated data')
-parser.add_argument('--cover_heu_flag', type=str2bool, default=False, help='Whether covering test results of heuristics')
-parser.add_argument('--cover_train_flag', type=str2bool, default=True, help='Whether covering the trained model')
-parser.add_argument('--sort_flag', type=str2bool, default=True, help='Whether sorting the printed results by the makespan')
 parser.add_argument('--debug_reward_trace', type=str2bool, default=False, help='Whether printing detailed gate reward traces')
 parser.add_argument('--debug_reward_positive_threshold', type=float, default=0.5, help='Print shaping traces when reward_shaping_penalty exceeds this threshold')
 
@@ -57,7 +50,6 @@ parser.add_argument('--seed_train_vali_datagen', type=int, default=100, help='Se
 # Instance Parameters
 parser.add_argument('--n_j', type=int, default=10, help='Number of jobs of the instance')
 parser.add_argument('--n_m', type=int, default=5, help='Number of machines of the instance')
-parser.add_argument('--n_op', type=int, default=50, help='Number of operations of the instance')
 parser.add_argument('--low', type=int, default=1, help='Lower Bound of processing time(PT)')
 parser.add_argument('--high', type=int, default=99, help='Upper Bound of processing time')
 
@@ -86,11 +78,6 @@ parser.add_argument('--hidden_dim_actor', type=int, default=512, help='Hidden di
 parser.add_argument('--num_mlp_layers_critic', type=int, default=3, help='Number of layers in Critic network')
 parser.add_argument('--hidden_dim_critic', type=int, default=256, help='Hidden dimension of Critic network')
 parser.add_argument('--critic_size_context_max_n_j', type=float, default=30.0, help='Training max job count used to scale critic-only size context n_j/max_n_j')
-parser.add_argument('--ll_critic_due_context', type=str2bool, default=False, help='Append due-setting one-hot context to critic input when available.')
-parser.add_argument('--multi_critic_split_n_j', type=int, default=20, help='Use small critic for n_j below this split and large critic otherwise.')
-parser.add_argument('--multi_critic_large_split_n_j', type=int, default=26, help='Use mid critic below this split and large critic from this n_j onward.')
-
-
 # ============================
 # PPO Training Algorithm
 # ============================
@@ -98,8 +85,6 @@ parser.add_argument('--seed_train', type=int, default=3, help='Seed for training
 parser.add_argument('--ll_num_envs', type=int, default=100, help='Batch size for training environments')
 parser.add_argument('--ll_max_updates', type=int, default=1000, help='No. of episodes of each env for training')
 parser.add_argument('--ll_lr', type=float, default=3e-4, help='Learning rate')
-parser.add_argument('--ll_lr_decay', type=str2bool, default=True, help='Whether to decay learning rate linearly')
-parser.add_argument('--ll_lr_end', type=float, default=1e-4, help='Final learning rate at end of training')
 parser.add_argument('--ll_gamma', type=float, default=1, help='Discount factor used in training')
 parser.add_argument('--ll_k_epochs', type=int, default=4, help='Update frequency of each episode')
 parser.add_argument('--ll_eps_clip', type=float, default=0.2, help='Clip parameter')
@@ -112,7 +97,6 @@ parser.add_argument('--ll_ploss_coef', type=float, default=1, help='Policy loss 
 parser.add_argument('--ll_entloss_coef', type=float, default=0.03, help='Entropy loss coefficient')
 parser.add_argument('--ll_tau', type=float, default=0, help='Policy soft update coefficient')
 parser.add_argument('--ll_gae_lambda', type=float, default=0.98, help='GAE parameter')
-parser.add_argument('--train_size', type=str, default="10x5", help='Size of training instances')
 parser.add_argument('--validate_timestep', type=int, default=10, help='Interval for validation and data log')
 parser.add_argument('--reset_env_timestep', type=int, default=40, help='Interval for reseting the environment')
 parser.add_argument('--ll_minibatch_size', type=int, default=1024, help='Batch size for computing the gradient')
@@ -124,15 +108,9 @@ parser.add_argument('--ll_minibatch_size', type=int, default=1024, help='Batch s
 parser.add_argument('--seed_test', type=int, default=50, help='Seed for testing heuristics')
 parser.add_argument('--eval_seed', type=int, default=42, help='Seed for dynamic evaluation')
 parser.add_argument('--instance_json', type=str, default='', help='Fixed dynamic instance JSON path for replay/evaluation')
-parser.add_argument('--dynamic_instance_dir', type=str, default='dynamic_instances', help='Directory for exported fixed dynamic instance JSON files')
+parser.add_argument('--dynamic_instance_dir', type=str, default=r'instances\dynamic', help='Directory for exported fixed dynamic instance JSON files')
 parser.add_argument('--eval_runs_per_instance', type=int, default=10, help='Number of runs per test instance')
 parser.add_argument('--main_sample_runs', type=int, default=-1, help='Number of sample runs for main.py dynamic evaluation. If <=0, use eval_runs_per_instance.')
-parser.add_argument('--eval_num_instances', type=int, default=10, help='Number of test instances to evaluate')
-parser.add_argument('--test_data', nargs='+', default=['Hurink_vdata'], help='List of data for testing')
-parser.add_argument('--test_mode', type=str2bool, default=False, help='Whether using the sampling strategy in testing')
-parser.add_argument('--sample_times', type=int, default=100, help='Sampling times for the sampling strategy')
-parser.add_argument('--test_model', nargs='+', default=['curriculum_train_10x5+mix','curriculum_train_40x5+mix'], help='List of model for testing')
-parser.add_argument('--test_method', nargs='+', default=["MWKR"], help='List of heuristic methods for testing')
 parser.add_argument('--eval_model_name', type=str, default="llmk1000", help='用於儲存檔案的檔名')
 
 
@@ -194,7 +172,7 @@ parser.add_argument('--hl_due_date_k_normal_high', type=float, default=8.5, help
 parser.add_argument('--scheduler_type', type=str, default='PPO', 
                     choices=['PPO', 'SPT', 'MWKR', 'FIFO', 'OR-Tools'],
                     help='Unified scheduling method used across all stages (Init, Dynamic, Flush)')
-parser.add_argument('--ll_ppo_model_path', type=str, default=r'trained_network\SD2\ll_u1030_esttd_odprog.pth', help='PPO 權重檔 .pth 路徑')
+parser.add_argument('--ll_ppo_model_path', type=str, default=r'trained_weights\lower_level\ll_u1030_esttd_odprog.pth', help='PPO 權重檔 .pth 路徑')
 parser.add_argument('--ll_ppo_sample', type=str2bool, default=False, help='PPO 推論是否採用抽樣；False=貪婪/取最大機率')
 parser.add_argument('--enable_gap_insertion', type=str2bool, default=False, help='Allow low-level scheduler to insert operations into machine idle gaps instead of always appending after machine free time.')
 
@@ -213,7 +191,7 @@ parser.add_argument('--ll_eval_action_selection', type=str, default='sample',
                     help='Action selection mode for low-level scheduler during evaluation: sample or greedy')
 parser.add_argument('--ll_rollout_k', type=int, default=10,
                     help='Number of parallel candidate schedules generated for the low-level subproblem (when > 1, forces sampling mode).')
-parser.add_argument('--hl_ppo_model_path', type=str, default=r"ppo_ckpt\hl_ppo_gate_formal_stab_none.pth", help='PPO gate 推論權重路徑（.pth）')
+parser.add_argument('--hl_ppo_model_path', type=str, default=r"trained_weights\high_level\hl_ppo_gate_formal_stab_none.pth", help='PPO gate 推論權重路徑（.pth）')
 parser.add_argument('--hl_ppo_name', type=str, default='test', help='PPO gate 訓練存檔名稱 (不含 .pth)')
 
 
@@ -248,6 +226,7 @@ parser.add_argument('--hl_buffer_penalty_coef', type=float, default=0.0, help='C
 parser.add_argument('--hl_stability_mode', type=str, default='immediate_all', choices=['immediate_all', 'free_threshold'], help='Stability reward mode: immediate_all = current per-release penalty; free_threshold = releases are free until stability_free_releases, then penalize via terminal or redistribution.')
 parser.add_argument('--hl_stability_terminal_only', type=str2bool, default=False, help='If true, apply stability penalty only once at episode end using agent-chosen release count.')
 parser.add_argument('--hl_stability_free_releases', type=int, default=0, help='Number of agent-chosen releases that are free before stability penalty starts.')
+parser.add_argument('--hl_stability_power', type=float, default=0.0, help='Optional power for free-threshold stability penalty. Set >0 to use scale * excess^power; 0 keeps legacy triangular penalty.')
 parser.add_argument('--release_penalty_coef', type=float, default=0.1, help='Deprecated legacy parameter. No longer used by gate reward logic.')
 parser.add_argument('--hl_release_reward_decay', type=float, default=0.9, help='Decay rate for high-level release reward redistribution.')
 parser.add_argument('--hl_td_signal_source', type=str, default='agent_only', choices=['', 'none', 'agent_only', 'baseline_gap_final', 'baseline_gap_release_interval'], help='High-level TD reward source selector. Empty string keeps legacy compatibility.')

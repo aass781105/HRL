@@ -18,6 +18,7 @@ from hl_gate_env import HLGateEnv
 from model.hl_gate_state import HL_GATE_STATE_DIM, HL_LL_BUFFER_EMBED_DIM, get_hl_gate_state_dim
 from model.hl_ppo_gate_model import HLPPOGateNet
 from params import configs
+from common_utils import high_level_log_dir, high_level_plot_dir, high_level_weight_dir
 
 
 def build_env() -> HLGateEnv:
@@ -612,23 +613,43 @@ def train_hl_ppo_gate():
     vector_kwargs = {"autoreset_mode": gym.vector.AutoresetMode.DISABLED}
     if use_async_envs:
         try:
+            print(f"[INIT] creating AsyncVectorEnv with {num_envs} envs...")
+            t_env_create = time.perf_counter()
             envs = gym.vector.AsyncVectorEnv(env_fns, **vector_kwargs)
+            print(f"[INIT] AsyncVectorEnv created in {time.perf_counter() - t_env_create:.3f}s")
+            print("[INIT] resetting envs; this may compute cadence baselines...")
+            t_env_reset = time.perf_counter()
             states, _ = envs.reset(seed=seeds)
+            print(f"[INIT] env reset done in {time.perf_counter() - t_env_reset:.3f}s")
         except Exception:
             try:
                 envs.close()
             except Exception:
                 pass
+            print("[INIT] AsyncVectorEnv failed; falling back to SyncVectorEnv.")
+            t_env_create = time.perf_counter()
             envs = gym.vector.SyncVectorEnv(env_fns, **vector_kwargs)
+            print(f"[INIT] SyncVectorEnv created in {time.perf_counter() - t_env_create:.3f}s")
+            print("[INIT] resetting envs; this may compute cadence baselines...")
+            t_env_reset = time.perf_counter()
             states, _ = envs.reset(seed=seeds)
+            print(f"[INIT] env reset done in {time.perf_counter() - t_env_reset:.3f}s")
             use_async_envs = False
     else:
+        print(f"[INIT] creating SyncVectorEnv with {num_envs} envs...")
+        t_env_create = time.perf_counter()
         envs = gym.vector.SyncVectorEnv(env_fns, **vector_kwargs)
+        print(f"[INIT] SyncVectorEnv created in {time.perf_counter() - t_env_create:.3f}s")
+        print("[INIT] resetting envs; this may compute cadence baselines...")
+        t_env_reset = time.perf_counter()
         states, _ = envs.reset(seed=seeds)
+        print(f"[INIT] env reset done in {time.perf_counter() - t_env_reset:.3f}s")
     states = np.asarray(states, dtype=np.float32)
 
     name = str(getattr(configs, "hl_ppo_name", "hl_ppo_latest"))
-    plot_dir = os.path.join("plots", "train_ppo")
+    log_dir = high_level_log_dir()
+    plot_dir = high_level_plot_dir()
+    os.makedirs(log_dir, exist_ok=True)
     os.makedirs(plot_dir, exist_ok=True)
     history_ret, history_loss, history_ploss, history_vloss, history_entropy = [], [], [], [], []
     history_kl, history_clip, history_ev = [], [], []
@@ -639,6 +660,7 @@ def train_hl_ppo_gate():
     history_buf, history_shape, history_term, history_stab, history_flush = [], [], [], [], []
     history_gmk, history_gtd, history_grel = [], [], []
     history_val_mk, history_val_td, history_val_rel = [], [], []
+    history_collect_s, history_reset_s, history_merge_s, history_update_s, history_val_s = [], [], [], [], []
     val_updates, val_mk, val_td, val_rel = [], [], [], []
 
     pbar = tqdm(total=updates, desc="PPO Gate Updates")
@@ -648,14 +670,24 @@ def train_hl_ppo_gate():
         for group in optimizer.param_groups:
             group["lr"] = lr_now
 
+        t_collect = time.perf_counter()
         episodes = collect_episode_batch_vectorized(envs, states, model, device)
+        collect_s = time.perf_counter() - t_collect
+
+        t_reset = time.perf_counter()
         states, _ = envs.reset()
         states = np.asarray(states, dtype=np.float32)
+        reset_s = time.perf_counter() - t_reset
+
+        t_merge = time.perf_counter()
         batch, adv, ret, ep = merge_episode_batch(
             episodes,
             gamma,
             gae_lambda,
         )
+        merge_s = time.perf_counter() - t_merge
+
+        t_update = time.perf_counter()
         upd = update_ppo(
             model=model,
             optimizer=optimizer,
@@ -670,6 +702,8 @@ def train_hl_ppo_gate():
             minibatch_size=minibatch_size,
             max_grad_norm=max_grad_norm,
         )
+        update_s = time.perf_counter() - t_update
+        val_s = 0.0
 
         history_ret.append(float(ep["episode_return"]))
         history_loss.append(float(upd["loss"]))
@@ -712,7 +746,9 @@ def train_hl_ppo_gate():
         history_grel.append(int(grel))
 
         if (validate_every > 0) and (update_idx % validate_every == 0):
+            t_val = time.perf_counter()
             vmk, vtd, vrel = validate_greedy(model, device, seed=999)
+            val_s = time.perf_counter() - t_val
             val_updates.append(update_idx)
             val_mk.append(vmk)
             val_td.append(vtd)
@@ -721,6 +757,12 @@ def train_hl_ppo_gate():
             history_val_td[-1] = float(vtd)
             history_val_rel[-1] = float(vrel)
             tqdm.write(f">>> [VAL {update_idx:04d}] MK={vmk:7.1f} | TD={vtd:8.1f} | Rel={vrel:4d}")
+
+        history_collect_s.append(float(collect_s))
+        history_reset_s.append(float(reset_s))
+        history_merge_s.append(float(merge_s))
+        history_update_s.append(float(update_s))
+        history_val_s.append(float(val_s))
 
         avg10 = float(np.mean(history_ret[-10:]))
         line_parts = [
@@ -742,6 +784,7 @@ def train_hl_ppo_gate():
             f"EV={history_ev[-1]:6.3f}",
             f"RawAdvStd={history_raw_adv_std[-1]:6.2f}",
             f"RawAdv+={history_raw_adv_pos[-1] * 100.0:5.1f}%",
+            f"T[c/u/v]={collect_s:5.1f}/{update_s:4.1f}/{val_s:4.1f}s",
         ]
         if abs(history_shape[-1]) > 1e-12:
             line_parts.insert(9, f"Rshape={history_shape[-1]:7.2f}")
@@ -758,13 +801,14 @@ def train_hl_ppo_gate():
     pbar.close()
     envs.close()
 
-    ckpt_dir = "ppo_ckpt"
+    ckpt_dir = high_level_weight_dir()
     os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
     os.makedirs(plot_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(ckpt_dir, f"{name}.pth"))
 
-    train_log_path = os.path.join(plot_dir, f"train_log_{name}.csv")
-    val_log_path = os.path.join(plot_dir, f"val_log_{name}.csv")
+    train_log_path = os.path.join(log_dir, f"train_log_{name}.csv")
+    val_log_path = os.path.join(log_dir, f"val_log_{name}.csv")
     with open(train_log_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -774,6 +818,7 @@ def train_hl_ppo_gate():
             "Val_Makespan", "Val_Tardiness", "Val_Release_Count",
             "Makespan", "Tardiness", "Release_Count",
             "Buffer_Reward", "Shaping_Reward", "TD_Reward", "Stability_Reward", "MK_Reward",
+            "Collect_Seconds", "Reset_Seconds", "Merge_Seconds", "Update_Seconds", "Validate_Seconds",
         ])
         for i in range(len(history_ret)):
             writer.writerow([
@@ -784,6 +829,7 @@ def train_hl_ppo_gate():
                 history_val_mk[i], history_val_td[i], history_val_rel[i],
                 history_mk[i], history_td[i], history_rel[i],
                 history_buf[i], history_shape[i], history_term[i], history_stab[i], history_flush[i],
+                history_collect_s[i], history_reset_s[i], history_merge_s[i], history_update_s[i], history_val_s[i],
             ])
 
     with open(val_log_path, "w", newline="", encoding="utf-8") as f:
@@ -814,7 +860,7 @@ def train_hl_ppo_gate():
     plt.close(fig)
 
     elapsed = max(0.0, time.time() - start_ts)
-    with open(os.path.join(plot_dir, f"time_{name}.txt"), "w", encoding="utf-8") as f:
+    with open(os.path.join(log_dir, f"time_{name}.txt"), "w", encoding="utf-8") as f:
         f.write(f"hl_ppo_name={name}\n")
         f.write(f"config_path={getattr(configs, 'config', '')}\n")
         f.write(f"elapsed_seconds={elapsed:.3f}\n")

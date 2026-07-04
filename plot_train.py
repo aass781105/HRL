@@ -5,10 +5,10 @@ from typing import List, Tuple, Union
 import matplotlib.pyplot as plt
 import numpy as np
 from params import configs
-from common_utils import strToSuffix
+from common_utils import lower_level_log_dir, lower_level_plot_dir, strToSuffix
 
 # ======= 設定 =======
-OUTPUT_PLOT_DIR  = "train_log_plot"
+OUTPUT_PLOT_DIR  = lower_level_plot_dir()
 LINE_WIDTH       = 1.5
 # =========================
 
@@ -488,7 +488,7 @@ def main():
     log_file_suffix = f"{model_name}_{init_nj}x{n_m}{suffix}"
     
     # 2. Setup Paths
-    log_dir = Path(f"train_log/{configs.data_source}/").expanduser().resolve()
+    log_dir = Path(lower_level_log_dir()).expanduser().resolve()
     
     print(f"Looking for logs with suffix: {log_file_suffix} in {log_dir}")
     

@@ -16,7 +16,7 @@ from ll_fjsp_env import LLFJSPEnv
 from model.ll_dan_model import LLDANNet
 from model.hl_gate_state import HL_LL_BUFFER_EMBED_DIM, calculate_hl_gate_state, get_hl_gate_state_dim
 from hl_env_scenarios import make_burst_sampler, resolve_hl_env_scenario, scenario_config
-from common_utils import setup_seed
+from common_utils import resolve_lower_level_weight_path, setup_seed
 
 
 _LL_ENCODER_MODEL = None
@@ -35,7 +35,7 @@ def _get_global_ll_encoder_model(config=configs):
     if _LL_ENCODER_LOAD_FAILED:
         return None
 
-    model_path = str(getattr(config, "ll_ppo_model_path", "") or "")
+    model_path = resolve_lower_level_weight_path(str(getattr(config, "ll_ppo_model_path", "") or ""), getattr(config, "data_source", "SD2"))
     if not model_path or not os.path.exists(model_path):
         _LL_ENCODER_LOAD_FAILED = True
         return None
@@ -322,6 +322,9 @@ class HLGateEnv(gym.Env):
             return float(-stability_scale * max(0, int(agent_release_count)))
         free_releases = max(0, int(getattr(configs, "hl_stability_free_releases", 0)))
         excess_releases = max(0, int(agent_release_count) - free_releases)
+        stability_power = float(getattr(configs, "hl_stability_power", 0.0))
+        if stability_power > 0.0:
+            return float(-stability_scale * (float(excess_releases) ** stability_power))
         return float(-stability_scale * (excess_releases * (excess_releases + 1) / 2.0))
 
     @staticmethod
@@ -572,7 +575,7 @@ class HLGateEnv(gym.Env):
         if self._ll_encoder_load_failed:
             return None
 
-        model_path = str(getattr(configs, "ll_ppo_model_path", "") or "")
+        model_path = resolve_lower_level_weight_path(str(getattr(configs, "ll_ppo_model_path", "") or ""), getattr(configs, "data_source", "SD2"))
         if not model_path or not os.path.exists(model_path):
             self._ll_encoder_load_failed = True
             return None

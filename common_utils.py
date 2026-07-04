@@ -1,4 +1,5 @@
 import json
+import os
 import random
 
 from torch.distributions.categorical import Categorical
@@ -10,6 +11,88 @@ import copy
 """
     agent utils
 """
+
+
+def lower_level_weight_dir(data_source=None):
+    return os.path.join(".", "trained_weights", "lower_level")
+
+
+def high_level_weight_dir():
+    return os.path.join(".", "trained_weights", "high_level")
+
+
+def lower_level_log_dir():
+    return os.path.join(".", "train_log", "lower_level")
+
+
+def high_level_log_dir():
+    return os.path.join(".", "train_log", "high_level")
+
+
+def lower_level_plot_dir():
+    return os.path.join(".", "train_log_plot", "lower_level")
+
+
+def high_level_plot_dir():
+    return os.path.join(".", "train_log_plot", "high_level")
+
+
+def lower_level_test_result_dir():
+    return os.path.join(".", "test_results", "lower_level")
+
+
+def high_level_test_result_dir():
+    return os.path.join(".", "test_results", "high_level")
+
+
+def instances_root_dir():
+    return os.path.join(".", "instances")
+
+
+def static_instance_dir(name="or_instances_uniform"):
+    return os.path.join(instances_root_dir(), str(name))
+
+
+def dynamic_instance_dir():
+    return os.path.join(instances_root_dir(), "dynamic")
+
+
+def range_due_test_instance_dir(name="or_instances_uniform_test_30_50_due_scaled"):
+    return os.path.join(instances_root_dir(), str(name))
+
+
+def resolve_instance_dir(path):
+    if path and os.path.exists(path):
+        return path
+    if path:
+        candidate = os.path.join(instances_root_dir(), os.path.basename(str(path).rstrip("\\/")))
+        if os.path.exists(candidate):
+            return candidate
+    return path
+
+
+def resolve_lower_level_weight_path(path, data_source="SD2"):
+    """Resolve LL PPO checkpoints under the unified trained_weights layout."""
+    if path and os.path.exists(path):
+        return path
+    if path:
+        name = os.path.basename(str(path))
+        candidate = os.path.join(lower_level_weight_dir(), name)
+        if os.path.exists(candidate):
+            return candidate
+    return path
+
+
+def resolve_high_level_weight_path(path):
+    """Resolve HL PPO checkpoints under the unified trained_weights layout."""
+    if path and os.path.exists(path):
+        return path
+    if path:
+        name = os.path.basename(str(path))
+        candidate = os.path.join(high_level_weight_dir(), name)
+        if os.path.exists(candidate):
+            return candidate
+    return path
 
 
 # def sample_action(p):

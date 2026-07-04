@@ -9,7 +9,7 @@ from typing import Dict, List
 import numpy as np
 import torch
 
-from common_utils import greedy_select_action, sample_action
+from common_utils import dynamic_instance_dir, greedy_select_action, high_level_test_result_dir, resolve_lower_level_weight_path, sample_action
 from FJSPEnvForVariousOpNums import FJSPEnvForVariousOpNums
 from model.PPO import PPO_initialize
 from ortools_tools.common.ortools_gantt import plot_ortools_gantt_with_due_dates
@@ -19,7 +19,7 @@ from params import configs
 def parse_args():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--instance_json", type=str, default="")
-    parser.add_argument("--output_dir", type=str, default=os.path.join("evaluation_results", "dynamic_ppo_runs"))
+    parser.add_argument("--output_dir", type=str, default=os.path.join(high_level_test_result_dir(), "dynamic_ppo_runs"))
     parser.add_argument("--name", type=str, default="")
     parser.add_argument("--sample", type=str, default="")
     parser.add_argument("--action_selection", type=str, default="", choices=["", "greedy", "sample"])
@@ -35,6 +35,7 @@ def resolve_instance_json_path(cli_path: str) -> str:
 
     candidates = []
     for pattern in (
+        os.path.join(dynamic_instance_dir(), "dynamic_instance*.json"),
         os.path.join("evaluation_results", "dynamic_instance*.json"),
         os.path.join("or_tools_solutions", "dynamic", "*_instance.json"),
     ):
@@ -210,7 +211,8 @@ def main():
 
     device = torch.device(getattr(configs, "device", "cpu"))
     ppo = PPO_initialize()
-    model_path = str(getattr(configs, "ppo_model_path", "") or "").strip()
+    model_path = str(getattr(configs, "ppo_model_path", "") or getattr(configs, "ll_ppo_model_path", "") or "").strip()
+    model_path = resolve_lower_level_weight_path(model_path, getattr(configs, "data_source", "SD2"))
     if not model_path:
         raise ValueError("Missing configs.ppo_model_path for low-level PPO scheduler.")
     ppo.policy.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))

@@ -10,6 +10,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from params import configs
+from common_utils import high_level_test_result_dir
 from main import run_event_driven_until_nevents
 
 
@@ -36,7 +37,7 @@ def main():
     base_seed = _safe_int(getattr(configs, "event_seed", 42))
 
     # Keep outputs separated from main run folders.
-    out_dir = os.path.join("evaluation_results", "cadence_multi_runs")
+    out_dir = os.path.join(high_level_test_result_dir(), "cadence_multi_runs")
     os.makedirs(out_dir, exist_ok=True)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -17,7 +17,7 @@ from ll_fjsp_env import LLFJSPEnv
 import torch
 from model.ll_ppo import ll_ppo_initialize
 from params import configs
-from common_utils import heuristic_select_action, greedy_select_action, sample_action
+from common_utils import heuristic_select_action, greedy_select_action, sample_action, resolve_lower_level_weight_path
 from data_utils import generate_due_dates
 from hl_env_scenarios import apply_bottleneck_orders
 
@@ -186,7 +186,9 @@ class GlobalTimelineOrchestrator:
         self._ppo = ll_ppo_initialize() if self.method == "PPO" else None
         if self._ppo:
             p = getattr(configs, "ll_ppo_model_path", None)
-            if p: self._ppo.policy.load_state_dict(torch.load(p, map_location=getattr(configs, "device", "cpu"), weights_only=True))
+            if p:
+                p = resolve_lower_level_weight_path(p, getattr(configs, "data_source", "SD2"))
+                self._ppo.policy.load_state_dict(torch.load(p, map_location=getattr(configs, "device", "cpu"), weights_only=True))
             self._ppo.policy.eval()
 
     def reset(self, *, clear_buffer: bool = True, t0: float = 0.0):

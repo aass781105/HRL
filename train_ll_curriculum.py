@@ -81,10 +81,10 @@ class Trainer:
         self.validate_timestep = config.validate_timestep
         self.num_envs = config.ll_num_envs
 
-        if not os.path.exists(f'./trained_network/{self.config.data_source}'):
-            os.makedirs(f'./trained_network/{self.config.data_source}')
-        if not os.path.exists(f'./train_log/{self.config.data_source}'):
-            os.makedirs(f'./train_log/{self.config.data_source}')
+        if not os.path.exists(lower_level_weight_dir(self.config.data_source)):
+            os.makedirs(lower_level_weight_dir(self.config.data_source))
+        os.makedirs(lower_level_log_dir(), exist_ok=True)
+        os.makedirs(lower_level_plot_dir(), exist_ok=True)
 
         if device.type == 'cuda':
             torch.set_default_tensor_type('torch.cuda.FloatTensor')
@@ -610,7 +610,7 @@ class Trainer:
             return obj
 
         log_model_name = f'{self.model_name}_{self.initial_n_j}x{self.fixed_n_m}{strToSuffix(self.config.data_suffix)}'
-        log_path_base = f'./train_log/{self.config.data_source}/'
+        log_path_base = os.path.join(lower_level_log_dir(), "")
 
         # Convert and save all logs to .txt
         with open(f'{log_path_base}reward_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.log)))
@@ -671,7 +671,7 @@ class Trainer:
                     ax2.plot(df_breakdown['update'], df_breakdown[f'ms_{n_j}j'], color='blue', linestyle='--', label='Makespan')
                     ax2.set_ylabel('Mean Makespan', color='blue')
                 plt.tight_layout()
-                plt.savefig(f'{log_path_base}valitrend_{log_model_name}.png')
+                plt.savefig(os.path.join(lower_level_plot_dir(), f'valitrend_{log_model_name}.png'))
                 plt.close(fig)
             except Exception as e:
                 print(f"Plotting failed: {e}")
@@ -684,7 +684,7 @@ class Trainer:
             return obj
 
         log_model_name = f'{self.model_name}_{self.initial_n_j}x{self.fixed_n_m}{strToSuffix(self.config.data_suffix)}'
-        log_path_base = f'./train_log/{self.config.data_source}/'
+        log_path_base = os.path.join(lower_level_log_dir(), "")
         
         with open(f'{log_path_base}valiquality_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.validation_log)))
         with open(f'{log_path_base}valitardiness_{log_model_name}.txt', 'w') as f: f.write(str(to_native(self.validation_tardiness_log)))
@@ -839,7 +839,7 @@ class Trainer:
         return results_per_batch
 
     def save_model(self):
-        save_dir = os.path.join(".", "trained_network", self.config.data_source)
+        save_dir = lower_level_weight_dir(self.config.data_source)
         os.makedirs(save_dir, exist_ok=True)
         target_path = os.path.join(save_dir, f"{self.model_name}.pth")
         tmp_path = os.path.join(save_dir, f"{self.model_name}.tmp.pth")

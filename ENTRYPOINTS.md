@@ -49,3 +49,39 @@ This file lists the main scripts after the cleanup. Keep new one-off debug or an
 - `hl_env_scenarios.py`: high-level environment scenario generation.
 - `hrl_orchestrator.py`: dynamic orchestration and low-level scheduler integration.
 - `params.py`: shared configuration parser and defaults.
+
+## Model Weights
+
+- New lower-level PPO checkpoints are saved under:
+  `trained_weights/lower_level/<model_name>.pth`
+- New high-level PPO checkpoints are saved under:
+  `trained_weights/high_level/<model_name>.pth`
+- Existing checkpoints have been migrated into `trained_weights/`.
+- YAML files that still contain old checkpoint paths are resolved by filename into the new folders.
+
+## Logs, Plots, And Test Results
+
+- Lower-level training logs:
+  `train_log/lower_level/`
+- High-level training logs:
+  `train_log/high_level/`
+- Lower-level training plots:
+  `train_log_plot/lower_level/`
+- High-level training plots:
+  `train_log_plot/high_level/`
+- Lower-level test/evaluation results:
+  `test_results/lower_level/`
+- High-level test/evaluation results:
+  `test_results/high_level/`
+
+## Instances
+
+- All instance/data folders are grouped under:
+  `instances/`
+- Dynamic replay/export instances:
+  `instances/dynamic/`
+- Static uniform instances:
+  `instances/or_instances_uniform/`
+- Static range-due test instances:
+  `instances/or_instances_uniform_test_30_50_due_scaled/`
+- Legacy data folders such as `data/` and `TestDataToExcel/` are now under `instances/`.

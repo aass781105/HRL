@@ -7,8 +7,10 @@ from typing import Dict, Tuple
 
 import numpy as np
 
+from common_utils import range_due_test_instance_dir
+
 _gen_parser = argparse.ArgumentParser(add_help=False)
-_gen_parser.add_argument("--output_dir", default="or_instances_uniform_test_30_50_due_scaled")
+_gen_parser.add_argument("--output_dir", default=range_due_test_instance_dir())
 _gen_parser.add_argument("--sizes", nargs="+", type=int, default=[30, 40, 50])
 _gen_parser.add_argument("--n_m", type=int, default=5)
 _gen_parser.add_argument("--instances_per_combo", type=int, default=3)

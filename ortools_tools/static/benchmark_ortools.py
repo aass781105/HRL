@@ -13,6 +13,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+from common_utils import resolve_instance_dir, static_instance_dir
 from ortools_tools.common.ortools_gantt import plot_ortools_gantt_with_due_dates
 
 
@@ -173,7 +174,8 @@ def _safe_name(*parts):
     return "_".join(str(p).replace(" ", "_").replace("/", "_").replace("\\", "_") for p in parts if str(p) != "")
 
 
-def run_benchmark(base_dir="or_instances_uniform_test_30_50", time_limit=7200, output_root="or_tools_solutions", make_gantt=True, log_solutions=False, resume_dir=""):
+def run_benchmark(base_dir=None, time_limit=7200, output_root="or_tools_solutions", make_gantt=True, log_solutions=False, resume_dir=""):
+    base_dir = resolve_instance_dir(base_dir or static_instance_dir("or_instances_uniform_test_30_50"))
     output_dir = str(resume_dir).strip()
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
@@ -316,7 +318,7 @@ def run_benchmark(base_dir="or_instances_uniform_test_30_50", time_limit=7200, o
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run OR-Tools on generated static FJSP test instances.")
-    parser.add_argument("--base_dir", type=str, default="or_instances_uniform_test_30_50")
+    parser.add_argument("--base_dir", type=str, default=static_instance_dir("or_instances_uniform_test_30_50"))
     parser.add_argument("--time_limit", type=float, default=7200.0, help="Time limit per instance in seconds.")
     parser.add_argument("--output_root", type=str, default="or_tools_solutions")
     parser.add_argument("--no_gantt", action="store_true", help="Skip Gantt chart generation.")

@@ -221,9 +221,10 @@ def run_event_driven_until_nevents(
             initial_release_prob=float(getattr(configs, "hl_initial_release_prob", -1.0)),
         ).to(gate_device)
         try:
-            hl_ppo_model.load_state_dict(torch.load(getattr(configs, "hl_ppo_model_path", ""), map_location=gate_device, weights_only=True))
+            hl_path = resolve_high_level_weight_path(getattr(configs, "hl_ppo_model_path", ""))
+            hl_ppo_model.load_state_dict(torch.load(hl_path, map_location=gate_device, weights_only=True))
             hl_ppo_model.eval()
-            print(f"[PPO-GATE] Loaded weights.")
+            print(f"[PPO-GATE] Loaded weights: {hl_path}")
         except:
             print(f"[WARN] Fallback."); gate_policy = "cadence"; is_ppo = False
 

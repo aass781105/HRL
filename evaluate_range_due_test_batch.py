@@ -9,14 +9,14 @@ import torch
 from tqdm import tqdm
 
 from ll_fjsp_env import LLFJSPEnv
-from common_utils import sample_action
+from common_utils import lower_level_test_result_dir, range_due_test_instance_dir, resolve_instance_dir, resolve_lower_level_weight_path, sample_action
 from data_utils import text_to_matrix
 from model.ll_ppo import ll_ppo_initialize
 from ortools_tools.common.ortools_gantt import plot_ortools_gantt_with_due_dates
 from params import configs
 
 
-BASE_DIR = "or_instances_uniform_test_30_50_due_scaled"
+BASE_DIR = range_due_test_instance_dir()
 
 
 def parse_scale(scale_name: str):
@@ -153,11 +153,13 @@ def run_sample_episodes_batched(ppo, jl, pt, due_dates_abs, n_j, n_m, num_runs, 
 
 
 def evaluate_range_due_test(base_dir=BASE_DIR):
+    base_dir = resolve_instance_dir(base_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     configs.device = str(device)
 
     ppo = ll_ppo_initialize()
     model_path = str(getattr(configs, "ppo_model_path", "") or getattr(configs, "ll_ppo_model_path", ""))
+    model_path = resolve_lower_level_weight_path(model_path, getattr(configs, "data_source", "SD2"))
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"PPO model not found: {model_path}")
     ppo.policy.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
@@ -267,7 +269,7 @@ def evaluate_range_due_test(base_dir=BASE_DIR):
     model_name = os.path.basename(model_path).replace(".pth", "")
     prefix = f"range_due_test_{model_name}_sample{eval_runs}"
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.abspath(os.path.join("evaluation_results", f"{prefix}_{timestamp}"))
+    output_dir = os.path.abspath(os.path.join(lower_level_test_result_dir(), f"{prefix}_{timestamp}"))
     os.makedirs(output_dir, exist_ok=True)
 
     detail_df = pd.DataFrame(detail_rows)

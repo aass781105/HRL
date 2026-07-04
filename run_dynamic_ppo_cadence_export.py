@@ -13,6 +13,7 @@ import torch
 from gantt import plot_global_gantt
 from hrl_orchestrator import GlobalTimelineOrchestrator, JobSpec, OperationSpec
 from params import configs
+from common_utils import dynamic_instance_dir, resolve_lower_level_weight_path
 
 
 def parse_args():
@@ -35,6 +36,7 @@ def resolve_instance_json_path(cli_path: str) -> str:
 
     candidates = []
     for pattern in (
+        os.path.join(dynamic_instance_dir(), "dynamic_instance*.json"),
         os.path.join("evaluation_results", "dynamic_instance*.json"),
         os.path.join("or_tools_solutions", "dynamic", "*_instance.json"),
     ):
@@ -125,6 +127,7 @@ def get_payload_arrive_time(payload: Dict, job_id: int) -> float:
 
 def ensure_model_path() -> str:
     model_path = str(getattr(configs, "ll_ppo_model_path", "") or "").strip()
+    model_path = resolve_lower_level_weight_path(model_path, getattr(configs, "data_source", "SD2"))
     if not model_path:
         raise ValueError("Missing configs.ll_ppo_model_path for low-level PPO scheduler.")
     if not os.path.exists(model_path):
