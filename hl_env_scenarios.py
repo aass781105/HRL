@@ -4,7 +4,7 @@ from typing import Callable
 import numpy as np
 
 
-VALID_HL_ENV_SCENARIOS = ("baseline", "custom", "burst_cluster", "bottleneck_order", "mixed3")
+VALID_HL_ENV_SCENARIOS = ("baseline", "custom", "burst_cluster", "bottleneck_order", "mixed3", "mixed_base_bot")
 
 
 def resolve_hl_env_scenario(config, rng: np.random.Generator = None) -> str:
@@ -14,6 +14,10 @@ def resolve_hl_env_scenario(config, rng: np.random.Generator = None) -> str:
     scenario = str(getattr(config, "hl_env_scenario", "baseline")).strip().lower()
     if scenario == "mixed3":
         choices = ("baseline", "burst_cluster", "bottleneck_order")
+        rng = rng or np.random.default_rng()
+        scenario = str(rng.choice(choices))
+    elif scenario == "mixed_base_bot":
+        choices = ("baseline", "bottleneck_order")
         rng = rng or np.random.default_rng()
         scenario = str(rng.choice(choices))
     if scenario not in VALID_HL_ENV_SCENARIOS:

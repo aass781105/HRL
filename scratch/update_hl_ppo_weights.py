@@ -5,8 +5,8 @@ def main():
     yaml_config_dir = os.path.join(project_root, "yaml_config")
     
     # Target path from last step to replace with the new path
-    old_target = "trained_weights\\high_level\\hlgate_scn_base_s07_p15_e8.pth"
-    new_target = "trained_weights\\high_level\\hlgate_scn_base_newstate_s07_p15_e8.pth"
+    old_target = "trained_weights\\high_level\\hlgate_scn_base_newstate_deltagap_actormask_criticextra_s07_p15_e8.pth"
+    new_target = "trained_weights\\high_level\\hlgate_scn_base_s05_e16.pth"
     
     files_updated = 0
     
@@ -28,7 +28,8 @@ def main():
                 fallback_targets = [
                     "ppo_ckpt\\hlgate_scn_base_s05_e4.pth",
                     "trained_weights\\high_level\\hlgate_scn_base_s05_e8.pth",
-                    "trained_weights\\high_level\\hlgate_scn_base_s05_p15_e4.pth"
+                    "trained_weights\\high_level\\hlgate_scn_base_s05_p15_e4.pth",
+                    "trained_weights\\high_level\\hlgate_scn_base_newstate_s07_p15_e8.pth"
                 ]
                 updated = False
                 for target in fallback_targets:
