@@ -1,0 +1,79 @@
+# High-level PPO gate training: baseline dynamic environment.
+# Stability variant: every release has a fixed cost, scale=0.5.
+
+hl_gate_policy: ppo
+scheduler_type: PPO
+ll_ppo_model_path: trained_weights\lower_level\ll_u1030_esttd_odprog.pth
+hl_ppo_model_path: trained_weights\high_level\hlgate_scn_base_newstate_immediate_s01_e8.pth
+
+n_m: 5
+low: 1
+high: 99
+event_horizon: 160
+interarrival_mean: 25
+arrival_mode: uniform
+interarrival_uniform_low: 20
+interarrival_uniform_high: 45
+init_jobs: 50
+burst_size: 1
+event_seed: 1
+fast_mode: true
+hl_env_scenario: baseline
+
+hl_due_date_urgent_prob: 0.3
+hl_due_date_k_urgent_low: 1.5
+hl_due_date_k_urgent_high: 3
+hl_due_date_k_normal_low: 6
+hl_due_date_k_normal_high: 12
+
+hl_gate_decision_interval: 2
+baseline_cadence: 1
+ll_eval_action_selection: greedy
+hl_initial_release_prob: 0.25
+
+hl_td_credit_mode: terminal_only
+hl_release_reward_decay: 0.9
+hl_td_signal_source: baseline_gap_final
+hl_td_reward_coef: 0.1
+hl_shaping_reward_coef: 0.0
+hl_mk_reward_coef: 0.0
+hl_buffer_penalty_coef: 0.01
+
+hl_stability_mode_v2: immediate_all
+hl_stability_scale: 0.1
+hl_stability_power: 0.0
+hl_stability_free_releases: 0
+
+hl_ppo_name: hlgate_scn_base_newstate_immediate_s01_e8
+hl_ppo_updates: 200
+hl_ppo_num_envs: 8
+hl_ppo_use_async_envs: true
+hl_ppo_train_seed: 42
+hl_ppo_lr: 0.0001
+hl_ppo_lr_decay: true
+hl_ppo_lr_end: 0.00005
+hl_ppo_gamma: 0.995
+hl_ppo_gae_lambda: 0.98
+hl_ppo_clip: 0.2
+hl_ppo_entropy_coef: 0.001
+hl_ppo_entropy_decay: true
+hl_ppo_entropy_end: 0.0001
+hl_ppo_value_coef: 0.01
+hl_ppo_update_epochs: 5
+hl_ppo_minibatch_size: 160
+hl_ppo_max_grad_norm: 1.0
+hl_ppo_validate_every: 10
+hl_ppo_instance_episodes: 20
+hl_ppo_same_problem_eval_every: 0
+
+hl_ppo_num_layers: 3
+hl_ppo_hidden_dim: 512
+hl_ppo_separate_trunks: true
+hl_ppo_actor_hidden_dim: 512
+hl_ppo_actor_num_layers: 3
+hl_ppo_critic_hidden_dim: 512
+hl_ppo_critic_num_layers: 3
+hl_ppo_value_num_layers: 1
+hl_ppo_use_residual: true
+hl_ppo_use_glu: false
+hl_ppo_pre_norm: false

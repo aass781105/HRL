@@ -125,7 +125,7 @@ parser.add_argument('--interarrival_uniform_high', type=float, default=43.0, hel
 parser.add_argument('--init_jobs', type=int, default=50, help='初始工單數')
 parser.add_argument('--burst_size', type=int, default=1, help='每次生成工單數')
 parser.add_argument('--hl_env_scenario', type=str, default='baseline',
-                    choices=['baseline', 'custom', 'burst_cluster', 'bottleneck_order', 'mixed3'],
+                    choices=['baseline', 'urgent', 'custom', 'burst_cluster', 'bottleneck_order', 'mixed3', 'mixed_base_bot'],
                     help='High-level dynamic environment scenario preset')
 parser.add_argument('--hl_burst_size_mode', type=str, default='fixed', choices=['fixed', 'uniform', 'inverse'],
                     help='Dynamic burst size sampler mode used by scenario presets')

@@ -688,7 +688,8 @@ def run_event_driven_until_nevents(
             gate_release_count += 1
             if release_result.get("event") == "batch_finalized":
                 print(
-                    f"[Reschedule] Event ID={stats['arrive']} | Jobs={release_result['jobs_count']} | K={release_result['K']} | "
+                    f"[Reschedule] Event ID={stats['arrive']} | Jobs={release_result['jobs_count']} | "
+                    f"Operations={release_result['operations_count']} | K={release_result['K']} | "
                     f"MK={release_result['sub_makespan']:.2f} | TD={release_result['sub_tardiness']:.2f} | SolveTime={solve_time:.3f}s"
                 )
             write_release_log(int(stats["arrive"]), "EVENT", t_now, release_result.get("rows", getattr(orch, "last_batch_rows", [])), solve_time)

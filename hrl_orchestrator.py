@@ -115,12 +115,25 @@ class EventBurstGenerator:
     def generate_burst(self, t_event: float) -> List[JobSpec]:
         K = int(self.k_sampler(self.rng))
         if K <= 0: return []
+        same_batch = bool(getattr(self.cfg, "hl_same_batch_jobs", False)) and K > 1
         old_n_j = getattr(self.cfg, "n_j", None)
         try:
             setattr(self.cfg, "n_j", K)
             jl, pt, _ = self.sd2_fn(self.cfg, rng=self.rng)
         finally:
             if old_n_j is not None: setattr(self.cfg, "n_j", old_n_j)
+
+        if same_batch:
+            # Treat a burst as one repeated job template, not K independent jobs.
+            # The job IDs remain different, but every operation keeps the same
+            # machine eligibility and processing-time row.
+            jl_arr = np.asarray(jl, dtype=int).reshape(-1)
+            pt_arr = np.asarray(pt, dtype=float)
+            template_len = int(jl_arr[0])
+            template_pt = np.array(pt_arr[:template_len], copy=True)
+            jl = np.full(K, template_len, dtype=int)
+            pt = np.tile(template_pt, (K, 1))
+
         dd_rel, due_info = generate_due_dates(
             jl,
             pt,
@@ -130,8 +143,45 @@ class EventBurstGenerator:
             return_info=True,
             due_config=self.cfg,
         )
+        if same_batch:
+            # Keep due date, urgency, k, and work metadata identical as well.
+            dd_rel = np.full(K, float(np.asarray(dd_rel).reshape(-1)[0]), dtype=float)
+            due_info = {
+                key: np.full(
+                    K,
+                    np.asarray(value).reshape(-1)[0],
+                    dtype=np.asarray(value).dtype,
+                )
+                for key, value in due_info.items()
+            }
+
+        burst_due_alpha = float(getattr(self.cfg, "hl_burst_due_date_scale_alpha", 0.0))
+        if burst_due_alpha != 0.0 and K > 1:
+            # Relax larger bursts gradually to reduce seed variance caused by
+            # one event receiving several urgent jobs at once.
+            max_burst = max(2, int(getattr(self.cfg, "hl_burst_size_high", 5)))
+            burst_factor = 1.0 + burst_due_alpha * (K - 1) / float(max_burst - 1)
+            dd_rel = np.asarray(dd_rel, dtype=float) * burst_factor
+            if "due_date_k" in due_info:
+                due_info["due_date_k"] = (
+                    np.asarray(due_info["due_date_k"], dtype=float) * burst_factor
+                )
+
         jobs = split_matrix_to_jobs(jl, pt, base_job_id=self._next_id, t_arrive=t_event, due_dates=float(t_event)+dd_rel, job_info=due_info)
-        jobs = apply_bottleneck_orders(jobs, self.cfg, self.rng, self.M)
+        if same_batch:
+            # Apply scenario transformations once to the template, then clone
+            # the transformed job so bottleneck selection cannot diverge inside
+            # the same burst.
+            jobs = apply_bottleneck_orders([jobs[0]], self.cfg, self.rng, self.M)
+            template = jobs[0]
+            for job_id in range(1, K):
+                jobs.append(JobSpec(
+                    job_id=self._next_id + job_id,
+                    operations=copy.deepcopy(template.operations),
+                    meta=copy.deepcopy(template.meta),
+                ))
+        else:
+            jobs = apply_bottleneck_orders(jobs, self.cfg, self.rng, self.M)
         self._next_id += len(jobs)
         return jobs
 
@@ -520,6 +570,7 @@ class GlobalTimelineOrchestrator:
             "t": self.t,
             "rows": rows,
             "jobs_count": len(jobs_new),
+            "operations_count": len(rows),
             "K": K,
             "sub_makespan": sub_makespan,
             "sub_tardiness": sub_tardiness,

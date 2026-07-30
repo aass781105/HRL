@@ -4,7 +4,7 @@ from typing import Callable
 import numpy as np
 
 
-VALID_HL_ENV_SCENARIOS = ("baseline", "custom", "burst_cluster", "bottleneck_order", "mixed3", "mixed_base_bot")
+VALID_HL_ENV_SCENARIOS = ("baseline", "urgent", "custom", "burst_cluster", "bottleneck_order", "mixed3", "mixed_base_bot")
 
 
 def resolve_hl_env_scenario(config, rng: np.random.Generator = None) -> str:
@@ -34,6 +34,9 @@ def scenario_config(config, scenario: str):
         # ad-hoc YAML environment tweaks; use hl_env_scenario=custom for tuning.
         setattr(cfg, "init_jobs", 50)
         setattr(cfg, "burst_size", 1)
+        setattr(cfg, "hl_burst_size_mode", "fixed")
+        setattr(cfg, "hl_burst_size_low", 1)
+        setattr(cfg, "hl_burst_size_high", 1)
         setattr(cfg, "arrival_mode", "uniform")
         setattr(cfg, "interarrival_uniform_low", 20.0)
         setattr(cfg, "interarrival_uniform_high", 45.0)
@@ -44,21 +47,40 @@ def scenario_config(config, scenario: str):
         setattr(cfg, "hl_due_date_k_urgent_high", 3.0)
         setattr(cfg, "hl_due_date_k_normal_low", 7.0)
         setattr(cfg, "hl_due_date_k_normal_high", 10.0)
+    elif scenario == "urgent":
+        # Baseline environment with a tighter urgent due-date range and a looser normal range.
+        setattr(cfg, "init_jobs", 50)
+        setattr(cfg, "burst_size", 1)
+        setattr(cfg, "hl_burst_size_mode", "fixed")
+        setattr(cfg, "hl_burst_size_low", 1)
+        setattr(cfg, "hl_burst_size_high", 1)
+        setattr(cfg, "arrival_mode", "uniform")
+        setattr(cfg, "interarrival_uniform_low", 20.0)
+        setattr(cfg, "interarrival_uniform_high", 45.0)
+        setattr(cfg, "hl_bottleneck_order_prob", 0.0)
+        setattr(cfg, "hl_bottleneck_order_machine_count", 1)
+        setattr(cfg, "hl_due_date_urgent_prob", 0.3)
+        setattr(cfg, "hl_due_date_k_urgent_low", 1.2)
+        setattr(cfg, "hl_due_date_k_urgent_high", 2.0)
+        setattr(cfg, "hl_due_date_k_normal_low", 8.0)
+        setattr(cfg, "hl_due_date_k_normal_high", 12.0)
     elif scenario == "custom":
         # Fully YAML-driven environment for sensitivity tests.
         pass
     elif scenario == "burst_cluster":
-        setattr(cfg, "init_jobs", 30)
+        setattr(cfg, "init_jobs", 50)
         setattr(cfg, "burst_size", 1)
         setattr(cfg, "arrival_mode", "uniform")
         setattr(cfg, "interarrival_uniform_low", 45.0)
-        setattr(cfg, "interarrival_uniform_high", 100.0)
+        setattr(cfg, "interarrival_uniform_high", 90.0)
         setattr(cfg, "hl_burst_size_mode", "inverse")
         setattr(cfg, "hl_burst_size_low", 1)
         setattr(cfg, "hl_burst_size_high", 5)
+        setattr(cfg, "hl_same_batch_jobs", True)
+        setattr(cfg, "hl_burst_due_date_scale_alpha", 1.0)
         setattr(cfg, "hl_bottleneck_order_prob", 0.0)
         setattr(cfg, "hl_bottleneck_order_machine_count", 1)
-        setattr(cfg, "hl_bottleneck_exclude_urgent", False)
+        setattr(cfg, "hl_bottleneck_exclude_urgent", True)
         setattr(cfg, "hl_bottleneck_group_sampling", "rolling_freq")
         setattr(cfg, "hl_due_date_urgent_prob", 0.3)
         setattr(cfg, "hl_due_date_k_urgent_low", 1.5)

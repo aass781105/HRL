@@ -3,11 +3,11 @@
 
 # --- Scheduler ---
 hl_gate_policy: ppo
-hl_buffer_slack_release_threshold: 0
+hl_buffer_slack_release_threshold: 100.0
 scheduler_type: PPO
 ll_ppo_model_path: trained_network\SD2\ll_u1030_esttd_odprog.pth
-hl_ppo_model_path: trained_weights\high_level\hlgate_scn_bottleneck_newstate_s07_p15_e8.pth
-hl_ppo_name: hlgate_scn_base_s05_e4
+hl_ppo_model_path: trained_weights\high_level\hlgate_baseline_stab05_e16_newstate.pth
+hl_ppo_name: hlgate_baseline_stab05_e16_newstate
 hl_ppo_separate_trunks: true
 hl_ppo_value_num_layers: 1
 hl_ppo_use_residual: true
@@ -21,17 +21,22 @@ hl_eval_action_selection: greedy
 n_m: 5
 low: 1
 high: 99
-event_horizon: 300
+event_horizon: 160
 interarrival_mean: 25
 arrival_mode: uniform
-interarrival_uniform_low: 20
-interarrival_uniform_high: 45
-init_jobs: 30
+interarrival_uniform_low: 45
+interarrival_uniform_high: 90
+init_jobs: 50
 burst_size: 1
+hl_burst_size_mode: inverse
+hl_burst_size_low: 1
+hl_burst_size_high: 5
+hl_same_batch_jobs: true
+hl_burst_due_date_scale_alpha: 1
 event_seed: 6
-fast_mode: false
-hl_env_scenario: bottleneck_order
-hl_bottleneck_order_prob: 0.5
+fast_mode: true
+hl_env_scenario: baseline
+hl_bottleneck_order_prob: 0.0
 hl_bottleneck_order_machine_count: 1
 hl_bottleneck_exclude_urgent: true
 hl_bottleneck_group_sampling: rolling_freq
@@ -40,14 +45,14 @@ hl_bottleneck_group_sampling: rolling_freq
 # Initial jobs use normal_only; arrival jobs use mix_urgent_normal.
 hl_due_date_urgent_prob: 0.3
 hl_due_date_k_urgent_low: 1.5
-hl_due_date_k_urgent_high: 3
-hl_due_date_k_normal_low: 7
-hl_due_date_k_normal_high: 10
+hl_due_date_k_urgent_high: 3.0
+hl_due_date_k_normal_low: 7.0
+hl_due_date_k_normal_high: 10.0
 
 # --- Baseline Policy ---
-hl_gate_decision_interval: 1
-hl_gate_cadence: 5
-baseline_cadence: 5
+hl_gate_decision_interval: 2
+hl_gate_cadence: 2
+baseline_cadence: 2
 
 # --- Low-Level PPO Action Selection ---
 ll_eval_action_selection: greedy
