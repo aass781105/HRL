@@ -22,18 +22,22 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DEFAULT_CONFIG = os.path.join(
     PROJECT_ROOT,
     "yaml_config",
-    "train_hl_gate_scn_baseline_stab05_e16.yml",
+    "eval_baseline_seed1_greedy_cadence1_1run.yml",
 )
 
 SCENARIOS = ("baseline", "urgent", "burst_cluster")
 SEEDS = tuple(range(1, 11))
-STRATEGIES = ("ppo", "cadence1", "cadence5", "slack0")
+STRATEGIES = ("ppo", "cadence5", "slack0")
 CHECKPOINTS = (0, 40, 80, 120, 160)
 
 # Each scenario uses the high-level policy trained for that scenario.
@@ -99,6 +103,91 @@ CSV_COLUMNS = [
     "rel_n",
 ]
 
+EVENT_COLUMNS = [
+    "strat",
+    "seed",
+    "event",
+    "time",
+    "action",
+    "released",
+    "td_before",
+    "td",
+    "b_jobs",
+    "b_ops",
+    "b_work",
+    "b_smin",
+    "b_smean",
+    "b_sq25",
+    "b_sstd",
+    "b_neg_sum",
+    "b_lt0_n",
+    "b_lt100_n",
+    "b_lt0_r",
+    "b_lt100_r",
+    "b_critical_work",
+    "b_near_critical_work",
+    "w_jobs",
+    "w_ops",
+    "w_work",
+    "w_smin",
+    "w_smean",
+    "w_sq25",
+    "w_sstd",
+    "w_neg_sum",
+    "w_lt0_n",
+    "w_lt100_n",
+    "w_lt0_r",
+    "w_lt100_r",
+    "w_critical_work",
+    "w_near_critical_work",
+    "bw_smin",
+    "bw_smean",
+    "bw_sq25",
+    "bw_sstd",
+    "bw_jobs",
+    "bw_neg_sum",
+    "bw_lt0_n",
+    "bw_lt100_n",
+    "bw_lt0_r",
+    "bw_lt100_r",
+    "bw_critical_work",
+    "bw_near_critical_work",
+    "m_lmax",
+]
+
+PLOT_STRATEGIES = ("ppo", "cadence5", "slack0")
+
+PLOT_METRIC_SPECS = (
+    (
+        "slack_lt0_count",
+        {"b": "b_lt0_n", "w": "w_lt0_n", "bw": "bw_lt0_n"},
+    ),
+    (
+        "slack_lt100_count",
+        {"b": "b_lt100_n", "w": "w_lt100_n", "bw": "bw_lt100_n"},
+    ),
+    (
+        "negative_slack_burden",
+        {"b": "b_neg_sum", "w": "w_neg_sum", "bw": "bw_neg_sum"},
+    ),
+    (
+        "critical_work_lt0",
+        {
+            "b": "b_critical_work",
+            "w": "w_critical_work",
+            "bw": "bw_critical_work",
+        },
+    ),
+    (
+        "near_critical_work_lt100",
+        {
+            "b": "b_near_critical_work",
+            "w": "w_near_critical_work",
+            "bw": "bw_near_critical_work",
+        },
+    ),
+)
+
 
 # Parse the optional config before importing params.py.  params.py parses
 # sys.argv itself, so it must only receive its own --config argument.
@@ -124,6 +213,22 @@ if "--seed" in _raw_args:
     SELECTED_SEEDS = (_requested_seed,)
 else:
     SELECTED_SEEDS = SEEDS
+
+if "--output-root" in _raw_args:
+    _output_idx = _raw_args.index("--output-root")
+    if _output_idx + 1 >= len(_raw_args):
+        raise SystemExit("--output-root requires a directory")
+    OUTPUT_ROOT = os.path.abspath(_raw_args[_output_idx + 1])
+else:
+    OUTPUT_ROOT = None
+
+if "--replot-root" in _raw_args:
+    _replot_idx = _raw_args.index("--replot-root")
+    if _replot_idx + 1 >= len(_raw_args):
+        raise SystemExit("--replot-root requires an existing analysis directory")
+    REPLOT_ROOT = os.path.abspath(_raw_args[_replot_idx + 1])
+else:
+    REPLOT_ROOT = None
 
 sys.argv = [sys.argv[0], "--config", CONFIG_PATH]
 
@@ -185,6 +290,11 @@ def _wip_details(orch, all_due: Mapping[int, float], now: float) -> Dict[str, fl
     wip_ops = 0
     total_work = 0.0
     planned_td = 0.0
+    neg_slack_sum = 0.0
+    slack_lt0_count = 0
+    slack_lt100_count = 0
+    critical_work = 0.0
+    near_critical_work = 0.0
 
     for job in getattr(orch, "_last_jobs_snapshot", []) or []:
         jid = int(job.job_id)
@@ -198,7 +308,15 @@ def _wip_details(orch, all_due: Mapping[int, float], now: float) -> Dict[str, fl
         wip_ops += len(getattr(job, "operations", []) or [])
         total_work += rem_work
         due = float(all_due.get(jid, 0.0))
-        slack_values.append(due - float(now) - rem_work)
+        slack = due - float(now) - rem_work
+        slack_values.append(slack)
+        if slack < 0.0:
+            neg_slack_sum += -slack
+            slack_lt0_count += 1
+            critical_work += rem_work
+        if slack < 100.0:
+            slack_lt100_count += 1
+            near_critical_work += rem_work
         if rows:
             planned_td += max(0.0, planned_finish - due)
 
@@ -208,10 +326,16 @@ def _wip_details(orch, all_due: Mapping[int, float], now: float) -> Dict[str, fl
         "ops": float(wip_ops),
         "work": float(total_work),
         "td": float(planned_td),
+        "neg_sum": float(neg_slack_sum),
+        "lt0_count": float(slack_lt0_count),
+        "lt100_count": float(slack_lt100_count),
+        "critical_work": float(critical_work),
+        "near_critical_work": float(near_critical_work),
         "smin": smin,
         "smean": smean,
         "sq25": sq25,
         "sstd": sstd,
+        "slacks": slack_values,
     }
 
 
@@ -225,7 +349,16 @@ def collect_metrics(env: HLGateEnv, *, orch=None, now: Optional[float] = None) -
     buffer_slacks = [_job_slack(job, all_due, now) for job in buffer_jobs]
     b_smin, b_smean, b_sq25, b_sstd = _slack_summary(buffer_slacks)
     b_neg_n = sum(1 for value in buffer_slacks if value < 0.0)
+    b_lt100_n = sum(1 for value in buffer_slacks if value < 100.0)
     b_jobs = len(buffer_jobs)
+    b_ops = sum(len(getattr(job, "operations", []) or []) for job in buffer_jobs)
+    b_neg_sum = float(sum(-value for value in buffer_slacks if value < 0.0))
+    b_critical_work = float(
+        sum(_job_work(job) for job, slack in zip(buffer_jobs, buffer_slacks) if slack < 0.0)
+    )
+    b_near_critical_work = float(
+        sum(_job_work(job) for job, slack in zip(buffer_jobs, buffer_slacks) if slack < 100.0)
+    )
 
     machine_free = np.asarray(getattr(orch, "machine_free_time", []), dtype=float)
     machine_load = np.maximum(0.0, machine_free - now)
@@ -240,6 +373,15 @@ def collect_metrics(env: HLGateEnv, *, orch=None, now: Optional[float] = None) -
         m_lmean = m_lstd = m_lmin = m_lmax = m_imb = current_mk = 0.0
 
     wip = _wip_details(orch, all_due, now)
+    bw_smin, bw_smean, bw_sq25, bw_sstd = _slack_summary(
+        buffer_slacks + list(wip["slacks"])
+    )
+    bw_jobs = b_jobs + float(wip["jobs"])
+    bw_neg_sum = b_neg_sum + float(wip["neg_sum"])
+    bw_lt0_n = float(b_neg_n) + float(wip["lt0_count"])
+    bw_lt100_n = float(b_lt100_n) + float(wip["lt100_count"])
+    bw_critical_work = b_critical_work + float(wip["critical_work"])
+    bw_near_critical_work = b_near_critical_work + float(wip["near_critical_work"])
     current_td = float(orch.get_total_tardiness_estimate(all_due))
     current_obj = 0.5 * current_mk + 0.5 * current_td
     return {
@@ -247,6 +389,7 @@ def collect_metrics(env: HLGateEnv, *, orch=None, now: Optional[float] = None) -
         "td": current_td,
         "obj": current_obj,
         "b_jobs": float(b_jobs),
+        "b_ops": float(b_ops),
         "b_work": float(sum(_job_work(job) for job in buffer_jobs)),
         "b_smin": b_smin,
         "b_smean": b_smean,
@@ -254,10 +397,23 @@ def collect_metrics(env: HLGateEnv, *, orch=None, now: Optional[float] = None) -
         "b_sstd": b_sstd,
         "b_neg_n": float(b_neg_n),
         "b_neg_r": float(b_neg_n / b_jobs) if b_jobs else 0.0,
+        "b_lt100_n": float(b_lt100_n),
+        "b_lt0_r": float(b_neg_n / b_jobs) if b_jobs else 0.0,
+        "b_lt100_r": float(b_lt100_n / b_jobs) if b_jobs else 0.0,
+        "b_neg_sum": b_neg_sum,
+        "b_critical_work": b_critical_work,
+        "b_near_critical_work": b_near_critical_work,
         "w_jobs": wip["jobs"],
         "w_ops": wip["ops"],
         "w_work": wip["work"],
         "w_td": wip["td"],
+        "w_neg_sum": wip["neg_sum"],
+        "w_lt0_n": wip["lt0_count"],
+        "w_lt100_n": wip["lt100_count"],
+        "w_lt0_r": float(wip["lt0_count"] / wip["jobs"]) if wip["jobs"] else 0.0,
+        "w_lt100_r": float(wip["lt100_count"] / wip["jobs"]) if wip["jobs"] else 0.0,
+        "w_critical_work": wip["critical_work"],
+        "w_near_critical_work": wip["near_critical_work"],
         "w_smin": wip["smin"],
         "w_smean": wip["smean"],
         "w_sq25": wip["sq25"],
@@ -267,6 +423,18 @@ def collect_metrics(env: HLGateEnv, *, orch=None, now: Optional[float] = None) -
         "m_lmin": m_lmin,
         "m_lmax": m_lmax,
         "m_imb": m_imb,
+        "bw_smin": bw_smin,
+        "bw_smean": bw_smean,
+        "bw_sq25": bw_sq25,
+        "bw_sstd": bw_sstd,
+        "bw_jobs": bw_jobs,
+        "bw_neg_sum": bw_neg_sum,
+        "bw_lt0_n": bw_lt0_n,
+        "bw_lt100_n": bw_lt100_n,
+        "bw_lt0_r": float(bw_lt0_n / bw_jobs) if bw_jobs else 0.0,
+        "bw_lt100_r": float(bw_lt100_n / bw_jobs) if bw_jobs else 0.0,
+        "bw_critical_work": bw_critical_work,
+        "bw_near_critical_work": bw_near_critical_work,
     }
 
 
@@ -514,7 +682,13 @@ def rounded_row(
     return {key: row.get(key, "") for key in CSV_COLUMNS}
 
 
-def run_strategy(scenario: str, seed: int, strategy: str, model, device: torch.device) -> List[Dict[str, object]]:
+def run_strategy(
+    scenario: str,
+    seed: int,
+    strategy: str,
+    model,
+    device: torch.device,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
     strategy_started_at = time.perf_counter()
     print(
         f"    [START] scenario={scenario} seed={seed} strategy={strategy} event=0/{CHECKPOINTS[-1]}",
@@ -525,11 +699,65 @@ def run_strategy(scenario: str, seed: int, strategy: str, model, device: torch.d
     segment_jobs: List[object] = list(initial_jobs)
     segment_releases = 0
     rows: List[Dict[str, object]] = []
+    event_rows: List[Dict[str, object]] = []
 
     # Event 0 is the initial post-registration state.  Initial jobs are also
     # included in the first 0-40 segment summary.
     current0 = collect_metrics(env, now=0.0)
     release0 = release_now_metrics(env, 0.0)
+    event_rows.append(
+        {
+            "strat": strategy,
+            "seed": int(seed),
+            "event": 0,
+            "time": 0,
+            "action": "INIT",
+            "released": 0,
+            "td_before": round(float(current0["td"]), 3),
+            "td": round(float(current0["td"]), 3),
+            "b_jobs": int(round(current0["b_jobs"])),
+            "b_ops": int(round(current0["b_ops"])),
+            "b_work": round(float(current0["b_work"]), 3),
+            "b_smin": round(float(current0["b_smin"]), 3),
+            "b_smean": round(float(current0["b_smean"]), 3),
+            "b_sq25": round(float(current0["b_sq25"]), 3),
+            "b_sstd": round(float(current0["b_sstd"]), 3),
+            "b_neg_sum": round(float(current0["b_neg_sum"]), 3),
+            "b_lt0_n": int(round(current0["b_neg_n"])),
+            "b_lt100_n": int(round(current0["b_lt100_n"])),
+            "b_lt0_r": round(float(current0["b_lt0_r"]), 4),
+            "b_lt100_r": round(float(current0["b_lt100_r"]), 4),
+            "b_critical_work": round(float(current0["b_critical_work"]), 3),
+            "b_near_critical_work": round(float(current0["b_near_critical_work"]), 3),
+            "w_jobs": int(round(current0["w_jobs"])),
+            "w_ops": int(round(current0["w_ops"])),
+            "w_work": round(float(current0["w_work"]), 3),
+            "w_smin": round(float(current0["w_smin"]), 3),
+            "w_smean": round(float(current0["w_smean"]), 3),
+            "w_sq25": round(float(current0["w_sq25"]), 3),
+            "w_sstd": round(float(current0["w_sstd"]), 3),
+            "w_neg_sum": round(float(current0["w_neg_sum"]), 3),
+            "w_lt0_n": int(round(current0["w_lt0_n"])),
+            "w_lt100_n": int(round(current0["w_lt100_n"])),
+            "w_lt0_r": round(float(current0["w_lt0_r"]), 4),
+            "w_lt100_r": round(float(current0["w_lt100_r"]), 4),
+            "w_critical_work": round(float(current0["w_critical_work"]), 3),
+            "w_near_critical_work": round(float(current0["w_near_critical_work"]), 3),
+            "bw_smin": round(float(current0["bw_smin"]), 3),
+            "bw_smean": round(float(current0["bw_smean"]), 3),
+            "bw_sq25": round(float(current0["bw_sq25"]), 3),
+            "bw_sstd": round(float(current0["bw_sstd"]), 3),
+            "bw_jobs": int(round(current0["bw_jobs"])),
+            "bw_neg_sum": round(float(current0["bw_neg_sum"]), 3),
+            "bw_lt0_n": int(round(current0["bw_lt0_n"])),
+            "bw_lt100_n": int(round(current0["bw_lt100_n"])),
+            "bw_lt0_r": round(float(current0["bw_lt0_r"]), 4),
+            "bw_lt100_r": round(float(current0["bw_lt100_r"]), 4),
+            "bw_critical_work": round(float(current0["bw_critical_work"]), 3),
+            "bw_near_critical_work": round(float(current0["bw_near_critical_work"]), 3),
+            "m_lmax": round(float(current0["m_lmax"]), 3),
+        }
+    )
     rows.append(
         rounded_row(
             strategy,
@@ -549,6 +777,7 @@ def run_strategy(scenario: str, seed: int, strategy: str, model, device: torch.d
         obs = env._observe()
         event_time = float(env.t_now)
         action = choose_action(strategy, event_id, env, obs, model, device)
+        before = collect_metrics(env, now=event_time)
 
         # The release-now fields are only needed at output checkpoints.  Avoid
         # cloning and re-solving the scheduler for intermediate events.
@@ -560,6 +789,60 @@ def run_strategy(scenario: str, seed: int, strategy: str, model, device: torch.d
         current = collect_metrics(env, now=event_time)
         if action == 1:
             segment_releases += 1
+
+        event_rows.append(
+            {
+                "strat": strategy,
+                "seed": int(seed),
+                "event": int(event_id),
+                "time": round(event_time, 3),
+                "action": "RELEASE" if action else "HOLD",
+                "released": int(action == 1),
+                "td_before": round(float(before["td"]), 3),
+                "td": round(float(current["td"]), 3),
+                "b_jobs": int(round(before["b_jobs"])),
+                "b_ops": int(round(before["b_ops"])),
+                "b_work": round(float(before["b_work"]), 3),
+                "b_smin": round(float(before["b_smin"]), 3),
+                "b_smean": round(float(before["b_smean"]), 3),
+                "b_sq25": round(float(before["b_sq25"]), 3),
+                "b_sstd": round(float(before["b_sstd"]), 3),
+                "b_neg_sum": round(float(before["b_neg_sum"]), 3),
+                "b_lt0_n": int(round(before["b_neg_n"])),
+                "b_lt100_n": int(round(before["b_lt100_n"])),
+                "b_lt0_r": round(float(before["b_lt0_r"]), 4),
+                "b_lt100_r": round(float(before["b_lt100_r"]), 4),
+                "b_critical_work": round(float(before["b_critical_work"]), 3),
+                "b_near_critical_work": round(float(before["b_near_critical_work"]), 3),
+                "w_jobs": int(round(before["w_jobs"])),
+                "w_ops": int(round(before["w_ops"])),
+                "w_work": round(float(before["w_work"]), 3),
+                "w_smin": round(float(before["w_smin"]), 3),
+                "w_smean": round(float(before["w_smean"]), 3),
+                "w_sq25": round(float(before["w_sq25"]), 3),
+                "w_sstd": round(float(before["w_sstd"]), 3),
+                "w_neg_sum": round(float(before["w_neg_sum"]), 3),
+                "w_lt0_n": int(round(before["w_lt0_n"])),
+                "w_lt100_n": int(round(before["w_lt100_n"])),
+                "w_lt0_r": round(float(before["w_lt0_r"]), 4),
+                "w_lt100_r": round(float(before["w_lt100_r"]), 4),
+                "w_critical_work": round(float(before["w_critical_work"]), 3),
+                "w_near_critical_work": round(float(before["w_near_critical_work"]), 3),
+                "bw_smin": round(float(before["bw_smin"]), 3),
+                "bw_smean": round(float(before["bw_smean"]), 3),
+                "bw_sq25": round(float(before["bw_sq25"]), 3),
+                "bw_sstd": round(float(before["bw_sstd"]), 3),
+                "bw_jobs": int(round(before["bw_jobs"])),
+                "bw_neg_sum": round(float(before["bw_neg_sum"]), 3),
+                "bw_lt0_n": int(round(before["bw_lt0_n"])),
+                "bw_lt100_n": int(round(before["bw_lt100_n"])),
+                "bw_lt0_r": round(float(before["bw_lt0_r"]), 4),
+                "bw_lt100_r": round(float(before["bw_lt100_r"]), 4),
+                "bw_critical_work": round(float(before["bw_critical_work"]), 3),
+                "bw_near_critical_work": round(float(before["bw_near_critical_work"]), 3),
+                "m_lmax": round(float(before["m_lmax"]), 3),
+            }
+        )
 
         if event_id in CHECKPOINTS[1:]:
             rows.append(
@@ -588,7 +871,7 @@ def run_strategy(scenario: str, seed: int, strategy: str, model, device: torch.d
         f"rows={len(rows)} elapsed={time.perf_counter() - strategy_started_at:.1f}s",
         flush=True,
     )
-    return rows
+    return rows, event_rows
 
 
 def write_seed_csv(path: str, rows: Iterable[Mapping[str, object]]) -> None:
@@ -598,8 +881,242 @@ def write_seed_csv(path: str, rows: Iterable[Mapping[str, object]]) -> None:
         writer.writerows(rows)
 
 
+def write_event_csv(path: str, rows: Iterable[Mapping[str, object]]) -> None:
+    with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=EVENT_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def plot_tardiness_indicators(
+    path: str,
+    scenario: str,
+    seed: int,
+    slack_stat: str,
+    rows_by_strategy: Mapping[str, Sequence[Mapping[str, object]]],
+) -> None:
+    """Plot one slack statistic for all comparison strategies."""
+    colors = {
+        "ppo": "#2563eb",
+        "cadence5": "#dc2626",
+        "slack0": "#16a34a",
+    }
+    stat_fields = {"min": "smin", "mean": "smean", "q25": "sq25"}
+    if slack_stat not in stat_fields:
+        raise ValueError(f"Unsupported slack statistic: {slack_stat}")
+    field_suffix = stat_fields[slack_stat]
+    fig, axes = plt.subplots(4, 1, figsize=(14, 13), sharex=True)
+
+    for strategy in PLOT_STRATEGIES:
+        rows = rows_by_strategy.get(strategy, [])
+        if not rows:
+            continue
+        events = [int(row["event"]) for row in rows]
+        color = colors[strategy]
+        release_rows = [row for row in rows if int(row["released"]) == 1]
+        release_events = [int(row["event"]) for row in release_rows]
+
+        axes[0].step(
+            events,
+            [float(row["td"]) for row in rows],
+            where="post",
+            color=color,
+            label=strategy,
+        )
+
+        def mark_releases(axis, field: str, *, show_label: bool = False) -> None:
+            axis.scatter(
+                release_events,
+                [float(row[field]) for row in release_rows],
+                color=color,
+                s=20,
+                zorder=3,
+                label=f"{strategy} release" if show_label else "_nolegend_",
+            )
+
+        def plot_slack(axis, prefix: str, label_prefix: str) -> None:
+            field = f"{prefix}_{field_suffix}"
+            axis.plot(
+                events,
+                [float(row[field]) for row in rows],
+                color=color,
+                label=f"{strategy} {label_prefix} {slack_stat}",
+            )
+
+        mark_releases(axes[0], "td", show_label=True)
+        for axis, prefix, label_prefix in (
+            (axes[1], "b", "buffer slack"),
+            (axes[2], "w", "WIP slack"),
+            (axes[3], "bw", "buffer+WIP slack"),
+        ):
+            plot_slack(axis, prefix, label_prefix)
+            mark_releases(
+                axis,
+                f"{prefix}_{field_suffix}",
+                show_label=False,
+            )
+
+    axes[0].set_ylabel("Global TD")
+    axes[1].set_ylabel(f"Buffer slack ({slack_stat})")
+    axes[2].set_ylabel(f"WIP slack ({slack_stat})")
+    axes[3].set_ylabel(f"Buffer+WIP slack ({slack_stat})")
+    axes[3].set_xlabel("Event")
+    for axis in axes:
+        axis.grid(True, alpha=0.25)
+        axis.legend(loc="best", ncol=2)
+    fig.suptitle(
+        f"Tardiness and {slack_stat} slack | {scenario} | seed {int(seed):02d}"
+    )
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def plot_metric_indicators(
+    path: str,
+    scenario: str,
+    seed: int,
+    metric_label: str,
+    fields: Mapping[str, str],
+    rows_by_strategy: Mapping[str, Sequence[Mapping[str, object]]],
+) -> None:
+    """Plot one non-slack metric with TD and three population views."""
+    colors = {
+        "ppo": "#2563eb",
+        "cadence5": "#dc2626",
+        "slack0": "#16a34a",
+    }
+    labels = {
+        "b": "Buffer",
+        "w": "WIP",
+        "bw": "Buffer+WIP",
+    }
+    fig, axes = plt.subplots(4, 1, figsize=(14, 13), sharex=True)
+
+    for strategy in PLOT_STRATEGIES:
+        rows = rows_by_strategy.get(strategy, [])
+        if not rows:
+            continue
+        events = [int(row["event"]) for row in rows]
+        color = colors[strategy]
+        release_rows = [row for row in rows if int(row["released"]) == 1]
+        release_events = [int(row["event"]) for row in release_rows]
+
+        axes[0].step(
+            events,
+            [float(row["td"]) for row in rows],
+            where="post",
+            color=color,
+            label=strategy,
+        )
+        axes[0].scatter(
+            release_events,
+            [float(row["td"]) for row in release_rows],
+            color=color,
+            s=20,
+            zorder=3,
+            label=f"{strategy} release",
+        )
+
+        for axis, prefix in zip(axes[1:], ("b", "w", "bw")):
+            field = fields[prefix]
+            axis.plot(
+                events,
+                [float(row[field]) for row in rows],
+                color=color,
+                label=f"{strategy} {labels[prefix]}",
+            )
+            axes_index = ("b", "w", "bw").index(prefix) + 1
+            axes[axes_index].scatter(
+                release_events,
+                [float(row[field]) for row in release_rows],
+                color=color,
+                s=20,
+                zorder=3,
+                label="_nolegend_",
+            )
+
+    axes[0].set_ylabel("Global TD")
+    axes[1].set_ylabel(f"Buffer {metric_label}")
+    axes[2].set_ylabel(f"WIP {metric_label}")
+    axes[3].set_ylabel(f"Buffer+WIP {metric_label}")
+    axes[3].set_xlabel("Event")
+    for axis in axes:
+        axis.grid(True, alpha=0.25)
+        axis.legend(loc="best", ncol=2)
+    fig.suptitle(
+        f"Tardiness and {metric_label} | {scenario} | seed {int(seed):02d}"
+    )
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def replot_existing_results(root: str) -> None:
+    """Regenerate plots from existing event CSVs without rerunning simulations."""
+    if not os.path.isdir(root):
+        raise FileNotFoundError(f"Analysis result directory not found: {root}")
+
+    print(f"[REPLOT] {root}")
+    for scenario in SCENARIOS:
+        scenario_dir = os.path.join(root, scenario)
+        if not os.path.isdir(scenario_dir):
+            print(f"  [SKIP] missing scenario directory: {scenario}")
+            continue
+        for seed in SELECTED_SEEDS:
+            event_rows_by_strategy: Dict[str, List[Dict[str, str]]] = {}
+            missing = []
+            for strategy in STRATEGIES:
+                event_path = os.path.join(
+                    scenario_dir,
+                    f"{scenario}_seed_{int(seed):02d}_event_metrics_{strategy}.csv",
+                )
+                if not os.path.isfile(event_path):
+                    missing.append(strategy)
+                    continue
+                with open(event_path, "r", newline="", encoding="utf-8-sig") as handle:
+                    event_rows_by_strategy[strategy] = list(csv.DictReader(handle))
+            if missing:
+                print(
+                    f"  [SKIP] {scenario} seed={int(seed):02d} "
+                    f"missing event CSV: {', '.join(missing)}"
+                )
+                continue
+
+            for slack_stat in ("min", "mean", "q25"):
+                plot_tardiness_indicators(
+                    os.path.join(
+                        scenario_dir,
+                        f"{scenario}_seed_{int(seed):02d}_tardiness_indicators_{slack_stat}.png",
+                    ),
+                    scenario,
+                    seed,
+                    slack_stat,
+                    event_rows_by_strategy,
+                )
+            for metric_name, metric_fields in PLOT_METRIC_SPECS:
+                plot_metric_indicators(
+                    os.path.join(
+                        scenario_dir,
+                        f"{scenario}_seed_{int(seed):02d}_tardiness_indicators_{metric_name}.png",
+                    ),
+                    scenario,
+                    seed,
+                    metric_name,
+                    metric_fields,
+                    event_rows_by_strategy,
+                )
+            print(f"  [PLOT] {scenario} seed={int(seed):02d}")
+
+
 def main() -> None:
-    output_root = os.path.join(
+    if REPLOT_ROOT:
+        replot_existing_results(REPLOT_ROOT)
+        return
+
+    output_root = OUTPUT_ROOT or os.path.join(
         PROJECT_ROOT,
         "analysis_results",
         "release_strategy_analysis",
@@ -626,11 +1143,53 @@ def main() -> None:
         print(f"[SCENARIO] {scenario} | high-level={SCENARIO_MODEL_PATHS[scenario]}")
 
         for seed in SELECTED_SEEDS:
+            output_path = os.path.join(
+                scenario_dir, f"{scenario}_seed_{int(seed):02d}.csv"
+            )
+            required_paths = [
+                output_path,
+                *(
+                    os.path.join(
+                        scenario_dir,
+                        f"{scenario}_seed_{int(seed):02d}_event_metrics_{strategy}.csv",
+                    )
+                    for strategy in STRATEGIES
+                ),
+                *(
+                    os.path.join(
+                        scenario_dir,
+                        f"{scenario}_seed_{int(seed):02d}_tardiness_indicators_{name}.png",
+                    )
+                    for name in (
+                        "min",
+                        "mean",
+                        "q25",
+                        "slack_lt0_count",
+                        "slack_lt100_count",
+                        "negative_slack_burden",
+                        "critical_work_lt0",
+                        "near_critical_work_lt100",
+                    )
+                ),
+            ]
+            if all(os.path.isfile(path) for path in required_paths):
+                print(f"  [SKIP] {scenario} seed={int(seed):02d} already complete")
+                continue
+
             seed_rows: List[Dict[str, object]] = []
+            event_rows_by_strategy: Dict[str, List[Dict[str, object]]] = {}
             for strategy in STRATEGIES:
                 print(f"  [RUN] scenario={scenario} seed={seed} strategy={strategy}")
                 policy_model = model if strategy == "ppo" else None
-                seed_rows.extend(run_strategy(scenario, seed, strategy, policy_model, device))
+                checkpoint_rows, event_rows = run_strategy(
+                    scenario,
+                    seed,
+                    strategy,
+                    policy_model,
+                    device,
+                )
+                seed_rows.extend(checkpoint_rows)
+                event_rows_by_strategy[strategy] = event_rows
             # Group rows by checkpoint first so strategies can be compared at
             # the same event before moving to the next checkpoint.
             strategy_order = {name: index for index, name in enumerate(STRATEGIES)}
@@ -640,11 +1199,70 @@ def main() -> None:
                     strategy_order[str(row["strat"])],
                 )
             )
-            output_path = os.path.join(
-                scenario_dir, f"{scenario}_seed_{int(seed):02d}.csv"
-            )
             write_seed_csv(output_path, seed_rows)
             print(f"  [CSV] {output_path}")
+            for strategy, event_rows in event_rows_by_strategy.items():
+                event_path = os.path.join(
+                    scenario_dir,
+                    f"{scenario}_seed_{int(seed):02d}_event_metrics_{strategy}.csv",
+                )
+                write_event_csv(event_path, event_rows)
+            for slack_stat in ("min", "mean", "q25"):
+                plot_path = os.path.join(
+                    scenario_dir,
+                    f"{scenario}_seed_{int(seed):02d}_tardiness_indicators_{slack_stat}.png",
+                )
+                plot_tardiness_indicators(
+                    plot_path,
+                    scenario,
+                    seed,
+                    slack_stat,
+                    event_rows_by_strategy,
+                )
+            metric_specs = (
+                (
+                    "slack_lt0_count",
+                    {"b": "b_lt0_n", "w": "w_lt0_n", "bw": "bw_lt0_n"},
+                ),
+                (
+                    "slack_lt100_count",
+                    {"b": "b_lt100_n", "w": "w_lt100_n", "bw": "bw_lt100_n"},
+                ),
+                (
+                    "negative_slack_burden",
+                    {"b": "b_neg_sum", "w": "w_neg_sum", "bw": "bw_neg_sum"},
+                ),
+                (
+                    "critical_work_lt0",
+                    {
+                        "b": "b_critical_work",
+                        "w": "w_critical_work",
+                        "bw": "bw_critical_work",
+                    },
+                ),
+                (
+                    "near_critical_work_lt100",
+                    {
+                        "b": "b_near_critical_work",
+                        "w": "w_near_critical_work",
+                        "bw": "bw_near_critical_work",
+                    },
+                ),
+            )
+            for metric_name, metric_fields in metric_specs:
+                plot_path = os.path.join(
+                    scenario_dir,
+                    f"{scenario}_seed_{int(seed):02d}_tardiness_indicators_{metric_name}.png",
+                )
+                plot_metric_indicators(
+                    plot_path,
+                    scenario,
+                    seed,
+                    metric_name,
+                    metric_fields,
+                    event_rows_by_strategy,
+                )
+            print(f"  [EVENT CSV/PNG] {scenario} seed={int(seed):02d}")
 
     print("[DONE] Release strategy analysis completed.")
 

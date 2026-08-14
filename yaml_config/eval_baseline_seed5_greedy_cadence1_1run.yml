@@ -35,7 +35,7 @@ hl_same_batch_jobs: true
 hl_burst_due_date_scale_alpha: 1
 event_seed: 5
 fast_mode: true
-hl_env_scenario: custom
+hl_env_scenario: urgent
 hl_bottleneck_order_prob: 0.0
 hl_bottleneck_order_machine_count: 1
 hl_bottleneck_exclude_urgent: true

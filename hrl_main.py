@@ -5,7 +5,7 @@ import csv
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from typing import Optional, Dict, List
+from typing import Callable, Optional, Dict, List
 
 from params import configs
 from common_utils import *
@@ -39,6 +39,7 @@ def run_event_driven_until_nevents(
     seed_override: Optional[int] = None,
     sample_seed_override: Optional[int] = None,
     aggregate_prior: Optional[Dict[str, List[float]]] = None,
+    reschedule_observer: Optional[Callable[[Dict[str, object]], None]] = None,
 ):
     t_sim_start = time.perf_counter()
     # [FAST MODE] Skip heavy I/O tasks if enabled
@@ -681,11 +682,29 @@ def run_event_driven_until_nevents(
 
         actual_td_logged = 0.0
         if act == 1:
+            before_plan_rows = [dict(row) for row in orch._last_full_rows]
+            buffer_job_ids_before = [int(job.job_id) for job in orch.buffer]
+            wip_job_ids_before = [int(job.job_id) for job in orch._last_jobs_snapshot]
             t_start = time.perf_counter()
             release_result = orch.event_release_and_reschedule(t_now, event_id=int(stats["arrive"]))
             solve_time = time.perf_counter() - t_start
             release_count += 1
             gate_release_count += 1
+            if reschedule_observer is not None:
+                reschedule_observer(
+                    {
+                        "event_id": int(stats["arrive"]),
+                        "sim_time": float(t_now),
+                        "before_rows": before_plan_rows,
+                        "after_rows": [dict(row) for row in orch._last_full_rows],
+                        "buffer_job_ids_before": buffer_job_ids_before,
+                        "wip_job_ids_before": wip_job_ids_before,
+                        "release_jobs_count": int(release_result.get("jobs_count", 0)),
+                        "release_operations_count": int(release_result.get("operations_count", 0)),
+                        "sub_makespan": float(release_result.get("sub_makespan", 0.0)),
+                        "sub_tardiness": float(release_result.get("sub_tardiness", 0.0)),
+                    }
+                )
             if release_result.get("event") == "batch_finalized":
                 print(
                     f"[Reschedule] Event ID={stats['arrive']} | Jobs={release_result['jobs_count']} | "
