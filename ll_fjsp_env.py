@@ -376,8 +376,6 @@ class LLFJSPEnv:
                                       'constant', constant_values=0)
                                for k in range(self.number_of_envs)]).astype(np.float64)
 
-        self.pt_lower_bound = np.min(self.op_pt)
-        self.pt_upper_bound = np.max(self.op_pt)
         self.true_op_pt = np.copy(self.op_pt)
         self.op_assigned_mch = np.zeros((self.number_of_envs, self.max_number_of_ops), dtype=np.int32)
         
@@ -386,9 +384,10 @@ class LLFJSPEnv:
         # to ensure consistency with the High-level Agent.
         self.pt_scale = (float(configs.low) + float(configs.high)) / 2.0
         
-        # op_pt feature scale (remain 0~1 for MLP stability)
-        op_feat_scale = self.pt_upper_bound - self.pt_lower_bound + 1e-8
-        self.op_pt = (self.op_pt - self.pt_lower_bound) / op_feat_scale
+        # Keep every absolute time quantity in the same normalized system.
+        # Incompatible and padded entries remain zero; feasible PT values use
+        # the fixed generator-wide reference scale instead of batch min-max.
+        self.op_pt = self.true_op_pt / max(float(self.pt_scale), 1e-8)
 
         # Apply internal normalization to feature due_date using unified pt_scale
         if due_date_list is not None and normalize_due_date:

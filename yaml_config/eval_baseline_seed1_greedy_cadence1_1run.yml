@@ -5,7 +5,7 @@
 hl_gate_policy: ppo
 hl_buffer_slack_release_threshold: 100.0
 scheduler_type: PPO
-ll_ppo_model_path: trained_network\SD2\ll_u1030_esttd_odprog.pth
+ll_ppo_model_path: trained_weights\lower_level\ll_u1030_esttd_odprog_ptscale.pth
 hl_ppo_model_path: trained_weights\high_level\hlgate_baseline_stab05_e16_newstate.pth
 hl_ppo_name: hlgate_baseline_stab05_e16_newstate
 hl_ppo_separate_trunks: true

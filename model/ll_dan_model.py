@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class DualAttentionNetwork(nn.Module):
+class DualMLPEncoder(nn.Module):
     def __init__(self, config):
         """
         MLP 版 DAN：不使用 GNN/注意力，只用 MLP 對 fea_j / fea_m 做逐節點編碼，並輸出全域聚合特徵。
@@ -16,7 +16,7 @@ class DualAttentionNetwork(nn.Module):
           - layer_fea_output_dim: List[int]，定義每一層的輸出維度（例如 [128, 128, 64]）
           - dropout_prob: float    (可選，用於輸出後 dropout)
         """
-        super(DualAttentionNetwork, self).__init__()
+        super(DualMLPEncoder, self).__init__()
 
         # --- 讀 config ---
         self.fea_j_input_dim = config.fea_j_input_dim
@@ -114,13 +114,13 @@ class DualAttentionNetwork(nn.Module):
 
 
 
-class LLDANNet(nn.Module):
+class LLMLPNet(nn.Module):
     def __init__(self, config):
         """
             The implementation of the proposed learning framework for fjsp
         :param config: a package of parameters
         """
-        super(LLDANNet, self).__init__()
+        super(LLMLPNet, self).__init__()
         device = torch.device(config.device)
 
         self.pair_input_dim = int(getattr(config, "fea_pair_input_dim", 9))
@@ -132,10 +132,10 @@ class LLDANNet(nn.Module):
         self.embedding_output_dim = config.layer_fea_output_dim[-1]
         self.separate_actor_critic_encoder = bool(getattr(config, "separate_actor_critic_encoder", False))
 
-        self.feature_exact = DualAttentionNetwork(config).to(
+        self.feature_exact = DualMLPEncoder(config).to(
             device)
         if self.separate_actor_critic_encoder:
-            self.critic_feature_exact = DualAttentionNetwork(config).to(device)
+            self.critic_feature_exact = DualMLPEncoder(config).to(device)
         else:
             self.critic_feature_exact = None
         self.actor = Actor(config.num_mlp_layers_actor, 4 * self.embedding_output_dim + self.pair_input_dim,
@@ -318,3 +318,8 @@ class LLDANNet(nn.Module):
         if torch.isnan(v).any():
             raise RuntimeError("forward produced NaN critic values")
         return pi, v
+
+
+# Backward-compatible aliases for older scripts and checkpoints.
+DualAttentionNetwork = DualMLPEncoder
+LLDANNet = LLMLPNet

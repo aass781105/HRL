@@ -13,7 +13,7 @@ from data_utils import SD2_instance_generator
 from dynamic_job_stream import register_initial_jobs, sample_initial_jobs
 from hrl_orchestrator import GlobalTimelineOrchestrator, EventBurstGenerator
 from ll_fjsp_env import LLFJSPEnv
-from model.ll_dan_model import LLDANNet
+from model.ll_dan_model import LLMLPNet
 from model.hl_gate_state import HL_LL_BUFFER_EMBED_DIM, calculate_hl_gate_state, get_hl_gate_state_dim
 from hl_env_scenarios import make_burst_sampler, resolve_hl_env_scenario, scenario_config
 from common_utils import resolve_lower_level_weight_path, setup_seed
@@ -42,7 +42,7 @@ def _get_global_ll_encoder_model(config=configs):
 
     try:
         device = torch.device(getattr(config, "device", "cpu"))
-        model = LLDANNet(config).to(device)
+        model = LLMLPNet(config).to(device)
         model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
         model.eval()
         for param in model.parameters():
@@ -582,7 +582,7 @@ class HLGateEnv(gym.Env):
 
         try:
             device = torch.device(getattr(configs, "device", "cpu"))
-            model = LLDANNet(configs).to(device)
+            model = LLMLPNet(configs).to(device)
             model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
             model.eval()
             for param in model.parameters():

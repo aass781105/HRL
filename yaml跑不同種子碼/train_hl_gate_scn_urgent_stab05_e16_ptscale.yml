@@ -1,12 +1,12 @@
-# High-level PPO gate training: custom multi-job arrivals.
-# Training parameters match train_hl_gate_custom_seedenv_newstate_immediate_s01_e8.yml.
+# High-level PPO training: urgent scenario with the pt-scale lower PPO.
 
+# --- Scheduler ---
 hl_gate_policy: ppo
 scheduler_type: PPO
-ll_ppo_model_path: trained_weights\lower_level\ll_u1030_esttd_odprog.pth
-hl_ppo_model_path: trained_weights\high_level\hlgate_custom_multijob_newstate_immediate_s01_e8.pth
+ll_ppo_model_path: trained_weights\lower_level\ll_u1030_esttd_odprog_ptscale.pth
+hl_ppo_model_path: trained_weights\high_level\hlgate_urgent_stab05_e16_ptscale.pth
 
-# --- Custom multi-job dynamic environment ---
+# --- Dynamic Environment ---
 n_m: 5
 low: 1
 high: 99
@@ -17,33 +17,35 @@ interarrival_uniform_low: 45
 interarrival_uniform_high: 90
 init_jobs: 50
 burst_size: 1
-hl_burst_size_mode: inverse
+hl_burst_size_mode: fixed
 hl_burst_size_low: 1
-hl_burst_size_high: 5
+hl_burst_size_high: 1
 hl_same_batch_jobs: true
+hl_burst_due_date_scale_alpha: 1.0
 event_seed: 1
 fast_mode: true
-hl_env_scenario: custom
+hl_env_scenario: urgent
 hl_bottleneck_order_prob: 0.0
 hl_bottleneck_order_machine_count: 1
 hl_bottleneck_exclude_urgent: true
 hl_bottleneck_group_sampling: rolling_freq
 
-# --- Due date ---
+# --- Due Date ---
 hl_due_date_urgent_prob: 0.3
 hl_due_date_k_urgent_low: 1.5
 hl_due_date_k_urgent_high: 3.0
 hl_due_date_k_normal_low: 7.0
 hl_due_date_k_normal_high: 10.0
 
-# --- Decision and reference policy ---
+# --- Decision and Reference Policy ---
 hl_gate_decision_interval: 2
-hl_gate_cadence: 2
-baseline_cadence: 2
+hl_gate_cadence: 5
+baseline_cadence: 1
 ll_eval_action_selection: greedy
+ll_rollout_k: 1
 hl_initial_release_prob: 0.25
 
-# --- Reward ---
+# --- High-level Reward ---
 hl_td_credit_mode: terminal_only
 hl_release_reward_decay: 0.9
 hl_td_signal_source: baseline_gap_final
@@ -51,17 +53,15 @@ hl_td_reward_coef: 0.1
 hl_shaping_reward_coef: 0.0
 hl_mk_reward_coef: 0.0
 hl_buffer_penalty_coef: 0.01
-
-# Every release has a fixed stability cost.
 hl_stability_mode_v2: immediate_all
-hl_stability_scale: 0.1
+hl_stability_scale: 0.5
 hl_stability_power: 0.0
 hl_stability_free_releases: 0
 
 # --- High-level PPO ---
-hl_ppo_name: hlgate_custom_multijob_newstate_immediate_s01_e8
+hl_ppo_name: hlgate_urgent_stab05_e16_ptscale
 hl_ppo_updates: 200
-hl_ppo_num_envs: 8
+hl_ppo_num_envs: 16
 hl_ppo_use_async_envs: true
 hl_ppo_train_seed: 42
 hl_ppo_lr: 0.0001

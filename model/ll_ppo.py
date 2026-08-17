@@ -150,7 +150,7 @@ class LLPPO:
         self.normalize_vtarget = bool(getattr(config, "ll_vtarget_norm", False))
         self.critic_loss_type = str(getattr(config, "ll_critic_loss", "mse")).strip().lower()
 
-        self.policy = LLDANNet(config)
+        self.policy = LLMLPNet(config)
         self.policy_old = deepcopy(self.policy)
 
         self.policy_old.load_state_dict(self.policy.state_dict())
