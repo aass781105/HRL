@@ -125,9 +125,9 @@ class LLMLPNet(nn.Module):
 
         self.pair_input_dim = int(getattr(config, "fea_pair_input_dim", 9))
         self.critic_size_context_max_n_j = float(getattr(config, "critic_size_context_max_n_j", 30.0))
-        # Temporarily disable the critic-only raw tardiness summary.
-        # Keep _critic_raw_summary below so it can be restored without rewriting the feature logic.
-        self.critic_summary_dim = 0
+        # Stability fine-tuning uses six state-level summaries. Legacy models
+        # keep the previous critic input size unless the YAML opts in.
+        self.critic_summary_dim = 6 if bool(getattr(config, "ll_stability_critic_summary", False)) else 0
 
         self.embedding_output_dim = config.layer_fea_output_dim[-1]
         self.separate_actor_critic_encoder = bool(getattr(config, "separate_actor_critic_encoder", False))
@@ -225,9 +225,49 @@ class LLMLPNet(nn.Module):
             dim=-1
         )
 
+    def _critic_stability_summary(self, fea_j, candidate, dynamic_pair_mask, fea_pairs):
+        """Aggregate legal candidate-pair stability pressure for V(s)."""
+        legal = (~dynamic_pair_mask).to(fea_pairs.dtype)
+        legal_count = legal.sum(dim=(1, 2))
+        denom = legal_count.clamp_min(1.0)
+
+        # Operation-level flags are appended after the legacy 20 features.
+        candidate_idx = candidate.long()
+        if fea_j.size(-1) > 20:
+            candidate_new = torch.gather(fea_j[:, :, 20], 1, candidate_idx)
+        else:
+            candidate_new = torch.zeros_like(candidate, dtype=fea_pairs.dtype)
+        new_pair = candidate_new.unsqueeze(-1) * legal
+        new_job_ratio = new_pair.sum(dim=(1, 2)) / denom
+
+        same_old_machine = fea_pairs[:, :, :, 8]
+        machine_change = fea_pairs[:, :, :, 9]
+        comparable_pair_ratio = (same_old_machine * legal).sum(dim=(1, 2)) / denom
+        machine_change_ratio = (machine_change * legal).sum(dim=(1, 2)) / denom
+
+        inversion_log = fea_pairs[:, :, :, 11].clamp_min(0.0)
+        inversion_raw = torch.expm1(inversion_log)
+        inversion_sum_log = torch.log1p((inversion_raw * same_old_machine * legal).sum(dim=(1, 2)))
+        masked_inversion = torch.where(
+            (same_old_machine * legal) > 0,
+            inversion_log,
+            torch.zeros_like(inversion_log),
+        )
+        inversion_max_log = masked_inversion.amax(dim=(1, 2))
+
+        return torch.stack((
+            torch.log1p(legal_count),
+            new_job_ratio,
+            machine_change_ratio,
+            comparable_pair_ratio,
+            inversion_sum_log,
+            inversion_max_log,
+        ), dim=-1)
+
     def _compute_policy_features(self, fea_j, op_mask, candidate, fea_m, mch_mask, comp_idx, dynamic_pair_mask, fea_pairs):
         raw_fea_j = fea_j
         raw_fea_m = fea_m
+        raw_fea_pairs = fea_pairs
         fea_j, fea_m, fea_j_global, fea_m_global = self.feature_exact(
             fea_j, op_mask, candidate, fea_m, mch_mask, comp_idx, dynamic_pair_mask, fea_pairs
         )
@@ -257,8 +297,10 @@ class LLMLPNet(nn.Module):
         candidate_feature = torch.cat((fea_j_jc_serialized, fea_m_serialized, fea_gj_input,
                                        fea_gm_input, fea_pairs), dim=-1)
         if self.critic_summary_dim > 0:
-            raw_critic_summary = self._critic_raw_summary(raw_fea_j, candidate)
-            global_feature = torch.cat((critic_fea_j_global, critic_fea_m_global, raw_critic_summary), dim=-1)
+            stability_summary = self._critic_stability_summary(
+                raw_fea_j, candidate, dynamic_pair_mask, raw_fea_pairs
+            )
+            global_feature = torch.cat((critic_fea_j_global, critic_fea_m_global, stability_summary), dim=-1)
         else:
             global_feature = torch.cat((critic_fea_j_global, critic_fea_m_global), dim=-1)
         return candidate_feature, global_feature

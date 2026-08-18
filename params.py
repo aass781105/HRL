@@ -222,6 +222,38 @@ parser.add_argument('--ll_ready_overdue_wait_threshold', type=float, default=0.0
 parser.add_argument('--ll_vtarget_norm', type=str2bool, default=False, help='Normalize low-level PPO value targets per-env trajectory before critic loss.')
 parser.add_argument('--ll_critic_loss', type=str, default='mse', choices=['mse', 'huber'], help='Critic loss type for low-level PPO.')
 parser.add_argument('--ll_reward_norm_by_size', type=str2bool, default=False, help='Normalize low-level PPO step rewards by running mean/std tracked separately for each n_j.')
+parser.add_argument('--ll_stability_enable', type=str2bool, default=False,
+                    help='Enable lower-level stability features and incremental stability reward. Disabled by default for legacy compatibility.')
+parser.add_argument('--ll_stability_critic_summary', type=str2bool, default=False,
+                    help='Append confirmed stability summaries to the lower-level critic input.')
+parser.add_argument('--ll_stability_flip_coef', type=float, default=1.0,
+                    help='Penalty coefficient for newly created pair flips before the existing final reward divisor.')
+parser.add_argument('--ll_stability_machine_change_coef', type=float, default=3.0,
+                    help='Penalty coefficient for an old operation changing machine before the existing final reward divisor.')
+parser.add_argument('--ll_reward_divisor', type=float, default=10.0,
+                    help='Final divisor applied to the complete lower-level reward, including stability penalty.')
+parser.add_argument('--ll_stability_fresh_ratio', type=float, default=0.30,
+                    help='Fresh static samples ratio during stability fine-tuning.')
+parser.add_argument('--ll_stability_reschedule_ratio', type=float, default=0.70,
+                    help='Virtual-cut reschedule samples ratio during stability fine-tuning.')
+parser.add_argument('--ll_stability_reference_model_path', type=str,
+                    default=r'trained_weights\lower_level\ll_u1030_esttd_odprog_ptscale.pth',
+                    help='Frozen legacy lower-level checkpoint used to create old schedules.')
+parser.add_argument('--ll_stability_output_model_path', type=str,
+                    default=r'trained_weights\lower_level\ll_stability_finetune_ptscale.pth',
+                    help='Output checkpoint path for the stability-aware trainable policy.')
+parser.add_argument('--ll_stability_reference_action_selection', type=str, default='greedy', choices=['greedy'],
+                    help='Action selection mode for the frozen reference policy.')
+parser.add_argument('--ll_stability_initial_jobs', type=int, default=30,
+                    help='Initial job count for virtual-cut stability samples.')
+parser.add_argument('--ll_stability_target_jobs_low', type=int, default=30,
+                    help='Minimum job count for generated stability subproblems.')
+parser.add_argument('--ll_stability_target_jobs_high', type=int, default=40,
+                    help='Maximum job count for generated stability subproblems.')
+parser.add_argument('--ll_stability_cut_low', type=float, default=0.10,
+                    help='Lower fraction of the frozen reference schedule used as a virtual cut.')
+parser.add_argument('--ll_stability_cut_high', type=float, default=0.50,
+                    help='Upper fraction of the frozen reference schedule used as a virtual cut.')
 parser.add_argument('--hl_buffer_penalty_coef', type=float, default=0.0, help='Coefficient for buffer tardiness penalty')
 parser.add_argument('--hl_stability_mode', type=str, default='immediate_all', choices=['immediate_all', 'free_threshold'], help='Stability reward mode: immediate_all = current per-release penalty; free_threshold = releases are free until stability_free_releases, then penalize via terminal or redistribution.')
 parser.add_argument('--hl_stability_terminal_only', type=str2bool, default=False, help='If true, apply stability penalty only once at episode end using agent-chosen release count.')

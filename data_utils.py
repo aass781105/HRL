@@ -206,7 +206,18 @@ def text_to_matrix(text):
     return job_length, op_pt
 
 
-def generate_due_dates(job_length, op_pt, tightness=1.2, due_date_mode='k', seed=None, noise_level=0.0, rng=None, return_info=False, due_config=None):
+def generate_due_dates(
+    job_length,
+    op_pt,
+    tightness=1.2,
+    due_date_mode='k',
+    seed=None,
+    noise_level=0.0,
+    rng=None,
+    return_info=False,
+    due_config=None,
+    allow_overdue_injection=True,
+):
     """
     Simplified Due Date Generation.
     """
@@ -233,6 +244,8 @@ def generate_due_dates(job_length, op_pt, tightness=1.2, due_date_mode='k', seed
 
     def maybe_inject_range3_overdue(due_dates, due_range):
         from params import configs
+        if not allow_overdue_injection:
+            return due_dates
         prob = float(getattr(configs, "ll_range3_overdue_prob", 0.0))
         if prob <= 0.0 or n_j <= 0:
             return due_dates

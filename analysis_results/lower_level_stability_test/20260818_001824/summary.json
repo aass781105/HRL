@@ -1,0 +1,21 @@
+{
+  "config": "C:\\Users\\123\\Desktop\\李信翰\\碩一\\PPO_FJSP\\FJSP-DRL-main_NO_GNN\\yaml_config\\train_ll_stability_finetune.yml",
+  "legacy_checkpoint": "C:\\Users\\123\\Desktop\\李信翰\\碩一\\PPO_FJSP\\FJSP-DRL-main_NO_GNN\\trained_weights\\lower_level\\ll_u1030_esttd_odprog_ptscale.pth",
+  "kind_requested": "reschedule",
+  "kind_generated": "reschedule",
+  "due_mode_requested": "auto",
+  "due_mode_effective": "range3_loose",
+  "seed": 15,
+  "sample_index": 0,
+  "action_mode": "greedy",
+  "target_jobs": 40,
+  "scheduled_operations": 123,
+  "retained_jobs": 22,
+  "new_jobs": 18,
+  "overdue_jobs": 1,
+  "overdue_job_ratio": 0.025,
+  "cut_time": 248.13005444842807,
+  "makespan": 811.869945551572,
+  "tardiness": 2956.961793621471,
+  "objective": 1884.4158695865215
+}

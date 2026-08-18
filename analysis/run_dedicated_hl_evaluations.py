@@ -23,6 +23,12 @@ SCENARIO_WEIGHTS = {
     "burst_cluster": r"trained_weights\high_level\hlgate_multijob_stab05_e16_newstate.pth",
 }
 
+NEW_SCENARIO_WEIGHTS = {
+    "baseline": r"trained_weights\high_level\hlgate_baseline_stab05_e16_ptscale.pth",
+    "urgent": r"trained_weights\high_level\hlgate_urgent_stab05_e16_ptscale.pth",
+    "burst_cluster": r"trained_weights\high_level\hlgate_multijob_stab05_e16_ptscale.pth",
+}
+
 
 def choose_output_root() -> Path:
     root = RESULTS_ROOT / "dedicated"
@@ -37,6 +43,12 @@ def copy_existing_urgent_baselines(output_root: Path) -> None:
     for strategy in ("cad1", "cad5", "slack0"):
         source = OLD_URGENT_ROOT / strategy
         target = target_root / strategy
+        if target.exists():
+            existing_target_files = list(target.rglob("sample_runs_summary.csv"))
+            if len(existing_target_files) == 10:
+                print(f"[REUSE] urgent/{strategy}: dedicated copy already exists")
+                continue
+            raise RuntimeError(f"Partial target already exists: {target}")
         if not source.is_dir():
             raise FileNotFoundError(f"Existing urgent strategy directory not found: {source}")
         sample_files = list(source.rglob("sample_runs_summary.csv"))
@@ -44,19 +56,13 @@ def copy_existing_urgent_baselines(output_root: Path) -> None:
             raise RuntimeError(
                 f"Expected 10 existing urgent {strategy} runs, found {len(sample_files)}"
             )
-        if target.exists():
-            existing_target_files = list(target.rglob("sample_runs_summary.csv"))
-            if len(existing_target_files) == 10:
-                print(f"[REUSE] urgent/{strategy}: dedicated copy already exists")
-                continue
-            raise RuntimeError(f"Partial target already exists: {target}")
         shutil.copytree(source, target)
         print(f"[REUSE] urgent/{strategy}: copied {len(sample_files)} existing runs")
 
 
 def strategy_args(strategy: str, scenario: str, weight: str) -> list[str]:
     args = ["--hl_env_scenario", scenario]
-    if strategy == "ppo":
+    if strategy in {"ppo", "ppo_new"}:
         args += ["--hl_gate_policy", "ppo", "--hl_ppo_model_path", weight]
     elif strategy == "cad1":
         args += ["--hl_gate_policy", "cadence", "--hl_gate_cadence", "1"]
@@ -89,7 +95,10 @@ def run_one(*, scenario: str, strategy: str, seed: int, output_root: Path) -> No
     if completed_dirs:
         print(f"[SKIP] {scenario}/{strategy}/seed{seed:02d} already completed")
         return
-    weight = SCENARIO_WEIGHTS[scenario]
+    if strategy == "ppo_new":
+        weight = NEW_SCENARIO_WEIGHTS[scenario]
+    else:
+        weight = SCENARIO_WEIGHTS[scenario]
     command = [
         sys.executable,
         str(REPO_ROOT / "hrl_main.py"),
@@ -138,6 +147,8 @@ def main() -> None:
     for scenario in ("baseline", "burst_cluster"):
         for strategy in ("ppo", "cad1", "cad5", "slack0"):
             tasks.append((scenario, strategy))
+    for scenario in ("baseline", "urgent", "burst_cluster"):
+        tasks.append((scenario, "ppo_new"))
 
     for index, (scenario, strategy) in enumerate(tasks, start=1):
         print(f"[GROUP {index}/{len(tasks)}] {scenario}/{strategy}")

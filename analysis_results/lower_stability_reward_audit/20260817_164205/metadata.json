@@ -1,0 +1,38 @@
+{
+  "config": "C:\\Users\\123\\Desktop\\\u674e\u4fe1\u7ff0\\\u78a9\u4e00\\PPO_FJSP\\FJSP-DRL-main_NO_GNN\\yaml\u8dd1\u4e0d\u540c\u7a2e\u5b50\u78bc\\train_ll_u1030_esttd_odprog.yml",
+  "reference_model": "C:\\Users\\123\\Desktop\\\u674e\u4fe1\u7ff0\\\u78a9\u4e00\\PPO_FJSP\\FJSP-DRL-main_NO_GNN\\trained_weights\\lower_level\\ll_u1030_esttd_odprog03.pth",
+  "reference_action_selection": "greedy",
+  "initial_jobs": 30,
+  "op_per_job": 5,
+  "seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "cut_fractions": [
+    0.1,
+    0.2,
+    0.3,
+    0.4,
+    0.5
+  ],
+  "target_jobs": [
+    30,
+    32,
+    35,
+    38,
+    40
+  ],
+  "due_mode_requested": "auto",
+  "due_mode_resolved": "range3_loose",
+  "new_job_due_rule": "Uniform(-0.1*a_new, 1.2*a_new), a_new=ll_due_range_scale*target_jobs*mean_pt",
+  "metric_definition": "future old operations only; new jobs excluded from flip/machine-change comparisons",
+  "created_at": "2026-08-17T16:42:05"
+}

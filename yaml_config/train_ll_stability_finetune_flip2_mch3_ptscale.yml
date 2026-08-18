@@ -1,0 +1,79 @@
+# Lower-level PPO stability fine-tuning: flip=2, machine-change=3.
+eval_model_name: ll_stability_finetune_flip2_mch3_ptscale
+ll_ppo_model_path: trained_weights\lower_level\ll_stability_finetune_flip2_mch3_ptscale.pth
+ll_stability_reference_model_path: trained_weights\lower_level\ll_u1030_esttd_odprog_ptscale.pth
+ll_stability_output_model_path: trained_weights\lower_level\ll_stability_finetune_flip2_mch3_ptscale.pth
+
+# Static instance generation.
+n_j: 30
+n_m: 5
+low: 1
+high: 99
+op_per_job: 5
+enable_op_mixture: true
+data_suffix: mix
+op_per_mch_min: 1
+op_per_mch_max: 5
+seed_train: 3
+
+# Legacy lower-level reward and due-date distribution.
+ll_num_envs: 50
+ll_due_date_mode: range3_hold
+ll_val_due_date_mode: range3
+ll_due_range_scale: 0.7
+ll_range3_overdue_prob: 0.3
+ll_range3_overdue_factor_low: -2.0
+ll_range3_overdue_factor_high: -0.5
+ll_range3_overdue_job_frac_low: 0.01
+ll_range3_overdue_job_frac_high: 0.20
+ll_schedule_type: u10_30
+ll_mixed_size_hold_updates: 60
+ll_due_setting_hold_updates: 20
+ll_max_updates: 1000
+ll_mk_coef: 10.0
+ll_td_coef: 1.0
+ll_overdue_progress_coef: 0.3
+ll_td_mode: chosen_est_tardiness_delta
+ll_ready_overdue_wait_coef: 0.0
+ll_vloss_coef: 0.1
+ll_ploss_coef: 1.0
+ll_entloss_coef: 0.03
+ll_lr: 0.0003
+ll_gamma: 1.0
+ll_gae_lambda: 0.98
+ll_k_epochs: 4
+ll_eps_clip: 0.2
+ll_tau: 0.0
+ll_minibatch_size: 1024
+validate_timestep: 10
+
+# Stability objective.
+ll_stability_enable: true
+ll_stability_critic_summary: true
+ll_stability_flip_coef: 2.0
+ll_stability_machine_change_coef: 3.0
+ll_reward_divisor: 10.0
+ll_stability_fresh_ratio: 0.30
+ll_stability_reschedule_ratio: 0.70
+ll_stability_initial_jobs: 30
+ll_stability_target_jobs_low: 30
+ll_stability_target_jobs_high: 40
+ll_stability_cut_low: 0.10
+ll_stability_cut_high: 0.50
+
+# Existing lower-level network; stability state extends only the input dims.
+fea_j_input_dim: 22
+fea_m_input_dim: 9
+fea_pair_input_dim: 12
+layer_fea_output_dim: [64, 64, 64]
+separate_actor_critic_encoder: false
+num_mlp_layers_actor: 3
+hidden_dim_actor: 512
+num_mlp_layers_critic: 3
+hidden_dim_critic: 256
+critic_size_context_max_n_j: 30.0
+critic_due_context: false
+ll_due_vloss_coef: false
+ll_vtarget_norm: false
+ll_critic_loss: huber
+enable_gap_insertion: false

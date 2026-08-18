@@ -81,16 +81,26 @@ class LLFJSPEnv:
         Padding is applied up to max_number_of_ops within the batch, and dummy nodes are masked out.
     """
 
-    def __init__(self, n_j, n_m):
+    def __init__(self, n_j, n_m, stability_enabled=None):
         self.number_of_jobs = n_j
         self.number_of_machines = n_m
         self.old_state = EnvState()
 
+        if stability_enabled is None:
+            stability_enabled = getattr(configs, "ll_stability_enable", False)
+        self.stability_enabled = bool(stability_enabled)
+
         # feature dims (keep your original settings)
         # 14 legacy dims + tardiness/rank/gap/flexibility/overdue-weight features.
-        self.op_fea_dim = 20
+        self.op_fea_dim = 22 if self.stability_enabled else 20
         self.mch_fea_dim = 9
-        self.pair_fea_dim = 8
+        self.pair_fea_dim = 12 if self.stability_enabled else 8
+
+        self.stability_ref_mask = None
+        self.stability_is_new_job = None
+        self.stability_old_machine = None
+        self.stability_old_rank = None
+        self.stability_old_rank_norm = None
 
     def _scale_true_time(self, x):
         return np.asarray(x, dtype=np.float64) / max(float(self.pt_scale), 1e-6)
@@ -294,6 +304,138 @@ class LLFJSPEnv:
                 refs[local_e, m] = ref
         return refs
 
+    def _initialize_stability_reference(self, references=None):
+        """Install immutable old-schedule metadata for the current static batch."""
+        shape = (self.number_of_envs, self.max_number_of_ops)
+        self.stability_ref_mask = np.zeros(shape, dtype=bool)
+        self.stability_is_new_job = np.ones(shape, dtype=np.float32)
+        self.stability_old_machine = np.full(shape, -1, dtype=np.int32)
+        self.stability_old_rank = np.full(shape, -1, dtype=np.int32)
+        self.stability_old_rank_norm = np.zeros(shape, dtype=np.float32)
+
+        if not self.stability_enabled or references is None:
+            return
+
+        for env_idx, reference in enumerate(references[:self.number_of_envs]):
+            if not reference:
+                continue
+
+            def copy_op_array(name, target, default=None):
+                values = reference.get(name, default)
+                if values is None:
+                    return
+                values = np.asarray(values)
+                length = min(values.size, self.max_number_of_ops)
+                target[env_idx, :length] = values.reshape(-1)[:length]
+
+            copy_op_array("ref_mask", self.stability_ref_mask, np.zeros(self.max_number_of_ops, dtype=bool))
+            copy_op_array("is_new_job_op", self.stability_is_new_job, np.ones(self.max_number_of_ops, dtype=np.float32))
+            copy_op_array("old_machine", self.stability_old_machine, np.full(self.max_number_of_ops, -1, dtype=np.int32))
+            copy_op_array("old_rank", self.stability_old_rank, np.full(self.max_number_of_ops, -1, dtype=np.int32))
+            copy_op_array("old_rank_norm", self.stability_old_rank_norm, np.zeros(self.max_number_of_ops, dtype=np.float32))
+
+            # Allow callers to provide a job-level new-job flag instead of an
+            # operation-level array.
+            if "is_new_job_op" not in reference and "is_new_job" in reference:
+                job_flags = np.asarray(reference["is_new_job"]).reshape(-1)
+                for job_idx in range(min(self.number_of_jobs, job_flags.size)):
+                    start = int(self.job_first_op_id[env_idx, job_idx])
+                    end = int(self.job_last_op_id[env_idx, job_idx]) + 1
+                    self.stability_is_new_job[env_idx, start:end] = float(job_flags[job_idx])
+
+    def _stability_pair_features(self):
+        """Return confirmed candidate-level stability features.
+
+        Pair columns are: same old machine, machine-change flag, old-rank
+        position, and log1p append inversion count.
+        """
+        shape = (self.number_of_envs, self.number_of_jobs, self.number_of_machines)
+        if not self.stability_enabled:
+            return np.zeros(shape + (4,), dtype=np.float32)
+
+        # ``candidate`` already stores the global operation ID per job.
+        candidate_ops = self.candidate
+        ref = self.stability_ref_mask[self.env_job_idx, candidate_ops]
+        old_machine = self.stability_old_machine[self.env_job_idx, candidate_ops]
+        old_rank_norm = self.stability_old_rank_norm[self.env_job_idx, candidate_ops]
+
+        machine_ids = np.arange(self.number_of_machines, dtype=np.int32)[None, None, :]
+        same_old_machine = ref[:, :, None] & (old_machine[:, :, None] == machine_ids)
+        machine_change = ref[:, :, None] & (old_machine[:, :, None] != machine_ids)
+        pair_old_rank_norm = np.where(same_old_machine, old_rank_norm[:, :, None], 0.0)
+
+        append_inversion_count = np.zeros(shape, dtype=np.float32)
+        for env_idx in range(self.number_of_envs):
+            for job_idx in range(self.number_of_jobs):
+                op_id = int(candidate_ops[env_idx, job_idx])
+                if op_id < 0 or op_id >= self.max_number_of_ops:
+                    continue
+                if not self.stability_ref_mask[env_idx, op_id]:
+                    continue
+                old_mch = int(self.stability_old_machine[env_idx, op_id])
+                old_rank = int(self.stability_old_rank[env_idx, op_id])
+                if old_mch < 0 or old_rank < 0 or old_mch >= self.number_of_machines:
+                    continue
+                queue_len = int(self.mch_queue_len[env_idx, old_mch])
+                queued_ops = self.mch_queue[env_idx, old_mch, :queue_len]
+                count = 0
+                for queued_op in queued_ops:
+                    queued_op = int(queued_op)
+                    if queued_op < 0 or queued_op >= self.max_number_of_ops:
+                        continue
+                    if not self.stability_ref_mask[env_idx, queued_op]:
+                        continue
+                    if int(self.stability_old_machine[env_idx, queued_op]) != old_mch:
+                        continue
+                    if int(self.stability_old_rank[env_idx, queued_op]) > old_rank:
+                        count += 1
+                append_inversion_count[env_idx, job_idx, old_mch] = float(count)
+
+        return np.stack((same_old_machine.astype(np.float32),
+                         machine_change.astype(np.float32),
+                         pair_old_rank_norm.astype(np.float32),
+                         np.log1p(append_inversion_count)), axis=-1)
+
+    def _stability_step_increments(self, env_indices, chosen_job, chosen_op, chosen_mch):
+        """Count only violations newly finalized by the current append action."""
+        flip_increment = np.zeros(self.number_of_envs, dtype=np.float64)
+        machine_change_increment = np.zeros(self.number_of_envs, dtype=np.float64)
+        if not self.stability_enabled:
+            return flip_increment, machine_change_increment
+
+        for local_idx, env_idx in enumerate(env_indices):
+            e = int(env_idx)
+            j = int(chosen_job[local_idx])
+            op_id = int(chosen_op[local_idx])
+            machine_id = int(chosen_mch[local_idx])
+            if not self.stability_ref_mask[e, op_id]:
+                continue
+
+            old_machine = int(self.stability_old_machine[e, op_id])
+            old_rank = int(self.stability_old_rank[e, op_id])
+            if old_machine < 0 or old_rank < 0:
+                continue
+            if old_machine != machine_id:
+                machine_change_increment[e] = 1.0
+                # Machine changes are excluded from pair-flip counting.
+                continue
+
+            queue_len = int(self.mch_queue_len[e, machine_id])
+            queued_ops = self.mch_queue[e, machine_id, :queue_len]
+            for queued_op in queued_ops:
+                queued_op = int(queued_op)
+                if queued_op < 0 or queued_op >= self.max_number_of_ops:
+                    continue
+                if not self.stability_ref_mask[e, queued_op]:
+                    continue
+                if int(self.stability_old_machine[e, queued_op]) != machine_id:
+                    continue
+                queued_rank = int(self.stability_old_rank[e, queued_op])
+                if queued_rank > old_rank:
+                    flip_increment[e] += 1.0
+
+        return flip_increment, machine_change_increment
+
     # -------------------- static properties & init --------------------
 
     def set_static_properties(self):
@@ -318,7 +460,9 @@ class LLFJSPEnv:
 
         self.flag_exist_dummy_node = ~(self.env_number_of_ops == self.max_number_of_ops).all()
 
-    def set_initial_data(self, job_length_list, op_pt_list, due_date_list=None, normalize_due_date=True, true_due_date_list=None, tightness=None, release_time_list=None):
+    def set_initial_data(self, job_length_list, op_pt_list, due_date_list=None, normalize_due_date=True,
+                         true_due_date_list=None, tightness=None, release_time_list=None,
+                         stability_reference=None):
         """
         Args:
             job_length_list: List[np.ndarray]
@@ -328,6 +472,7 @@ class LLFJSPEnv:
             true_due_date_list: Absolute due dates used for Tardiness/Reward calculation.
             tightness:       Optional array/list of tightness factors (k) for reward normalization.
             release_time_list: Optional list of release times for each job (for dynamic scenarios).
+            stability_reference: Optional per-environment old-schedule metadata for fine-tuning.
         """
         self.number_of_envs = len(job_length_list)
         self.enable_gap_insertion = bool(getattr(configs, "enable_gap_insertion", False))
@@ -426,6 +571,7 @@ class LLFJSPEnv:
         self.job_last_op_id[:, -1] = self.env_number_of_ops - 1
 
         self.initial_vars()
+        self._initialize_stability_reference(stability_reference)
         self.init_op_mask()
 
         self.op_pt = ma.array(self.op_pt, mask=self.reverse_process_relation)
@@ -658,6 +804,11 @@ class LLFJSPEnv:
         
         # [FIX] Correctly index candidate using incomplete_env_idx for row and chosen_job for column
         chosen_op = self.candidate[self.incomplete_env_idx, chosen_job]
+
+        # Count only stability violations finalized by this append action.
+        stability_flip_increment, stability_machine_change_increment = self._stability_step_increments(
+            self.incomplete_env_idx, chosen_job, chosen_op, chosen_mch
+        )
 
         # (Snapshots before state transition removed as other TD modes are cleaned up)
 
@@ -938,11 +1089,19 @@ class LLFJSPEnv:
         reward_td_weighted = td_coef * reward_td
         reward_od_weighted = od_coef * reward_od
         reward_wait_od_weighted = wait_od_coef * reward_wait_od
-        reward = (reward_mk_weighted + reward_td_weighted + reward_od_weighted + reward_wait_od_weighted) / 10
-        reward_mk_step = reward_mk_weighted / 10.0
-        reward_td_step = reward_td_weighted / 10.0
-        reward_od_step = reward_od_weighted / 10.0
-        reward_wait_od_step = reward_wait_od_weighted / 10.0
+        stability_raw = -(
+            float(getattr(configs, "ll_stability_flip_coef", 1.0)) * stability_flip_increment
+            + float(getattr(configs, "ll_stability_machine_change_coef", 3.0))
+            * stability_machine_change_increment
+        ) if self.stability_enabled else np.zeros(self.number_of_envs, dtype=np.float64)
+        reward_divisor = max(float(getattr(configs, "ll_reward_divisor", 10.0)), 1e-8)
+        reward = (reward_mk_weighted + reward_td_weighted + reward_od_weighted
+                  + reward_wait_od_weighted + stability_raw) / reward_divisor
+        reward_mk_step = reward_mk_weighted / reward_divisor
+        reward_td_step = reward_td_weighted / reward_divisor
+        reward_od_step = reward_od_weighted / reward_divisor
+        reward_wait_od_step = reward_wait_od_weighted / reward_divisor
+        reward_stability_step = stability_raw / reward_divisor
 
         # self.state.update (...) already called above in timing block
         self.done_flag = self.done()
@@ -992,6 +1151,10 @@ class LLFJSPEnv:
             "reward_td_step": reward_td_step,
             "reward_od_step": reward_od_step,
             "reward_wait_od_step": reward_wait_od_step,
+            "reward_stability_step": reward_stability_step,
+            "raw_stability_penalty": stability_raw,
+            "stability_flip_increment": stability_flip_increment,
+            "stability_machine_change_increment": stability_machine_change_increment,
             # [ADDED] Raw values for debugging
             "raw_mk_gain": float(reward_mk[env_idx]), 
             "raw_local_tardiness": float(tardiness[env_idx]),
@@ -1090,7 +1253,7 @@ class LLFJSPEnv:
         overdue_weight = np.log1p(np.maximum(0.0, -self.due_date))
         feat_overdue_weight = np.repeat(overdue_weight, self.virtual_job_length[0], axis=1)
 
-        self.fea_j = np.stack((self.op_scheduled_flag,
+        op_feature_list = [self.op_scheduled_flag,
                                self.op_ct_lb,
                                self.op_min_pt,
                                self.pt_span,
@@ -1109,7 +1272,14 @@ class LLFJSPEnv:
                                feat_slack_gap_to_min,
                                feat_remaining_flex_min,
                                feat_remaining_flex_mean,
-                               feat_overdue_weight), axis=2).astype(np.float32, copy=False)
+                               feat_overdue_weight]
+        if self.stability_enabled:
+            # Binary reference/new-job indicators are intentionally appended
+            # after the protected raw feature block and are never z-scored.
+            op_feature_list.extend((self.stability_is_new_job,
+                                    self.stability_ref_mask.astype(np.float32)))
+
+        self.fea_j = np.stack(op_feature_list, axis=2).astype(np.float32, copy=False)
 
         # [NEW] Store RAW features before normalization for debugging
         self.raw_fea_j = np.copy(self.fea_j)
@@ -1149,7 +1319,7 @@ class LLFJSPEnv:
         
         z_norm = (temp - z_mean[:, np.newaxis, :]) / (z_std[:, np.newaxis, :] + 1e-8)
         
-        # Re-assemble in correct order: 0 | 1-6 | 7 | 8-9 | 10-11 | 12-19
+        # Re-assemble in correct order: 0 | 1-6 | 7 | 8-9 | 10-11 | raw tail.
         self.fea_j = np.concatenate((
             fea_f0, 
             z_norm[:, :, 0:6], 
@@ -1255,14 +1425,21 @@ class LLFJSPEnv:
         true_due_date = self.true_due_date[:, :, np.newaxis]
         pair_est_lateness = np.maximum(0.0, true_pair_free_time + true_candidate_pt - true_due_date)
 
-        self.fea_pairs = np.stack((self.candidate_pt,
-                                   self.candidate_pt / chosen_op_max_pt,
-                                   self.candidate_pt / mch_max_candidate_pt,
-                                   self.candidate_pt / max_remain_op_pt,
-                                   self.candidate_pt / mch_max_remain_op_pt,
-                                   self.candidate_pt / pair_max_pt,
-                                   self.candidate_pt / chosen_job_remain_work,
-                                   self._log1p_scaled(pair_est_lateness)), axis=-1).astype(np.float32, copy=False)
+        pair_feature_list = [self.candidate_pt,
+                             self.candidate_pt / chosen_op_max_pt,
+                             self.candidate_pt / mch_max_candidate_pt,
+                             self.candidate_pt / max_remain_op_pt,
+                             self.candidate_pt / mch_max_remain_op_pt,
+                             self.candidate_pt / pair_max_pt,
+                             self.candidate_pt / chosen_job_remain_work,
+                             self._log1p_scaled(pair_est_lateness)]
+        if self.stability_enabled:
+            pair_feature_list.append(self._stability_pair_features())
+
+        self.fea_pairs = np.concatenate(
+            [item if item.ndim == 4 else item[..., np.newaxis] for item in pair_feature_list],
+            axis=-1,
+        ).astype(np.float32, copy=False)
         return self.fea_pairs
 
     # -------------------- masks / logic --------------------

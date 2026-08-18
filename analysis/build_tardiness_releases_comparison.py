@@ -12,7 +12,7 @@ DEFAULT_ROOT = Path(
     r"C:\Users\123\Desktop\李信翰\碩一\meeting_ppt\20260819\urgent"
 )
 DEFAULT_OUTPUT = DEFAULT_ROOT / "tardiness_releases_comparison.csv"
-STRATEGIES = ("ppo", "cad1", "cad5", "slack0")
+STRATEGIES = ("ppo", "ppo_new", "cad1", "cad5", "slack0")
 
 
 def parse_args() -> argparse.Namespace:

@@ -331,10 +331,23 @@ class Trainer:
                         ]
 
                 state, reward, done, info = self.env.step(actions=full_actions.cpu().numpy())
-                ep_mk_gain += np.mean(info['reward_mk']); ep_td_penalty += np.mean(info['reward_td'])
-                all_mk_rewards.extend(info['reward_mk'].flatten()); all_td_rewards.extend(info['reward_td'].flatten())
-                all_od_rewards.extend(np.asarray(info.get('reward_od_step', np.zeros(self.num_envs))).flatten())
-                all_wait_od_rewards.extend(np.asarray(info.get('reward_wait_od_step', np.zeros(self.num_envs))).flatten())
+                # Use the same /10-scaled components that form the actual PPO
+                # reward. The legacy reward_mk/reward_td info fields additionally
+                # divide by sqrt(number_of_jobs) and are diagnostic-only values.
+                mk_step_rewards = np.asarray(info['reward_mk_step'], dtype=np.float64).reshape(-1)
+                td_step_rewards = np.asarray(info['reward_td_step'], dtype=np.float64).reshape(-1)
+                od_step_rewards = np.asarray(
+                    info.get('reward_od_step', np.zeros(self.num_envs)), dtype=np.float64
+                ).reshape(-1)
+                wait_od_step_rewards = np.asarray(
+                    info.get('reward_wait_od_step', np.zeros(self.num_envs)), dtype=np.float64
+                ).reshape(-1)
+                ep_mk_gain += np.mean(mk_step_rewards)
+                ep_td_penalty += np.mean(td_step_rewards)
+                all_mk_rewards.extend(mk_step_rewards)
+                all_td_rewards.extend(td_step_rewards)
+                all_od_rewards.extend(od_step_rewards)
+                all_wait_od_rewards.extend(wait_od_step_rewards)
                 ep_rewards += reward
                 self.memory.done_seq.append(torch.from_numpy(done).to(device))
                 reward_seq_raw_np.append(np.asarray(reward, dtype=np.float32))

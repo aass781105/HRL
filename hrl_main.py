@@ -2,10 +2,11 @@ import os
 import time
 import copy
 import csv
+import itertools
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from typing import Callable, Optional, Dict, List
+from typing import Callable, Optional, Dict, List, Iterable, Mapping
 
 from params import configs
 from common_utils import *
@@ -27,6 +28,101 @@ def _mean_std(values: List[float]):
     if arr.size == 0:
         return 0.0, 0.0
     return float(arr.mean()), float(arr.std(ddof=0))
+
+
+def _stability_op_key(row: Mapping[str, object]):
+    """Return the stable operation identity used for release comparisons."""
+    return int(row["job"]), int(row["op"])
+
+
+def _future_schedule_rows(
+    rows: Iterable[Mapping[str, object]],
+    sim_time: float,
+) -> List[dict]:
+    """Keep only operations that have not started at the reschedule time."""
+    return [
+        dict(row)
+        for row in rows
+        if float(row["start"]) > float(sim_time)
+    ]
+
+
+def _schedule_sequence_by_machine(
+    rows: Iterable[Mapping[str, object]],
+) -> Dict[int, List[tuple]]:
+    grouped: Dict[int, List[dict]] = {}
+    for row in rows:
+        grouped.setdefault(int(row["machine"]), []).append(dict(row))
+    return {
+        machine: [
+            _stability_op_key(row)
+            for row in sorted(
+                machine_rows,
+                key=lambda item: (
+                    float(item["start"]),
+                    float(item["end"]),
+                    int(item["job"]),
+                    int(item["op"]),
+                ),
+            )
+        ]
+        for machine, machine_rows in grouped.items()
+    }
+
+
+def compute_dynamic_stability_counts(
+    before_rows: Iterable[Mapping[str, object]],
+    after_rows: Iterable[Mapping[str, object]],
+    sim_time: float,
+) -> Dict[str, int]:
+    """Compute old-operation machine changes and pair flips at one release.
+
+    The reference set follows the stability definition in
+    ``analysis/robust_lower_ppo_training_plan.md``: only operations that are
+    present before and after the release and start strictly after ``sim_time``
+    are compared. Operations that change machines count as machine changes and
+    are excluded from same-machine pair-flip comparisons.
+    """
+    before = _future_schedule_rows(before_rows, sim_time)
+    after = _future_schedule_rows(after_rows, sim_time)
+    before_map = {_stability_op_key(row): row for row in before}
+    after_map = {_stability_op_key(row): row for row in after}
+    common_keys = set(before_map) & set(after_map)
+
+    machine_change_count = sum(
+        int(after_map[key]["machine"]) != int(before_map[key]["machine"])
+        for key in common_keys
+    )
+
+    before_sequences = _schedule_sequence_by_machine(before)
+    after_sequences = _schedule_sequence_by_machine(after)
+    pair_flip_count = 0
+    for machine in sorted(set(before_sequences) | set(after_sequences)):
+        before_sequence = before_sequences.get(machine, [])
+        after_position = {
+            key: index
+            for index, key in enumerate(after_sequences.get(machine, []))
+        }
+        comparable = [
+            key
+            for key in before_sequence
+            if key in common_keys
+            and int(after_map[key]["machine"]) == machine
+            and key in after_position
+        ]
+        before_position = {
+            key: index for index, key in enumerate(before_sequence)
+        }
+        for first, second in itertools.combinations(comparable, 2):
+            before_delta = before_position[first] - before_position[second]
+            after_delta = after_position[first] - after_position[second]
+            if before_delta * after_delta < 0:
+                pair_flip_count += 1
+
+    return {
+        "pair_flip_count": int(pair_flip_count),
+        "machine_change_count": int(machine_change_count),
+    }
 
 
 def run_event_driven_until_nevents(
@@ -336,6 +432,8 @@ def run_event_driven_until_nevents(
             "Repeated_Job_Count",
             "Repeated_Job_IDs",
             "Solve_Time_Sec",
+            "Pair_Flip_Count",
+            "Machine_Change_Count",
         ])
 
     release_count, plot_seq = 0, 0
@@ -347,6 +445,8 @@ def run_event_driven_until_nevents(
     total_r_shape = 0.0
     total_r_td = 0.0
     total_r_mk = 0.0
+    total_pair_flip_count = 0
+    total_machine_change_count = 0
     baseline_cadence = int(getattr(
         configs,
         "baseline_cadence",
@@ -534,7 +634,14 @@ def run_event_driven_until_nevents(
             info["objective_value"] = 0.5 * info["makespan"] + 0.5 * info["total_tardiness"]
         return info
 
-    def write_release_log(event_id: int, release_type: str, release_time: float, rows, solve_time: float = 0.0) -> None:
+    def write_release_log(
+        event_id: int,
+        release_type: str,
+        release_time: float,
+        rows,
+        solve_time: float = 0.0,
+        stability_counts: Optional[Dict[str, int]] = None,
+    ) -> None:
         nonlocal previous_release_job_ids
         if not write_outputs:
             return
@@ -558,6 +665,8 @@ def run_event_driven_until_nevents(
             len(repeated_job_ids),
             ";".join(str(job_id) for job_id in repeated_job_ids),
             f"{solve_time:.6f}",
+            "" if stability_counts is None else int(stability_counts["pair_flip_count"]),
+            "" if stability_counts is None else int(stability_counts["machine_change_count"]),
         ])
         previous_release_job_ids = current_job_ids
 
@@ -690,19 +799,29 @@ def run_event_driven_until_nevents(
             solve_time = time.perf_counter() - t_start
             release_count += 1
             gate_release_count += 1
+            after_plan_rows = [dict(row) for row in orch._last_full_rows]
+            stability_counts = compute_dynamic_stability_counts(
+                before_plan_rows,
+                after_plan_rows,
+                t_now,
+            )
+            total_pair_flip_count += stability_counts["pair_flip_count"]
+            total_machine_change_count += stability_counts["machine_change_count"]
             if reschedule_observer is not None:
                 reschedule_observer(
                     {
                         "event_id": int(stats["arrive"]),
                         "sim_time": float(t_now),
                         "before_rows": before_plan_rows,
-                        "after_rows": [dict(row) for row in orch._last_full_rows],
+                        "after_rows": after_plan_rows,
                         "buffer_job_ids_before": buffer_job_ids_before,
                         "wip_job_ids_before": wip_job_ids_before,
                         "release_jobs_count": int(release_result.get("jobs_count", 0)),
                         "release_operations_count": int(release_result.get("operations_count", 0)),
                         "sub_makespan": float(release_result.get("sub_makespan", 0.0)),
                         "sub_tardiness": float(release_result.get("sub_tardiness", 0.0)),
+                        "pair_flip_count": stability_counts["pair_flip_count"],
+                        "machine_change_count": stability_counts["machine_change_count"],
                     }
                 )
             if release_result.get("event") == "batch_finalized":
@@ -711,7 +830,14 @@ def run_event_driven_until_nevents(
                     f"Operations={release_result['operations_count']} | K={release_result['K']} | "
                     f"MK={release_result['sub_makespan']:.2f} | TD={release_result['sub_tardiness']:.2f} | SolveTime={solve_time:.3f}s"
                 )
-            write_release_log(int(stats["arrive"]), "EVENT", t_now, release_result.get("rows", getattr(orch, "last_batch_rows", [])), solve_time)
+            write_release_log(
+                int(stats["arrive"]),
+                "EVENT",
+                t_now,
+                release_result.get("rows", getattr(orch, "last_batch_rows", [])),
+                solve_time,
+                stability_counts,
+            )
             steps_since_last_release = 0
             collect_subproblem_stats(orch._committed_jobs, t_now) # [STATS: DYNAMIC SUBPROBLEM]
             actual_td_after = orch.get_total_tardiness_estimate(all_job_due_dates)
@@ -940,8 +1066,9 @@ def run_event_driven_until_nevents(
             "",
             "",
             "",
-            "Total_Simulation_Time_Sec",
-            f"{simulation_elapsed:.6f}"
+            f"{simulation_elapsed:.6f}",
+            int(total_pair_flip_count),
+            int(total_machine_change_count),
         ])
         write_env_job_info_csv()
         raw_csv_file.close()
@@ -951,7 +1078,9 @@ def run_event_driven_until_nevents(
         "release_count": release_count,
         "total_tardiness": total_td,
         "output_dir": csv_dir,
-        "elapsed_time_sec": simulation_elapsed
+        "elapsed_time_sec": simulation_elapsed,
+        "pair_flip_count": int(total_pair_flip_count),
+        "machine_change_count": int(total_machine_change_count),
     }
 
 def main():
@@ -979,6 +1108,8 @@ def main():
     tardiness_values: List[float] = []
     release_counts: List[float] = []
     elapsed_times: List[float] = []
+    pair_flip_counts: List[float] = []
+    machine_change_counts: List[float] = []
     run_records = []
     output_dir = None
     stats = None
@@ -1009,6 +1140,8 @@ def main():
             tardiness_values.append(float(stats["total_tardiness"]))
             release_counts.append(float(stats["release_count"]))
             elapsed_times.append(float(stats["elapsed_time_sec"]))
+            pair_flip_counts.append(float(stats["pair_flip_count"]))
+            machine_change_counts.append(float(stats["machine_change_count"]))
             obj = 0.5 * float(mk) + 0.5 * float(stats["total_tardiness"])
             run_records.append({
                 "run": run_idx + 1,
@@ -1021,6 +1154,8 @@ def main():
                 "obj": obj,
                 "release_count": int(stats["release_count"]),
                 "elapsed_time_sec": float(stats["elapsed_time_sec"]),
+                "pair_flip_count": int(stats["pair_flip_count"]),
+                "machine_change_count": int(stats["machine_change_count"]),
             })
             if obj < best_obj:
                 best_obj = obj
@@ -1030,6 +1165,7 @@ def main():
                 f"Run {run_idx + 1:02d}/{eval_runs} env_seed={base_seed} sample_seed={sample_seed} | "
                 f"MK={float(mk):.3f}, TD={float(stats['total_tardiness']):.3f}, "
                 f"Releases={int(stats['release_count'])}, "
+                f"Flip={int(stats['pair_flip_count'])}, MCh={int(stats['machine_change_count'])}, "
                 f"Elapsed={float(stats['elapsed_time_sec']):.3f}s"
             )
 
@@ -1066,6 +1202,8 @@ def main():
     obj_mean, obj_std = _mean_std(obj_values)
     release_mean, release_std = _mean_std(release_counts)
     elapsed_mean, elapsed_std = _mean_std(elapsed_times)
+    pair_flip_mean, pair_flip_std = _mean_std(pair_flip_counts)
+    machine_change_mean, machine_change_std = _mean_std(machine_change_counts)
     elapsed_total = sum(elapsed_times)
     if output_dir is None:
         output_dir = plot_dir
@@ -1076,7 +1214,8 @@ def main():
             f,
             fieldnames=[
                 "run", "ppo_model_name", "ppo_model_path", "env_seed", "sample_seed",
-                "makespan", "total_tardiness", "obj", "release_count", "elapsed_time_sec"
+                "makespan", "total_tardiness", "obj", "release_count", "elapsed_time_sec",
+                "pair_flip_count", "machine_change_count",
             ],
         )
         writer.writeheader()
@@ -1092,6 +1231,8 @@ def main():
                 "obj": f"{row['obj']:.6f}",
                 "release_count": row["release_count"],
                 "elapsed_time_sec": f"{row['elapsed_time_sec']:.6f}",
+                "pair_flip_count": row["pair_flip_count"],
+                "machine_change_count": row["machine_change_count"],
             })
         writer.writerow({
             "run": "mean",
@@ -1104,6 +1245,8 @@ def main():
             "obj": f"{obj_mean:.6f}",
             "release_count": f"{release_mean:.6f}",
             "elapsed_time_sec": f"{elapsed_mean:.6f}",
+            "pair_flip_count": f"{pair_flip_mean:.6f}",
+            "machine_change_count": f"{machine_change_mean:.6f}",
         })
         writer.writerow({
             "run": "std",
@@ -1116,6 +1259,8 @@ def main():
             "obj": f"{obj_std:.6f}",
             "release_count": f"{release_std:.6f}",
             "elapsed_time_sec": f"{elapsed_std:.6f}",
+            "pair_flip_count": f"{pair_flip_std:.6f}",
+            "machine_change_count": f"{machine_change_std:.6f}",
         })
         writer.writerow({
             "run": "total",
@@ -1128,6 +1273,8 @@ def main():
             "obj": "",
             "release_count": f"{sum(release_counts):.6f}",
             "elapsed_time_sec": f"{elapsed_total:.6f}",
+            "pair_flip_count": f"{sum(pair_flip_counts):.6f}",
+            "machine_change_count": f"{sum(machine_change_counts):.6f}",
         })
     print(
         f"\nSample x{eval_runs} | "
@@ -1135,6 +1282,8 @@ def main():
         f"TD mean/std: {td_mean:.3f}/{td_std:.3f}, "
         f"Obj mean/std: {obj_mean:.3f}/{obj_std:.3f}, "
         f"Releases mean/std: {release_mean:.3f}/{release_std:.3f}, "
+        f"Flip mean/std: {pair_flip_mean:.3f}/{pair_flip_std:.3f}, "
+        f"MCh mean/std: {machine_change_mean:.3f}/{machine_change_std:.3f}, "
         f"Elapsed total: {elapsed_total:.3f}s (mean/std: {elapsed_mean:.3f}/{elapsed_std:.3f}s)"
     )
     print(f"Sample run CSV: {sample_csv_path}")

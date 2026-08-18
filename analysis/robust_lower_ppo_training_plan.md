@@ -1,5 +1,27 @@
 # Robust Lower-Level PPO Training Plan
 
+## 0. Current Scope Boundary (Confirmed)
+
+The current discussion and implementation plan are limited to the lower-level
+static PPO scheduler. The training samples may be Fresh static instances or
+static rescheduling subproblems constructed from a virtual cut, but the
+high-level release policy is not part of this stage.
+
+The following are explicitly out of scope for the current lower-level design:
+
+```text
+high-level PPO training
+release/hold action selection
+cadence policy
+dynamic event timing
+high-level reward components
+```
+
+The old lower-level policy is used only as a frozen reference-policy generator
+for the old schedule. It is not the high-level policy and it is not being
+optimized in this stage. Objective and reward decisions below therefore refer
+only to the lower-level static scheduling problem.
+
 ## 1. Training Goal
 
 The lower-level PPO should continue optimizing:
@@ -204,9 +226,95 @@ Robust stability quantities to track:
     pair_flip_rate
 ```
 
-The exact scalar objective, coefficient values, reward assignment, and whether raw pair-flip count should receive a direct objective weight are not finalized yet.
+The first lower-level stability-reward trial is now defined below. These are
+initial calibration values, not final claims about the best objective.
 
 Raw `pair_flip_count` should not be combined with Makespan and Tardiness using equal weights because its scale is affected strongly by the number of comparable pairs.
+
+### 8.1 Lower-Level-Only Decision Scope (Confirmed)
+
+The following decisions apply only to lower-level static PPO training. They are
+not high-level release-policy decisions:
+
+```text
+primary stability quantity: absolute count, not rate
+reward assignment: charge only the newly created violations at the current step
+accumulation: sum those step-level increments over the episode
+flip coefficient: 1
+machine-change coefficient: 3
+stability reward placement: before the existing final /10 reward scaling
+stability status: included in the lower-level optimization objective
+```
+
+These decisions must not be conflated with high-level release decisions. No
+high-level state, cadence variable, release count, or high-level reward is
+required to resolve the current lower-level objective/reward design.
+
+### 8.2 Initial Stability Reward Trial (Confirmed)
+
+The first trial uses the confirmed schedule-level count definitions and applies
+the penalty immediately when the selected operation creates a new, measurable
+stability violation:
+
+```text
+flip_increment_t = number of newly finalized pair flips caused by action t
+machine_change_increment_t = 1 when action t changes a retained old operation's
+                             machine assignment, otherwise 0
+
+r_stability_t = -(1 * flip_increment_t
+                  + 3 * machine_change_increment_t) / 10
+```
+
+The increments must be used instead of cumulative counts. A cumulative
+`flip_count` or `machine_change_count` must not be charged again at every later
+step. New jobs and operations without a reference schedule do not receive a
+stability penalty. An operation moved to another machine is counted as a
+machine change and is excluded from pair-flip counting, as defined above.
+
+The initial coefficients were calibrated from the lower-level stability audit:
+
+> These MK/TD reward values are legacy rough estimates from the pre-correction
+> diagnostic log. They are retained only as historical context and are not used
+> by the new fine-tuning script. The new script uses the actual reward
+> composition in `ll_fjsp_env.py`; final calibration remains an open item.
+
+```text
+mean final MK reward estimate       = -45.7
+mean final TD reward estimate       = -27.1
+mean flip count                     = 61.6
+mean machine-change count           = 19.1
+
+mean initial stability penalty      = -(1*61.6 + 3*19.1) / 10
+                                    = approximately -11.9
+```
+
+This gives an approximate first-trial reward composition of:
+
+```text
+MK          54%
+TD          32%
+stability   14%
+```
+
+The values are an initial scale calibration for the current test distribution.
+They must be rechecked after training because policy changes can change the
+number of newly created violations.
+
+## Stability sample schedule
+
+The stability fine-tuning script uses the two curriculum hold parameters:
+
+```text
+ll_mixed_size_hold_updates = 60
+ll_due_setting_hold_updates = 20
+```
+
+One 60-update size block samples `target_jobs` once, then trains three due
+settings in order: 20 updates of `range3_loose`, 20 updates of
+`range3_mixed`, and 20 updates of `range3_tight`. A new target job count is
+sampled only when the next 60-update block begins. The configuration is
+validated so that `ll_mixed_size_hold_updates == 3 *
+ll_due_setting_hold_updates`.
 
 ## 9. Stability State Design
 
@@ -492,15 +600,25 @@ ref_mask = 0 or same_old_machine = 0
 ```
 
 The append inversion signal is a pair-level feature because the value can
-change with the candidate machine. Its semantic value is a count; for neural
-network input, `log1p(append_inversion_count)` may be used to reduce scale
-differences across problem sizes without converting it into a rate.
+change with the candidate machine. Its semantic value remains the raw count,
+but the value fed into the neural network is **defined** as:
+
+```text
+append_inversion_input = log1p(append_inversion_count)
+```
+
+This preserves zero as zero and preserves the ordering of inversion severity,
+while reducing scale differences across problem sizes without converting the
+signal into a rate. The raw `append_inversion_count` remains available for
+diagnostics and objective analysis.
 
 The current minimal stability state direction is therefore:
 
 ```text
+is_new_job
 ref_mask
 same_old_machine
+machine_change_flag
 old_rank_norm
 log1p(append_inversion_count)
 ```
@@ -510,7 +628,162 @@ log1p(append_inversion_count)
 final values depend on future append actions and they overlap with the
 immediate inversion signal.
 
-### 9.11 Critic Pair-State Handling (Unresolved)
+### 9.10.1 New-job and Machine-change Disambiguation (Confirmed)
+
+`is_new_job` is added as an explicit candidate-level feature. It identifies
+whether the candidate operation belongs to a job introduced after the old
+reference schedule was created. All candidate operations belonging to the
+same new job receive `is_new_job = 1`. History and completed operations are
+not candidates and therefore do not need this feature in the action state.
+
+`ref_mask` and `same_old_machine` remain separate from `is_new_job`. They
+describe reference availability and machine comparability, not job origin.
+An explicit `machine_change_flag` is also included instead of requiring the
+network to infer it from multiple fields:
+
+```text
+machine_change_flag = 1
+    if ref_mask = 1 and candidate_machine != old_machine
+
+machine_change_flag = 0
+    otherwise
+```
+
+The confirmed candidate-state combinations are:
+
+| Candidate condition | `is_new_job` | `ref_mask` | `same_old_machine` | `machine_change_flag` |
+|---|---:|---:|---:|---:|
+| New job | 1 | 0 | 0 | 0 |
+| Retained old operation on its old machine | 0 | 1 | 1 | 0 |
+| Retained old operation moved to another machine | 0 | 1 | 0 | 1 |
+| Old operation without a valid reference | 0 | 0 | 0 | 0 |
+
+This prevents a new job with no old reference from being confused with an old
+job that deliberately changes machine. A zero `same_old_machine` value must
+not be interpreted by itself; `ref_mask` and `is_new_job` are required to
+interpret its meaning.
+
+The numerical rules are:
+
+```text
+is_new_job, ref_mask, same_old_machine, machine_change_flag: binary values
+old_rank_norm: valid only when ref_mask = 1 and same_old_machine = 1
+log1p(append_inversion_count): valid only for comparable same-machine pairs
+```
+
+When a reference is unavailable, `old_rank_norm` and the inversion input may
+use a neutral numeric value such as zero, but the corresponding mask must be
+present so that zero is not interpreted as a confirmed stable comparison.
+Machine changes are counted separately and are not converted into pair flips.
+
+`is_new_job` is informative in Reschedule mode. In Fresh mode, where every job
+is newly generated, it is constant and therefore does not provide useful
+discrimination. It must not directly grant a reward or penalty; it only
+identifies the origin of the candidate operation.
+
+### 9.10.2 Stability-State Placement (Confirmed Direction)
+
+The placement rule is based on whether a feature changes when the candidate
+machine changes. Features that describe the operation/job itself belong to the
+operation feature stack. Features that describe a specific operation-machine
+candidate belong to the pair feature stack.
+
+The recommended first implementation is:
+
+```text
+operation features:
+    existing 20 operation features
+    + is_new_job
+    + ref_mask
+    = 22 dimensions
+
+pair features:
+    existing 8 pair features
+    + same_old_machine
+    + machine_change_flag
+    + old_rank_norm
+    + log1p(append_inversion_count)
+    = 12 dimensions
+```
+
+`is_new_job` and `ref_mask` are shared by all candidate machines of the same
+operation, so putting them in `op_fea` avoids duplicating the same information
+for every operation-machine pair. `same_old_machine`,
+`machine_change_flag`, `old_rank_norm`, and
+`log1p(append_inversion_count)` can change with the candidate machine and must
+remain available to the actor at pair-scoring time.
+
+With the current actor structure, the selected operation embedding carries
+the operation-level stability features and the pair branch carries the
+candidate-specific features:
+
+```text
+actor input:
+    selected operation embedding
+    + selected machine embedding
+    + global operation embedding
+    + global machine embedding
+    + pair features
+```
+
+The critic should not receive the raw pair matrix directly. It can see the
+operation-level features through the operation embedding and may later receive
+aggregated candidate-set summaries such as:
+
+```text
+legal_machine_change_count
+legal_nonzero_inversion_count
+maximum inversion pressure
+mean inversion pressure
+new-job candidate ratio
+```
+
+Those summaries are separate critic inputs and are not part of the actor pair
+feature vector in this first placement decision.
+
+### 9.10.3 Stability-State Numerical Handling (Confirmed)
+
+Stability features must not all pass through the existing continuous-feature
+normalization path. Their numerical treatment is fixed by semantic type:
+
+```text
+is_new_job          -> binary 0/1; no z-score
+ref_mask            -> binary 0/1; no z-score
+same_old_machine    -> binary 0/1; no z-score
+machine_change_flag -> binary 0/1; no z-score
+
+old_rank_norm       -> retain the [0, 1] normalization; no additional z-score
+
+append_inversion_count
+                    -> log1p before neural-network input; retain non-negative
+                       meaning and do not convert it into a rate
+```
+
+The raw `append_inversion_count` remains available for diagnostics and
+objective calculation. The `log1p` transformation applies only to the value
+fed to the neural network.
+
+When these features are implemented, the normalization code must use explicit
+feature definitions or explicit protected-index lists. Broad positional slices
+such as `features[:, 1:10]` must not be allowed to accidentally normalize a
+new binary feature after the input dimension changes.
+
+The state audit must verify all of the following:
+
+```text
+binary stability features contain only 0 or 1
+old_rank_norm is always within [0, 1]
+log1p(append_inversion_count) is always >= 0
+all feature tensors are finite; no NaN or Inf
+feature-index changes do not alter the normalization of existing features
+ref_mask = 0 is not interpreted as a confirmed stable comparison
+```
+
+Neutral values used when a reference is unavailable must always be interpreted
+together with the corresponding mask. A neutral zero is not evidence that the
+candidate is stable.
+
+### 9.11 Critic Pair-State Handling (Confirmed First Version)
 
 The current lower-level network does not pass pair features directly to the
 critic:
@@ -524,21 +797,179 @@ Therefore `append_inversion_log` is currently an actor-side, action-specific
 feature. The critic continues to estimate `V(s)` from state-level operation
 and machine information rather than from one selected operation-machine pair.
 
-If stability terms are later included in the reward, the critic may need a
-state-level summary of the available stability difficulty, for example:
+For the first stability-aware critic version, the critic receives a masked
+summary of the legal candidate set. The raw pair matrix is not passed to the
+critic. The summary uses these six scalar features:
 
 ```text
-mean legal-pair inversion pressure
-minimum legal-pair inversion pressure
-legal-pair inversion q25
-machine-change pressure
+log1p(legal_pair_count)
+new_job_pair_ratio
+machine_change_pair_ratio
+comparable_pair_ratio
+log1p(inversion_sum)
+log1p(inversion_max)
 ```
 
-The exact critic design is not finalized. Possible future changes include
-adding aggregated pair summaries to the critic input or redesigning the value
-estimator, but the current PPO critic should not receive the raw pair matrix
-directly. This section is a provisional design and may be revised after
-stability-reward experiments.
+These six values are directly concatenated with the existing global operation
+and global machine embeddings:
+
+```text
+critic_input = concat(
+    global_operation_embedding,
+    global_machine_embedding,
+    stability_summary
+)
+```
+
+No additional summary projection is used in the first version. With the
+current default embedding size of 64, the critic input size is:
+
+```text
+64 + 64 + 6 = 134
+```
+
+More generally:
+
+```text
+critic_input_dim = 2 * embedding_output_dim + 6
+```
+
+The six summary values are state-level information about available actions;
+they are not post-action rewards and do not reveal which action will be
+selected. Count-like values use the confirmed `log1p` input transformation,
+while ratios remain in their bounded range. The summary is computed only over
+legal candidates, with the comparable-pair mask applied to inversion
+statistics.
+
+If a later ablation shows that direct concatenation is insufficient, a small
+summary projection may be tested separately. It is not part of the first
+version and must not be introduced together with other architecture changes.
+
+### 9.12 Coexistence of Reference and Trainable Policies (Confirmed)
+
+The stability fine-tuning process must keep two lower-level PPO policies
+alive at the same time. They have different roles and must not share the same
+optimizer or update path:
+
+```text
+reference_policy:
+    load the old lower-level checkpoint
+    generate the old/reference schedule
+    frozen; inference only
+
+train_policy:
+    use the new stability-aware state
+    solve the rescheduling problem
+    trainable; the only policy updated by PPO
+```
+
+The reference policy is not a second trainable agent and its schedule is not
+an action target that the new policy must copy. It provides the fixed old
+schedule needed to calculate machine-change and order-stability information.
+The new policy is allowed to choose a different schedule and is optimized by
+the final scheduling objective plus any confirmed stability terms.
+
+#### 9.12.1 Required episode data flow
+
+Each reschedule training sample follows this order:
+
+```text
+1. Generate the complete base instance.
+2. Run reference_policy on the base instance.
+3. Save the reference schedule: machine, operation order, start/end times,
+   and the old-operation identity mapping.
+4. Select the virtual cut and perform the remove/add operation.
+5. Rebase the rescheduling problem to time zero using the existing protocol.
+6. Build the new stability-aware state from the fixed reference schedule.
+7. Run train_policy on the rescheduling problem and collect PPO data.
+8. Update train_policy only.
+```
+
+The reference schedule must be captured before the reschedule transformation.
+After the virtual cut, history and completed operations are excluded from new
+decisions, while the retained future operations keep their old reference
+information. New operations have no old reference and receive the confirmed
+`ref_mask = 0` handling.
+
+The reference policy should use deterministic/greedy inference for the first
+version. This keeps the old schedule reproducible for a fixed instance seed.
+If sampling is intentionally used later, the sample seed and inference mode
+must be recorded because they change the reference schedule itself.
+
+#### 9.12.2 Separate model instances and checkpoints
+
+The two policies are separate model instances, even when they use the same
+Python model class:
+
+```text
+reference_policy = PPO(old_config)
+train_policy     = PPO(new_config)
+```
+
+The reference policy must satisfy all of the following:
+
+```text
+reference_policy.eval()
+inference under no_grad()
+parameters excluded from the train optimizer
+no optimizer state shared with train_policy
+```
+
+The train policy remains in training mode and only its parameters are passed
+to the PPO optimizer. The two checkpoint paths must remain separate. Saving a
+new checkpoint must never overwrite the old reference checkpoint.
+
+#### 9.12.3 Different input dimensions are allowed
+
+The old and new policies do not need to have identical input dimensions. The
+current lower-level model has 20 operation features and eight pair features.
+With the confirmed placement, two stability features are added to the
+operation input and four are added to the pair input:
+
+```text
+old reference policy:  op_fea_dim = 20, pair_fea_dim = 8
+new train policy:      op_fea_dim = 22, pair_fea_dim = 12
+```
+
+In this case, the old checkpoint must be loaded only into the old reference
+policy. It must not be loaded directly into the new model because the actor
+input layer has a different shape. The new model may later use an explicit
+partial-weight migration or a projection layer, but that is a separate
+initialization decision and must not be confused with running both policies
+simultaneously.
+
+The environment or data pipeline must therefore support two feature views:
+
+```text
+old feature view -> reference_policy
+new stability-aware feature view -> train_policy
+```
+
+The old policy must not receive the new stability features, and the new policy
+must not silently receive an old feature vector with missing dimensions.
+
+#### 9.12.4 Efficiency and reproducibility
+
+Running the reference policy for every training sample is correct but may be
+expensive. The complete reference schedule can be generated once and cached
+using an instance/configuration/seed identifier. The cache must include the
+reference policy checkpoint identity and inference mode so that an old
+schedule generated under a different policy is not reused accidentally.
+
+The minimum audit information for each sample is:
+
+```text
+instance seed
+reference checkpoint
+reference inference mode
+virtual cut time
+retained old-operation mapping
+new-operation identifiers
+```
+
+This dual-policy design is compatible with both Fresh and Reschedule samples.
+Fresh samples may bypass the reference-policy stage because they have no old
+schedule; Reschedule samples must use the full reference-policy flow above.
 
 ## 10. Training Data Mixing (Confirmed)
 

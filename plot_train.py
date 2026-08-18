@@ -1,7 +1,16 @@
 # plot_train.py
-import json, ast, re, os
+import os, sys
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+import json, ast, re
 from pathlib import Path
 from typing import List, Tuple, Union
+
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 import matplotlib.pyplot as plt
 import numpy as np
 from params import configs
@@ -476,7 +485,7 @@ def plot_training_diagnostics(loss_data, output_path: Path, core_name: str):
     plt.close(fig)
     print(f"✅ Diagnostics plot saved: {output_path}")
 
-def main():
+def legacy_main():
     # 1. Construct dynamic log name
     model_name = configs.eval_model_name
     # Use configured training size for log suffix (e.g., 30x5).
@@ -655,6 +664,444 @@ def main():
     if loss_data:
         diag_path = out_dir / f"diagnostics_{CORE_NAME}.png"
         plot_training_diagnostics(loss_data, diag_path, CORE_NAME)
+
+
+def parse_stability_reward_log(reward_file: Path):
+    """
+    Parses reward_*.txt for stability fine-tuning runs.
+    Extracts step-level loss, reward, shares, and train metrics.
+    """
+    if not reward_file.exists():
+        return None
+    
+    updates = []
+    rewards = []
+    losses = []
+    v_losses = []
+    mk_shares = []
+    td_shares = []
+    od_shares = []
+    flip_shares = []
+    mchg_shares = []
+    train_mks = []
+    train_tds = []
+    train_flips = []
+    train_flip_rates = []
+    train_mchs = []
+    train_mch_rates = []
+
+    pattern = re.compile(
+        r"Update\s+(\d+)/\d+\s+\|\s+R:\s*([-\d.]+)\s+\|\s+Loss:\s*([-\d.]+)\s+\|\s+V-Loss:\s*([-\d.]+)\s+\|\s+"
+        r"MK_r:\s*([-\d.]+)%\s+\|\s+TD_r:\s*([-\d.]+)%\s+\|\s+OD_r:\s*([-\d.]+)%\s+\|\s+"
+        r"FlipR:\s*([-\d.]+)%\s+\|\s+MChgR:\s*([-\d.]+)%\s+\|\s+"
+        r"Train MK:\s*([-\d.]+)\s+\|\s+Train TD:\s*([-\d.]+)\s+\|\s+"
+        r"Flip:\s*([-\d.]+)\s*\(\s*([-\d.]+)%\)\s+\|\s+"
+        r"MChg:\s*([-\d.]+)\s*\(\s*([-\d.]+)%\)"
+    )
+
+    with open(reward_file, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            m = pattern.search(line)
+            if m:
+                u, r, l, vl, mkr, tdr, odr, fr, mr, t_mk, t_td, t_flip, t_frate, t_mch, t_mrate = m.groups()
+                updates.append(int(u))
+                rewards.append(float(r))
+                losses.append(float(l))
+                v_losses.append(float(vl))
+                mk_shares.append(float(mkr))
+                td_shares.append(float(tdr))
+                od_shares.append(float(odr))
+                flip_shares.append(float(fr))
+                mchg_shares.append(float(mr))
+                train_mks.append(float(t_mk))
+                train_tds.append(float(t_td))
+                train_flips.append(float(t_flip))
+                train_flip_rates.append(float(t_frate))
+                train_mchs.append(float(t_mch))
+                train_mch_rates.append(float(t_mrate))
+
+    if not updates:
+        return None
+
+    return {
+        "updates": np.array(updates),
+        "rewards": np.array(rewards),
+        "losses": np.array(losses),
+        "v_losses": np.array(v_losses),
+        "mk_shares": np.array(mk_shares),
+        "td_shares": np.array(td_shares),
+        "od_shares": np.array(od_shares),
+        "flip_shares": np.array(flip_shares),
+        "mchg_shares": np.array(mchg_shares),
+        "train_mks": np.array(train_mks),
+        "train_tds": np.array(train_tds),
+        "train_flips": np.array(train_flips),
+        "train_flip_rates": np.array(train_flip_rates),
+        "train_mchs": np.array(train_mchs),
+        "train_mch_rates": np.array(train_mch_rates),
+    }
+
+
+def parse_stability_detailed_log(detailed_file: Path):
+    """
+    Parses detailed_reward_*.txt for stability fine-tuning runs.
+    Extracts validation group data and computes per-update means.
+    """
+    if not detailed_file.exists():
+        return None
+
+    val_by_update = {}
+    with open(detailed_file, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("validation_group="):
+                parts = dict(p.split("=", 1) for p in line.split(",") if "=" in p)
+                try:
+                    u = int(parts.get("update", 0))
+                    if u not in val_by_update:
+                        val_by_update[u] = []
+                    val_by_update[u].append({
+                        "group": parts.get("validation_group"),
+                        "mk": float(parts.get("mk", 0.0)),
+                        "td": float(parts.get("td", 0.0)),
+                        "obj": float(parts.get("obj", 0.0)),
+                        "flip": float(parts.get("flip", 0.0)),
+                        "flip_rate": float(parts.get("flip_rate", 0.0)) * 100.0,
+                        "mch": float(parts.get("machine_change", 0.0)),
+                        "mch_rate": float(parts.get("machine_change_rate", 0.0)) * 100.0,
+                    })
+                except Exception:
+                    continue
+
+    if not val_by_update:
+        return None
+
+    sorted_updates = sorted(val_by_update.keys())
+    val_data = {
+        "updates": np.array(sorted_updates),
+        "val_mks": np.array([np.mean([x["mk"] for x in val_by_update[u]]) for u in sorted_updates]),
+        "val_tds": np.array([np.mean([x["td"] for x in val_by_update[u]]) for u in sorted_updates]),
+        "val_objs": np.array([np.mean([x["obj"] for x in val_by_update[u]]) for u in sorted_updates]),
+        "val_flips": np.array([np.mean([x["flip"] for x in val_by_update[u]]) for u in sorted_updates]),
+        "val_flip_rates": np.array([np.mean([x["flip_rate"] for x in val_by_update[u]]) for u in sorted_updates]),
+        "val_mchs": np.array([np.mean([x["mch"] for x in val_by_update[u]]) for u in sorted_updates]),
+        "val_mch_rates": np.array([np.mean([x["mch_rate"] for x in val_by_update[u]]) for u in sorted_updates]),
+    }
+    return val_data
+
+
+def plot_stability_finetune_results(model_name: str = None, log_dir: Path = None, output_dir: Path = None):
+    """
+    Plots the full 8-subplot training & validation analysis for a stability fine-tuning run.
+    """
+    if log_dir is None:
+        log_dir = Path(lower_level_log_dir())
+    if output_dir is None:
+        output_dir = Path(lower_level_plot_dir())
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if model_name is None:
+        model_name = getattr(configs, "eval_model_name", "ll_stability_finetune_ptscale")
+
+    reward_file = log_dir / f"reward_{model_name}.txt"
+    detailed_file = log_dir / f"detailed_reward_{model_name}.txt"
+
+    train_data = parse_stability_reward_log(reward_file)
+    val_data = parse_stability_detailed_log(detailed_file)
+
+    if train_data is None and val_data is None:
+        print(f"[PLOT] ⚠️ 找不到 {model_name} 的訓練日誌或格式不符，跳過繪圖。")
+        return None
+
+    fig, axes = plt.subplots(4, 2, figsize=(18, 22))
+    fig.suptitle(f"Lower-Level Stability Fine-Tuning Analysis: {model_name}", fontsize=18, fontweight="bold", y=0.99)
+
+    lw = LINE_WIDTH
+
+    # 1. Loss & Value Loss
+    ax = axes[0, 0]
+    ax.set_title("1. Training Loss (PPO Policy Loss & Value Loss)", fontsize=13, fontweight="bold")
+    if train_data:
+        u = train_data["updates"]
+        l1 = ax.plot(u, train_data["losses"], color="#1f77b4", linewidth=lw, label="Policy Loss")
+        ax.set_xlabel("Updates")
+        ax.set_ylabel("Policy Loss", color="#1f77b4")
+        ax.tick_params(axis="y", labelcolor="#1f77b4")
+        ax.grid(True, linestyle="--", alpha=0.5)
+
+        ax_r = ax.twinx()
+        l2 = ax_r.plot(u, train_data["v_losses"], color="#d62728", linewidth=lw, linestyle="--", label="Value Loss (V-Loss)")
+        ax_r.set_ylabel("Value Loss", color="#d62728")
+        ax_r.tick_params(axis="y", labelcolor="#d62728")
+
+        lns = l1 + l2
+        ax.legend(lns, [l.get_label() for l in lns], loc="upper right")
+    else:
+        ax.text(0.5, 0.5, "No Train Data", ha="center", va="center")
+
+    # 2. Total Reward
+    ax = axes[0, 1]
+    ax.set_title("2. Total Reward Convergence", fontsize=13, fontweight="bold")
+    if train_data:
+        ax.plot(train_data["updates"], train_data["rewards"], color="#2ca02c", linewidth=lw, label="Total Reward")
+        ax.set_xlabel("Updates")
+        ax.set_ylabel("Total Reward")
+        ax.grid(True, linestyle="--", alpha=0.5)
+        ax.legend(loc="lower right")
+    else:
+        ax.text(0.5, 0.5, "No Train Data", ha="center", va="center")
+
+    # 3. Reward Components Breakdown (%)
+    ax = axes[1, 0]
+    ax.set_title("3. Individual Reward Shares (%)", fontsize=13, fontweight="bold")
+    if train_data:
+        u = train_data["updates"]
+        ax.plot(u, train_data["mk_shares"], label="MK Gain Share %", color="#1f77b4", linewidth=lw)
+        ax.plot(u, train_data["td_shares"], label="TD Penalty Share %", color="#d62728", linewidth=lw)
+        ax.plot(u, train_data["od_shares"], label="OD Progress Share %", color="#ff7f0e", linewidth=lw)
+        ax.plot(u, train_data["flip_shares"], label="Flip Penalty Share %", color="#9467bd", linewidth=lw)
+        ax.plot(u, train_data["mchg_shares"], label="MChg Penalty Share %", color="#8c564b", linewidth=lw)
+        ax.set_xlabel("Updates")
+        ax.set_ylabel("Reward Component Share (%)")
+        ax.grid(True, linestyle="--", alpha=0.5)
+        ax.legend(loc="upper right", fontsize=9)
+    else:
+        ax.text(0.5, 0.5, "No Train Data", ha="center", va="center")
+
+    # 4. Train MK vs Train TD
+    ax = axes[1, 1]
+    ax.set_title("4. Train Makespan vs. Tardiness", fontsize=13, fontweight="bold")
+    if train_data:
+        u = train_data["updates"]
+        l1 = ax.plot(u, train_data["train_mks"], color="#1f77b4", linewidth=lw, label="Train Makespan")
+        ax.set_xlabel("Updates")
+        ax.set_ylabel("Makespan", color="#1f77b4")
+        ax.tick_params(axis="y", labelcolor="#1f77b4")
+        ax.grid(True, linestyle="--", alpha=0.5)
+
+        ax_r = ax.twinx()
+        l2 = ax_r.plot(u, train_data["train_tds"], color="#ff7f0e", linewidth=lw, linestyle="--", label="Train Tardiness")
+        ax_r.set_ylabel("Tardiness", color="#ff7f0e")
+        ax_r.tick_params(axis="y", labelcolor="#ff7f0e")
+
+        lns = l1 + l2
+        ax.legend(lns, [l.get_label() for l in lns], loc="upper right")
+    else:
+        ax.text(0.5, 0.5, "No Train Data", ha="center", va="center")
+
+    # 5. Train Flip & MChg
+    ax = axes[2, 0]
+    ax.set_title("5. Train Stability: Flips & Machine Changes", fontsize=13, fontweight="bold")
+    if train_data:
+        u = train_data["updates"]
+        l1 = ax.plot(u, train_data["train_flips"], color="#9467bd", linewidth=lw, label="Train Flip Count")
+        ax.set_xlabel("Updates")
+        ax.set_ylabel("Flip Count", color="#9467bd")
+        ax.tick_params(axis="y", labelcolor="#9467bd")
+        ax.grid(True, linestyle="--", alpha=0.5)
+
+        ax_r = ax.twinx()
+        l2 = ax_r.plot(u, train_data["train_mchs"], color="#8c564b", linewidth=lw, linestyle="--", label="Train MChg Count")
+        ax_r.set_ylabel("Machine Change Count", color="#8c564b")
+        ax_r.tick_params(axis="y", labelcolor="#8c564b")
+
+        lns = l1 + l2
+        ax.legend(lns, [l.get_label() for l in lns], loc="upper right")
+    else:
+        ax.text(0.5, 0.5, "No Train Data", ha="center", va="center")
+
+    # 6. Validation MK & TD & Objective
+    ax = axes[2, 1]
+    ax.set_title("6. Validation: MK, TD & Objective (0.5MK+0.5TD)", fontsize=13, fontweight="bold")
+    if val_data:
+        u = val_data["updates"]
+        l1 = ax.plot(u, val_data["val_mks"], color="#2ca02c", marker="o", markersize=3, linewidth=lw, label="Val Makespan")
+        l2 = ax.plot(u, val_data["val_objs"], color="#1f77b4", marker="s", markersize=3, linewidth=lw, linestyle=":", label="Val Obj (0.5MK+0.5TD)")
+        ax.set_xlabel("Validation Updates")
+        ax.set_ylabel("MK / Objective", color="#1f77b4")
+        ax.tick_params(axis="y", labelcolor="#1f77b4")
+        ax.grid(True, linestyle="--", alpha=0.5)
+
+        ax_r = ax.twinx()
+        l3 = ax_r.plot(u, val_data["val_tds"], color="#d62728", marker="^", markersize=3, linewidth=lw, linestyle="--", label="Val Tardiness")
+        ax_r.set_ylabel("Tardiness", color="#d62728")
+        ax_r.tick_params(axis="y", labelcolor="#d62728")
+
+        lns = l1 + l2 + l3
+        ax.legend(lns, [l.get_label() for l in lns], loc="upper right")
+    else:
+        ax.text(0.5, 0.5, "No Validation Data", ha="center", va="center")
+
+    # 7. Validation Flip Count & Rate (%)
+    ax = axes[3, 0]
+    ax.set_title("7. Validation: Sequence Flip Count & Rate (%)", fontsize=13, fontweight="bold")
+    if val_data:
+        u = val_data["updates"]
+        l1 = ax.plot(u, val_data["val_flips"], color="#9467bd", marker="o", markersize=3, linewidth=lw, label="Val Flip Count")
+        ax.set_xlabel("Validation Updates")
+        ax.set_ylabel("Flip Count", color="#9467bd")
+        ax.tick_params(axis="y", labelcolor="#9467bd")
+        ax.grid(True, linestyle="--", alpha=0.5)
+
+        ax_r = ax.twinx()
+        l2 = ax_r.plot(u, val_data["val_flip_rates"], color="#9467bd", marker="x", markersize=3, linewidth=lw, linestyle=":", label="Val Flip Rate (%)")
+        ax_r.set_ylabel("Flip Rate (%)", color="#9467bd")
+        ax_r.tick_params(axis="y", labelcolor="#9467bd")
+
+        lns = l1 + l2
+        ax.legend(lns, [l.get_label() for l in lns], loc="upper right")
+    else:
+        ax.text(0.5, 0.5, "No Validation Data", ha="center", va="center")
+
+    # 8. Validation Machine Change Count & Rate (%)
+    ax = axes[3, 1]
+    ax.set_title("8. Validation: Machine Change Count & Rate (%)", fontsize=13, fontweight="bold")
+    if val_data:
+        u = val_data["updates"]
+        l1 = ax.plot(u, val_data["val_mchs"], color="#8c564b", marker="o", markersize=3, linewidth=lw, label="Val MChg Count")
+        ax.set_xlabel("Validation Updates")
+        ax.set_ylabel("Machine Change Count", color="#8c564b")
+        ax.tick_params(axis="y", labelcolor="#8c564b")
+        ax.grid(True, linestyle="--", alpha=0.5)
+
+        ax_r = ax.twinx()
+        l2 = ax_r.plot(u, val_data["val_mch_rates"], color="#8c564b", marker="x", markersize=3, linewidth=lw, linestyle=":", label="Val MChg Rate (%)")
+        ax_r.set_ylabel("MChg Rate (%)", color="#8c564b")
+        ax_r.tick_params(axis="y", labelcolor="#8c564b")
+
+        lns = l1 + l2
+        ax.legend(lns, [l.get_label() for l in lns], loc="upper right")
+    else:
+        ax.text(0.5, 0.5, "No Validation Data", ha="center", va="center")
+
+    plt.tight_layout(rect=[0, 0.02, 1, 0.97])
+    out_path = output_dir / f"{model_name}_training_summary.png"
+    plt.savefig(out_path, dpi=200)
+    plt.close(fig)
+    print(f"[PLOT] 穩定性訓練視覺化圖表已輸出：{out_path}")
+    return out_path
+
+
+def plot_stability_models_comparison(models: list = None, log_dir: Path = None, output_dir: Path = None):
+    """
+    Plots a multi-model validation comparison chart (MK, TD, Objective, Flip, MChg).
+    """
+    if log_dir is None:
+        log_dir = Path(lower_level_log_dir())
+    if output_dir is None:
+        output_dir = Path(lower_level_plot_dir())
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if models is None:
+        models = [
+            ("flip1_mch3 (ptscale)", "ll_stability_finetune_ptscale", "#1f77b4"),
+            ("flip2_mch3", "ll_stability_finetune_flip2_mch3_ptscale", "#ff7f0e"),
+            ("flip2_mch6", "ll_stability_finetune_flip2_mch6_ptscale", "#2ca02c"),
+            ("flip4_mch6", "ll_stability_finetune_flip4_mch6_ptscale", "#d62728"),
+        ]
+
+    fig, axes = plt.subplots(3, 2, figsize=(16, 16))
+    fig.suptitle("Lower-Level Stability Fine-Tuning: 4 Models Comparison", fontsize=18, fontweight="bold", y=0.99)
+
+    valid_count = 0
+    for label, mname, color in models:
+        detailed_file = log_dir / f"detailed_reward_{mname}.txt"
+        vdata = parse_stability_detailed_log(detailed_file)
+        if not vdata:
+            continue
+        valid_count += 1
+        u = vdata["updates"]
+        lw = 1.8
+
+        # 1. Val Makespan
+        axes[0, 0].plot(u, vdata["val_mks"], label=label, color=color, linewidth=lw)
+        # 2. Val Tardiness
+        axes[0, 1].plot(u, vdata["val_tds"], label=label, color=color, linewidth=lw)
+        # 3. Val Objective
+        axes[1, 0].plot(u, vdata["val_objs"], label=label, color=color, linewidth=lw)
+        # 4. Val Flip Count
+        axes[1, 1].plot(u, vdata["val_flips"], label=label, color=color, linewidth=lw)
+        # 5. Val Machine Change Count
+        axes[2, 0].plot(u, vdata["val_mchs"], label=label, color=color, linewidth=lw)
+        # 6. Val Flip Rate vs MChg Rate (Scatter / End Point)
+        axes[2, 1].plot(u, vdata["val_mch_rates"], label=label, color=color, linewidth=lw)
+
+    if valid_count == 0:
+        plt.close(fig)
+        return None
+
+    axes[0, 0].set_title("Validation Makespan (Lower is Better)", fontsize=12, fontweight="bold")
+    axes[0, 0].set_xlabel("Updates")
+    axes[0, 0].set_ylabel("Makespan")
+    axes[0, 0].grid(True, linestyle="--", alpha=0.5)
+    axes[0, 0].legend()
+
+    axes[0, 1].set_title("Validation Tardiness (Lower is Better)", fontsize=12, fontweight="bold")
+    axes[0, 1].set_xlabel("Updates")
+    axes[0, 1].set_ylabel("Tardiness")
+    axes[0, 1].grid(True, linestyle="--", alpha=0.5)
+    axes[0, 1].legend()
+
+    axes[1, 0].set_title("Validation Objective (0.5*MK + 0.5*TD)", fontsize=12, fontweight="bold")
+    axes[1, 0].set_xlabel("Updates")
+    axes[1, 0].set_ylabel("Objective")
+    axes[1, 0].grid(True, linestyle="--", alpha=0.5)
+    axes[1, 0].legend()
+
+    axes[1, 1].set_title("Validation Sequence Flip Count (Lower is Better)", fontsize=12, fontweight="bold")
+    axes[1, 1].set_xlabel("Updates")
+    axes[1, 1].set_ylabel("Flip Count")
+    axes[1, 1].grid(True, linestyle="--", alpha=0.5)
+    axes[1, 1].legend()
+
+    axes[2, 0].set_title("Validation Machine Change Count (Lower is Better)", fontsize=12, fontweight="bold")
+    axes[2, 0].set_xlabel("Updates")
+    axes[2, 0].set_ylabel("Machine Change Count")
+    axes[2, 0].grid(True, linestyle="--", alpha=0.5)
+    axes[2, 0].legend()
+
+    axes[2, 1].set_title("Validation Machine Change Rate (%)", fontsize=12, fontweight="bold")
+    axes[2, 1].set_xlabel("Updates")
+    axes[2, 1].set_ylabel("MChg Rate (%)")
+    axes[2, 1].grid(True, linestyle="--", alpha=0.5)
+    axes[2, 1].legend()
+
+    plt.tight_layout(rect=[0, 0.02, 1, 0.97])
+    out_path = output_dir / "stability_models_comparison.png"
+    plt.savefig(out_path, dpi=200)
+    plt.close(fig)
+    print(f"[PLOT] 4模型橫向對比圖已輸出：{out_path}")
+    return out_path
+
+
+def main():
+    log_dir = Path(lower_level_log_dir())
+    eval_model_name = getattr(configs, "eval_model_name", "")
+    
+    stability_models = [
+        "ll_stability_finetune_ptscale",
+        "ll_stability_finetune_flip2_mch3_ptscale",
+        "ll_stability_finetune_flip2_mch6_ptscale",
+        "ll_stability_finetune_flip4_mch6_ptscale",
+    ]
+
+    # If specific stability model configured via --config
+    if eval_model_name and any(m in eval_model_name for m in stability_models):
+        plot_stability_finetune_results(eval_model_name)
+        plot_stability_models_comparison()
+        return
+
+    # Check if any stability logs exist
+    has_stability = any((log_dir / f"detailed_reward_{m}.txt").exists() for m in stability_models)
+    if has_stability:
+        for m in stability_models:
+            plot_stability_finetune_results(m)
+        plot_stability_models_comparison()
+        return
+
+    # Default legacy plot
+    legacy_main()
+
 
 if __name__ == "__main__":
     main()
